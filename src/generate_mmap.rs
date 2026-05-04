@@ -24,8 +24,8 @@ use log::{error, info, trace};
 use sonic_rs;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
-use crate::tethys_dip;
-use tethys_dip::TethysDIP;
+use crate::dip;
+use dip::{BfsDIP, HashDIP};
 
 pub struct EncryptedFileSystem {
     original_multimap: MultiMap<String, u32>,
@@ -43,13 +43,18 @@ pub struct EncryptedFileSystem {
         Vec<Vec<(String, usize)>>,
     )>,
     p: usize,
+    use_bfs: bool,
     single_string_array: Option<Vec<String>>,
     single_string_array_volmap: Option<Vec<String>>,
     data_dir: String,
 }
 
 impl EncryptedFileSystem {
-    pub fn new(p: usize, data_dir: String) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        p: usize,
+        data_dir: String,
+        use_bfs: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let original_multimap = Self::load_data(&data_dir)?;
         let encrypted_multimap = MultiMap::new();
         let plaintext_encrypted_multimap = MultiMap::new();
@@ -74,6 +79,7 @@ impl EncryptedFileSystem {
             single_string_array: None,
             single_string_array_volmap: None,
             p,
+            use_bfs,
         })
     }
 
@@ -460,10 +466,15 @@ impl EncryptedFileSystem {
         p: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let modified_keyword_count_map = self.create_modified_keyword_count_map();
-        let tethys_dip = TethysDIP::new(m, p);
-        let result = tethys_dip.build_valmap(&modified_keyword_count_map, &self.keyword_value_map);
-        self.tethys_dip_result = Some(result);
+        let result = if self.use_bfs {
+            let dip = BfsDIP::<2>::new(m, p);
+            dip.build_valmap(&modified_keyword_count_map, &self.keyword_value_map)
+        } else {
+            let dip = HashDIP::<2>::new(m, p);
+            dip.build_valmap(&modified_keyword_count_map, &self.keyword_value_map)
+        };
 
+        self.tethys_dip_result = Some(result);
         Ok(())
     }
 
@@ -472,17 +483,21 @@ impl EncryptedFileSystem {
         m: usize,
         p: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tethys_dip = TethysDIP::new(m, p);
-
         let keyword_count_as_value_map: HashMap<String, Vec<(String, usize)>> = self
             .keyword_count_map
             .iter()
             .map(|(k, &v)| (k.clone(), vec![(k.clone(), v)]))
             .collect();
 
-        let result = tethys_dip.build_volmap(&self.keyword_count_map, &keyword_count_as_value_map);
-        self.tethys_dip_result_volmap = Some(result);
+        let result = if self.use_bfs {
+            let dip = BfsDIP::<2>::new(m, p);
+            dip.build_volmap(&self.keyword_count_map, &keyword_count_as_value_map)
+        } else {
+            let dip = HashDIP::<2>::new(m, p);
+            dip.build_volmap(&self.keyword_count_map, &keyword_count_as_value_map)
+        };
 
+        self.tethys_dip_result_volmap = Some(result);
         Ok(())
     }
 

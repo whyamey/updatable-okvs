@@ -10,8 +10,8 @@ use std::env;
 use std::fs;
 
 mod bench;
+mod dip;
 mod generate_mmap;
-mod tethys_dip;
 
 use bench::Benchmarker;
 
@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut keywords_file: Option<String> = None;
     let mut data_dir: String = "data".to_string();
     let mut log_level = LevelFilter::Info;
+    let mut use_bfs = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -47,6 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--log-trace" => {
                 log_level = LevelFilter::Trace;
+                i += 1;
+            }
+            "--use-bfs" => {
+                use_bfs = true;
                 i += 1;
             }
             _ => i += 1,
@@ -88,8 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let epsilon = 0.1;
     let run_decryption_test = false;
 
-    let mut benchmarker =
-        Benchmarker::new(p, epsilon, run_decryption_test, keywords_file, data_dir)?;
+    let mut benchmarker = Benchmarker::new(
+        p,
+        epsilon,
+        run_decryption_test,
+        keywords_file,
+        data_dir,
+        use_bfs,
+    )?;
 
     if let Err(e) = benchmarker.run_benchmarks() {
         error!("Error running benchmarks: {}", e);

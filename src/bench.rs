@@ -1,5 +1,5 @@
+use crate::dip::HashDIP;
 use crate::generate_mmap::EncryptedFileSystem;
-use crate::tethys_dip::TethysDIP;
 
 use frodo_pir::api::*;
 use log::{error, info};
@@ -35,8 +35,9 @@ impl Benchmarker {
         run_decryption_test: bool,
         keywords_file: Option<String>,
         data_dir: String,
+        use_bfs: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let encrypted_fs = EncryptedFileSystem::new(p, data_dir.clone())?;
+        let encrypted_fs = EncryptedFileSystem::new(p, data_dir.clone(), use_bfs)?;
         Ok(Benchmarker {
             encrypted_fs,
             keywords_file,
@@ -194,7 +195,7 @@ impl Benchmarker {
         let mut indexes = HashSet::new();
 
         for keyword in keywords {
-            let (base_keyword, num_ones) = TethysDIP::parse_keyword(keyword);
+            let (base_keyword, num_ones) = HashDIP::<2>::parse_keyword(keyword);
 
             if num_ones == 0 {
                 indexes.insert(self.hash1(base_keyword, m));
