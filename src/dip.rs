@@ -67,8 +67,10 @@ impl<const N: usize> HashDIP<N> {
             .map(|(k, v)| (v.clone(), k.clone()))
             .collect();
 
-        let mut buckets: HashMap<usize, Vec<Vec<u8>>> =
-            (0..self.m).map(|i| (i, Vec::new())).collect();
+        let mut buckets: HashMap<usize, Vec<Vec<u8>>> = (0..self.m)
+            .map(|i| (i, Vec::with_capacity(self.p)))
+            .collect();
+
         let mut stash = Vec::new();
         let mut rng = rand::thread_rng();
 
@@ -124,8 +126,10 @@ impl<const N: usize> HashDIP<N> {
             .map(|(k, v)| (v.clone(), k.clone()))
             .collect();
 
-        let mut buckets: HashMap<usize, Vec<Vec<(String, usize)>>> =
-            (0..self.m).map(|i| (i, Vec::new())).collect();
+        let mut buckets: HashMap<usize, Vec<Vec<(String, usize)>>> = (0..self.m)
+            .map(|i| (i, Vec::with_capacity(self.p)))
+            .collect();
+
         let mut stash = Vec::new();
         let mut rng = rand::thread_rng();
 

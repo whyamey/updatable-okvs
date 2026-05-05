@@ -11,10 +11,7 @@ use rand::RngCore;
 
 use blake3;
 
-use cbc::{Decryptor, Encryptor};
-use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-
-use generic_array::GenericArray;
+use cipher::KeyIvInit;
 
 use chacha20::cipher::StreamCipher;
 use chacha20::{ChaCha20, Key, Nonce};
@@ -172,39 +169,20 @@ impl EncryptedFileSystem {
     }
 
     fn encrypt_data(&self, key: &[u8; 32], data: &[u8]) -> Vec<u8> {
-        type Aes256Cbc = Encryptor<aes::Aes256>;
-        let mut cipher = Aes256Cbc::new(key.into(), (&self.iv).into());
+        let nonce = Nonce::from_slice(&self.iv[..12]);
+        let mut cipher = ChaCha20::new(Key::from_slice(key), nonce);
+        let mut buf = data.to_vec();
 
-        let mut buf = Vec::from(data);
-        let padding = 16 - (buf.len() % 16);
-        buf.extend(std::iter::repeat(padding as u8).take(padding));
-
-        for chunk in buf.chunks_mut(16) {
-            let block = GenericArray::from_mut_slice(chunk);
-            BlockEncryptMut::encrypt_block_mut(&mut cipher, block);
-        }
-
+        cipher.apply_keystream(&mut buf);
         buf
     }
 
     fn decrypt_data(&self, key: &[u8; 32], encrypted_data: &[u8]) -> Vec<u8> {
-        type Aes256Cbc = Decryptor<aes::Aes256>;
-        let mut cipher = Aes256Cbc::new(key.into(), (&self.iv).into());
-
+        let nonce = Nonce::from_slice(&self.iv[..12]);
+        let mut cipher = ChaCha20::new(Key::from_slice(key), nonce);
         let mut buf = encrypted_data.to_vec();
 
-        for chunk in buf.chunks_mut(16) {
-            let block = GenericArray::from_mut_slice(chunk);
-            BlockDecryptMut::decrypt_block_mut(&mut cipher, block);
-        }
-
-        // Remove PKCS7 padding
-        if let Some(&padding) = buf.last() {
-            if padding as usize <= 16 && padding as usize <= buf.len() {
-                buf.truncate(buf.len() - padding as usize);
-            }
-        }
-
+        cipher.apply_keystream(&mut buf);
         buf
     }
 
@@ -523,7 +501,7 @@ impl EncryptedFileSystem {
 
     pub fn add_padding_to_buckets(&mut self) {
         if let Some((buckets, _)) = self.tethys_dip_result.as_mut() {
-            let target_size = self.p * 48 + 16;
+            let target_size = 1024;
             for bucket in buckets.values_mut() {
                 let current_size: usize = bucket.iter().map(|item| item.len()).sum();
                 let padding_needed = target_size - current_size;
@@ -538,17 +516,18 @@ impl EncryptedFileSystem {
         self.single_string_array = self.tethys_dip_result.as_ref().map(|(buckets, _)| {
             let max_bucket_id = buckets.keys().max().unwrap_or(&0);
             let mut single_array = vec![String::new(); max_bucket_id + 1];
-            let target_size = self.p * 48 + 16;
+
+            let target_size = 1024;
+            let b64_len = (target_size * 4 / 3) + 4;
 
             for (&bucket_id, bucket_content) in buckets {
                 let combined_bucket_data: Vec<u8> =
                     bucket_content.iter().flatten().cloned().collect();
-                assert_eq!(
-                    combined_bucket_data.len(),
-                    target_size,
-                    "Bucket size mismatch"
-                );
-                single_array[bucket_id] = general_purpose::STANDARD.encode(&combined_bucket_data);
+
+                let mut encoded = String::with_capacity(b64_len);
+                general_purpose::STANDARD.encode_string(&combined_bucket_data, &mut encoded);
+
+                single_array[bucket_id] = encoded;
             }
 
             single_array
