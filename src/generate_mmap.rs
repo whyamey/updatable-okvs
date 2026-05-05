@@ -30,7 +30,7 @@ use dip::{BfsDIP, HashDIP};
 pub struct EncryptedFileSystem {
     original_multimap: MultiMap<String, u32>,
     encrypted_multimap: MultiMap<Vec<u8>, Vec<u8>>,
-    plaintext_encrypted_multimap: MultiMap<String, Vec<u8>>,
+    pub plaintext_encrypted_multimap: MultiMap<String, Vec<u8>>,
     iv: [u8; 16],
     encryption_keys: HashMap<Vec<u8>, [u8; 32]>,
     document_keys: HashMap<u32, [u8; 16]>,
@@ -598,6 +598,12 @@ impl EncryptedFileSystem {
         self.single_string_array_volmap = Some(encoded_buckets);
 
         Ok(())
+    }
+
+    pub fn get_valmap_stash(&self) -> Option<Vec<Vec<u8>>> {
+        self.tethys_dip_result
+            .as_ref()
+            .map(|(_, stash)| stash.clone())
     }
 
     pub fn get_single_string_array_volmap(&self) -> Option<&Vec<String>> {

@@ -26,6 +26,7 @@ pub struct Benchmarker {
     volmap_query_time: Duration,
     valmap_setup_time: Duration,
     valmap_query_time: Duration,
+    run_plaintext_retrieval: bool,
 }
 
 impl Benchmarker {
@@ -36,6 +37,7 @@ impl Benchmarker {
         keywords_file: Option<String>,
         data_dir: String,
         use_bfs: bool,
+        run_plaintext_retrieval: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let encrypted_fs = EncryptedFileSystem::new(p, data_dir.clone(), use_bfs)?;
         Ok(Benchmarker {
@@ -53,6 +55,7 @@ impl Benchmarker {
             volmap_query_time: Duration::new(0, 0),
             valmap_setup_time: Duration::new(0, 0),
             valmap_query_time: Duration::new(0, 0),
+            run_plaintext_retrieval,
         })
     }
 
@@ -84,6 +87,12 @@ impl Benchmarker {
         );
         info!("Total Execution Time: {:?}", total_time);
 
+        // Check if we retrieve the right plaintext after decoding volmap
+        if self.run_plaintext_retrieval {
+            if let Some(test_kw) = self.selected_keywords.first().cloned() {
+                self.test_specific_keyword_retrieval(&test_kw)?;
+            }
+        }
         Ok(())
     }
 
@@ -336,6 +345,147 @@ impl Benchmarker {
 
         self.valmap_query_time = valmap_query_time.elapsed();
         info!("FrodoPIR query for ValMap finished executing.");
+
+        Ok(())
+    }
+
+    pub fn test_specific_keyword_retrieval(
+        &mut self,
+        target_keyword: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "--- Running End-to-End Retrieval Test for '{}' ---",
+            target_keyword
+        );
+
+        let volmap_db_array = self.encrypted_fs.get_single_string_array_volmap().unwrap();
+        let m_vol = volmap_db_array.len() as usize;
+        let vol_shard = Shard::from_base64_strings(&volmap_db_array, 1572, m_vol, 256, 10).unwrap();
+        let bp_vol = vol_shard.get_base_params();
+        let cp_vol = CommonParams::from(bp_vol);
+
+        let volmap_indexes =
+            self.get_indexes_for_keywords(&[target_keyword.to_string()], self.volmap_m);
+        let mut retrieved_count = 0;
+
+        for &index in &volmap_indexes {
+            let mut qp = QueryParams::new(&cp_vol, bp_vol).unwrap();
+            if let Ok(query) = qp.generate_query(index) {
+                let d_resp = vol_shard.respond(&query).unwrap();
+                let resp: Response = bincode::deserialize(&d_resp).unwrap();
+                let output = resp.parse_output_as_base64(&qp);
+                let decoded = self.encrypted_fs.decode_base64(&output)?;
+
+                let keyword_size = decoded[0] as usize;
+                if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
+                    if let Ok(keyword) = String::from_utf8(decoded[1..1 + keyword_size].to_vec()) {
+                        if keyword == target_keyword {
+                            let count_bytes: [u8; 4] = decoded
+                                [1 + keyword_size..1 + keyword_size + 4]
+                                .try_into()
+                                .unwrap();
+                            retrieved_count = u32::from_le_bytes(count_bytes);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("> VolMap returned count: {}", retrieved_count);
+        if retrieved_count == 0 {
+            info!("> No documents found. Ending test.");
+            return Ok(());
+        }
+
+        let p = self.encrypted_fs.get_p();
+        let num_entries = (retrieved_count as f64 / p as f64).ceil() as usize;
+        let mut valmap_keywords = Vec::new();
+
+        for i in 0..num_entries {
+            let mut modified_keyword = target_keyword.to_string();
+            modified_keyword.push_str(&"1".repeat(i));
+            valmap_keywords.push(modified_keyword);
+        }
+
+        info!(
+            "> Generating {} queries for ValMap...",
+            valmap_keywords.len()
+        );
+
+        let valmap_db_array = self.encrypted_fs.get_single_string_array().unwrap();
+        let m_val = valmap_db_array.len() as usize;
+        let val_shard =
+            Shard::from_base64_strings(&valmap_db_array, 1572, m_val, 8192, 10).unwrap();
+        let bp_val = val_shard.get_base_params();
+        let cp_val = CommonParams::from(bp_val);
+
+        let valmap_indexes = self.get_indexes_for_keywords(&valmap_keywords, self.valmap_m);
+        let mut retrieved_encrypted_paths = Vec::new();
+
+        for &index in &valmap_indexes {
+            let mut qp = QueryParams::new(&cp_val, bp_val).unwrap();
+            if let Ok(query) = qp.generate_query(index) {
+                let d_resp = val_shard.respond(&query).unwrap();
+                let resp: Response = bincode::deserialize(&d_resp).unwrap();
+                let output = resp.parse_output_as_base64(&qp);
+                let decoded_bucket = self.encrypted_fs.decode_base64(&output)?;
+
+                // Extract the 48-byte AES chunks generated by `encrypt_data`
+                for chunk in decoded_bucket.chunks_exact(48) {
+                    retrieved_encrypted_paths.push(chunk.to_vec());
+                }
+            }
+        }
+
+        info!(
+            "> Retrieved {} potential 48-byte encrypted payloads from ValMap.",
+            retrieved_encrypted_paths.len()
+        );
+
+        let stash = self.encrypted_fs.get_valmap_stash().unwrap_or_default();
+        info!(
+            "> Retrieved {} payloads from the ValMap Stash.",
+            stash.len()
+        );
+
+        if let Some(expected_paths) = self
+            .encrypted_fs
+            .plaintext_encrypted_multimap
+            .get_vec(target_keyword)
+        {
+            let mut matched_in_db = 0;
+            let mut matched_in_stash = 0;
+
+            for expected_path in expected_paths {
+                if retrieved_encrypted_paths.contains(expected_path) {
+                    matched_in_db += 1;
+                } else if stash.contains(expected_path) {
+                    matched_in_stash += 1;
+                }
+            }
+
+            let total_matched = matched_in_db + matched_in_stash;
+
+            if total_matched == expected_paths.len() {
+                info!(
+                    "> Success! Verified {}/{} document payloads linked to '{}'.",
+                    total_matched,
+                    expected_paths.len(),
+                    target_keyword
+                );
+                if matched_in_stash > 0 {
+                    info!(">    - {} found via PIR (Buckets)", matched_in_db);
+                    info!(
+                        ">    - {} found via Direct Download (Stash)",
+                        matched_in_stash
+                    );
+                }
+            } else {
+                error!("> Failed: Only found {}/{} document payloads for '{}'. ({} in DB, {} in Stash)",
+                            total_matched, expected_paths.len(), target_keyword, matched_in_db, matched_in_stash);
+            }
+        }
 
         Ok(())
     }

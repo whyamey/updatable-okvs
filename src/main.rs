@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir: String = "data".to_string();
     let mut log_level = LevelFilter::Info;
     let mut use_bfs = false;
+    let mut run_plaintext_retrieval = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -52,6 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--use-bfs" => {
                 use_bfs = true;
+                i += 1;
+            }
+            "--run-plaintext-retrieval" => {
+                run_plaintext_retrieval = true;
                 i += 1;
             }
             _ => i += 1,
@@ -100,6 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keywords_file,
         data_dir,
         use_bfs,
+        run_plaintext_retrieval,
     )?;
 
     if let Err(e) = benchmarker.run_benchmarks() {
