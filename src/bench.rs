@@ -235,41 +235,83 @@ impl Benchmarker {
         self.volmap_setup_time = volmap_setup_start.elapsed();
 
         let volmap_query_start = Instant::now();
-
         let indexes_to_query =
             self.get_indexes_for_keywords(&self.selected_keywords, self.volmap_m);
+
+        let mut indices: Vec<usize> = indexes_to_query.into_iter().collect();
+        while indices.len() % 8 != 0 {
+            indices.push(0);
+        }
+
         self.volmap_keyword_counts.clear();
 
-        let counts: Vec<u32> = indexes_to_query
-            .par_iter()
-            .filter_map(|&index| {
-                let mut qp = QueryParams::new(&cp, bp).unwrap();
-                let q = qp.generate_query(index).ok()?;
-                let d_resp = shard.respond(&q).unwrap();
-                let resp: Response = bincode::deserialize(&d_resp).unwrap();
-                let output = resp.parse_output_as_base64(&qp);
-                let decoded = self.encrypted_fs.decode_base64(&output).ok()?;
+        let counts: Vec<u32> = indices
+            .par_chunks(8)
+            .flat_map(|chunk| {
+                let mut qps = Vec::with_capacity(8);
+                let mut queries = Vec::with_capacity(8);
 
-                let keyword_size = decoded[0] as usize;
-                if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
-                    if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size]) {
-                        if let Ok(count_bytes) =
-                            decoded[1 + keyword_size..1 + keyword_size + 4].try_into()
-                        {
-                            let count = u32::from_le_bytes(count_bytes);
-                            if self.selected_keywords.contains(&keyword.to_string()) {
-                                return Some(count);
+                for i in 0..8 {
+                    loop {
+                        let mut qp = QueryParams::new(&cp, bp).unwrap();
+                        if let Ok(q) = qp.generate_query(chunk[i]) {
+                            qps.push(qp);
+                            queries.push(q);
+                            break;
+                        }
+                    }
+                }
+                let interleaved: Vec<[u32; 8]> = (0..m)
+                    .map(|row| {
+                        let mut vals = [0u32; 8];
+                        for j in 0..8 {
+                            vals[j] = queries[j].as_slice()[row];
+                        }
+                        vals
+                    })
+                    .collect();
+
+                let bq = BatchedQuery8 { interleaved };
+                let d_resp = shard.respond_batched_8(&bq).unwrap();
+                let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+
+                let width = shard.get_db().get_matrix_width_self();
+                let mut chunk_counts = Vec::new();
+
+                for j in 0..8 {
+                    let mut single_resp = Vec::with_capacity(width);
+                    for w in 0..width {
+                        single_resp.push(resp.results[w][j]);
+                    }
+
+                    let serialized_vec = bincode::serialize(&single_resp).unwrap();
+                    let parsed_resp: Response = bincode::deserialize(&serialized_vec).unwrap();
+
+                    let output = parsed_resp.parse_output_as_base64(&qps[j]);
+                    if let Ok(decoded) = self.encrypted_fs.decode_base64(&output) {
+                        let keyword_size = decoded[0] as usize;
+                        if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
+                            if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size])
+                            {
+                                if let Ok(count_bytes) =
+                                    decoded[1 + keyword_size..1 + keyword_size + 4].try_into()
+                                {
+                                    let count = u32::from_le_bytes(count_bytes);
+                                    if self.selected_keywords.contains(&keyword.to_string()) {
+                                        chunk_counts.push(count);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                None
+                chunk_counts
             })
             .collect();
 
         self.volmap_keyword_counts.extend(counts);
         self.volmap_query_time = volmap_query_start.elapsed();
-        info!("FrodoPIR query finished executing.");
+        info!("FrodoPIR batched query finished executing.");
 
         Ok(())
     }
@@ -311,17 +353,56 @@ impl Benchmarker {
         let valmap_keywords = self.generate_valmap_keywords();
         let indexes_to_query = self.get_indexes_for_keywords(&valmap_keywords, self.valmap_m);
 
-        indexes_to_query.par_iter().for_each(|&index| {
-            let mut qp = QueryParams::new(&cp, bp).unwrap();
-            if let Ok(query) = qp.generate_query(index) {
-                let d_resp = shard.respond(&query).unwrap();
-                let resp: Response = bincode::deserialize(&d_resp).unwrap();
-                let _ = resp.parse_output_as_base64(&qp);
+        let mut indices: Vec<usize> = indexes_to_query.into_iter().collect();
+        while indices.len() % 8 != 0 {
+            indices.push(0);
+        }
+
+        indices.par_chunks(8).for_each(|chunk| {
+            let mut qps = Vec::with_capacity(8);
+            let mut queries = Vec::with_capacity(8);
+
+            for i in 0..8 {
+                loop {
+                    let mut qp = QueryParams::new(&cp, bp).unwrap();
+                    if let Ok(q) = qp.generate_query(chunk[i]) {
+                        qps.push(qp);
+                        queries.push(q);
+                        break;
+                    }
+                }
+            }
+            let interleaved: Vec<[u32; 8]> = (0..m)
+                .map(|row| {
+                    let mut vals = [0u32; 8];
+                    for j in 0..8 {
+                        vals[j] = queries[j].as_slice()[row];
+                    }
+                    vals
+                })
+                .collect();
+
+            let bq = BatchedQuery8 { interleaved };
+            let d_resp = shard.respond_batched_8(&bq).unwrap();
+            let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+
+            let width = shard.get_db().get_matrix_width_self();
+
+            for j in 0..8 {
+                let mut single_resp = Vec::with_capacity(width);
+                for w in 0..width {
+                    single_resp.push(resp.results[w][j]);
+                }
+
+                let serialized_vec = bincode::serialize(&single_resp).unwrap();
+                let parsed_resp: Response = bincode::deserialize(&serialized_vec).unwrap();
+
+                let _ = parsed_resp.parse_output_as_base64(&qps[j]);
             }
         });
 
         self.valmap_query_time = valmap_query_time.elapsed();
-        info!("FrodoPIR query for ValMap finished executing.");
+        info!("FrodoPIR batched query for ValMap finished executing.");
 
         Ok(())
     }
@@ -341,28 +422,72 @@ impl Benchmarker {
         let bp_vol = vol_shard.get_base_params();
         let cp_vol = CommonParams::from(bp_vol);
 
-        let volmap_indexes =
-            self.get_indexes_for_keywords(&[target_keyword.to_string()], self.volmap_m);
+        let volmap_indexes: Vec<usize> = self
+            .get_indexes_for_keywords(&[target_keyword.to_string()], self.volmap_m)
+            .into_iter()
+            .collect();
         let mut retrieved_count = 0;
 
-        for &index in &volmap_indexes {
-            let mut qp = QueryParams::new(&cp_vol, bp_vol).unwrap();
-            if let Ok(query) = qp.generate_query(index) {
-                let d_resp = vol_shard.respond(&query).unwrap();
-                let resp: Response = bincode::deserialize(&d_resp).unwrap();
-                let output = resp.parse_output_as_base64(&qp);
-                let decoded = self.encrypted_fs.decode_base64(&output)?;
+        let mut vol_indices = volmap_indexes.clone();
+        while vol_indices.len() % 8 != 0 {
+            vol_indices.push(0);
+        }
 
-                let keyword_size = decoded[0] as usize;
-                if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
-                    if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size]) {
-                        if keyword == target_keyword {
-                            let count_bytes: [u8; 4] = decoded
-                                [1 + keyword_size..1 + keyword_size + 4]
-                                .try_into()
-                                .unwrap();
-                            retrieved_count = u32::from_le_bytes(count_bytes);
-                            break;
+        for chunk in vol_indices.chunks(8) {
+            let mut qps = Vec::with_capacity(8);
+            let mut queries = Vec::with_capacity(8);
+
+            // Retry loop to bypass ErrorOverflownAdd
+            for i in 0..8 {
+                loop {
+                    let mut qp = QueryParams::new(&cp_vol, bp_vol).unwrap();
+                    if let Ok(q) = qp.generate_query(chunk[i]) {
+                        qps.push(qp);
+                        queries.push(q);
+                        break;
+                    }
+                }
+            }
+
+            let interleaved: Vec<[u32; 8]> = (0..m_vol)
+                .map(|row| {
+                    let mut vals = [0u32; 8];
+                    for j in 0..8 {
+                        vals[j] = queries[j].as_slice()[row];
+                    }
+                    vals
+                })
+                .collect();
+
+            let bq = BatchedQuery8 { interleaved };
+            let d_resp = vol_shard.respond_batched_8(&bq).unwrap();
+            let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+            let width = vol_shard.get_db().get_matrix_width_self();
+
+            for j in 0..8 {
+                if chunk[j] == 0 && !volmap_indexes.contains(&0) {
+                    continue;
+                }
+
+                let mut single_resp = Vec::with_capacity(width);
+                for w in 0..width {
+                    single_resp.push(resp.results[w][j]);
+                }
+                let parsed_resp: Response =
+                    bincode::deserialize(&bincode::serialize(&single_resp).unwrap()).unwrap();
+                let output = parsed_resp.parse_output_as_base64(&qps[j]);
+
+                if let Ok(decoded) = self.encrypted_fs.decode_base64(&output) {
+                    let keyword_size = decoded[0] as usize;
+                    if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
+                        if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size]) {
+                            if keyword == target_keyword {
+                                let count_bytes: [u8; 4] = decoded
+                                    [1 + keyword_size..1 + keyword_size + 4]
+                                    .try_into()
+                                    .unwrap();
+                                retrieved_count = u32::from_le_bytes(count_bytes);
+                            }
                         }
                     }
                 }
@@ -378,7 +503,6 @@ impl Benchmarker {
         let p = self.encrypted_fs.get_p();
         let num_entries = (retrieved_count as f64 / p as f64).ceil() as usize;
         let mut valmap_keywords = Vec::new();
-
         for i in 0..num_entries {
             let mut modified_keyword = target_keyword.to_string();
             modified_keyword.push_str(&"1".repeat(i));
@@ -397,20 +521,66 @@ impl Benchmarker {
         let bp_val = val_shard.get_base_params();
         let cp_val = CommonParams::from(bp_val);
 
-        let valmap_indexes = self.get_indexes_for_keywords(&valmap_keywords, self.valmap_m);
+        let valmap_indexes_set = self.get_indexes_for_keywords(&valmap_keywords, self.valmap_m);
+        let mut valmap_indexes: Vec<usize> = valmap_indexes_set.into_iter().collect();
+        let original_valmap_len = valmap_indexes.len();
+        while valmap_indexes.len() % 8 != 0 {
+            valmap_indexes.push(0);
+        }
+
         let mut retrieved_encrypted_paths = Vec::new();
 
-        for &index in &valmap_indexes {
-            let mut qp = QueryParams::new(&cp_val, bp_val).unwrap();
-            if let Ok(query) = qp.generate_query(index) {
-                let d_resp = val_shard.respond(&query).unwrap();
-                let resp: Response = bincode::deserialize(&d_resp).unwrap();
-                let output = resp.parse_output_as_base64(&qp);
-                let decoded_bucket = self.encrypted_fs.decode_base64(&output)?;
+        for chunk in valmap_indexes.chunks(8) {
+            let mut qps = Vec::with_capacity(8);
+            let mut queries = Vec::with_capacity(8);
 
-                // Extract the 32-byte AES chunks generated by `encrypt_data`
-                for chunk in decoded_bucket.chunks_exact(32) {
-                    retrieved_encrypted_paths.push(chunk.to_vec());
+            // Retry loop to bypass ErrorOverflownAdd
+            for i in 0..8 {
+                loop {
+                    let mut qp = QueryParams::new(&cp_val, bp_val).unwrap();
+                    if let Ok(q) = qp.generate_query(chunk[i]) {
+                        qps.push(qp);
+                        queries.push(q);
+                        break;
+                    }
+                }
+            }
+
+            let interleaved: Vec<[u32; 8]> = (0..m_val)
+                .map(|row| {
+                    let mut vals = [0u32; 8];
+                    for j in 0..8 {
+                        vals[j] = queries[j].as_slice()[row];
+                    }
+                    vals
+                })
+                .collect();
+
+            let bq = BatchedQuery8 { interleaved };
+            let d_resp = val_shard.respond_batched_8(&bq).unwrap();
+            let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+            let width = val_shard.get_db().get_matrix_width_self();
+
+            for j in 0..8 {
+                if chunk[j] == 0
+                    && !valmap_keywords.contains(&"0".to_string())
+                    && chunk[j] != valmap_indexes[original_valmap_len.saturating_sub(1)]
+                {
+                    // Skips the padded dummy outputs
+                }
+
+                let mut single_resp = Vec::with_capacity(width);
+                for w in 0..width {
+                    single_resp.push(resp.results[w][j]);
+                }
+                let parsed_resp: Response =
+                    bincode::deserialize(&bincode::serialize(&single_resp).unwrap()).unwrap();
+                let output = parsed_resp.parse_output_as_base64(&qps[j]);
+
+                if let Ok(decoded_bucket) = self.encrypted_fs.decode_base64(&output) {
+                    for payload_chunk in decoded_bucket.chunks_exact(32) {
+                        retrieved_encrypted_paths.push(payload_chunk.to_vec());
+                    }
                 }
             }
         }
@@ -451,16 +621,9 @@ impl Benchmarker {
                     expected_paths.len(),
                     target_keyword
                 );
-                if matched_in_stash > 0 {
-                    info!(">    - {} found via PIR (Buckets)", matched_in_db);
-                    info!(
-                        ">    - {} found via Direct Download (Stash)",
-                        matched_in_stash
-                    );
-                }
             } else {
                 error!("> Failed: Only found {}/{} document payloads for '{}'. ({} in DB, {} in Stash)",
-                            total_matched, expected_paths.len(), target_keyword, matched_in_db, matched_in_stash);
+                                total_matched, expected_paths.len(), target_keyword, matched_in_db, matched_in_stash);
             }
         }
 

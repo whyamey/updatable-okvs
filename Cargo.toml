@@ -15,7 +15,7 @@ rand = "0.8.5"
 chacha20 = "0.9.1"
 hex = "0.4.3"
 petgraph = "0.6.5"
-frodo-pir = { git = "https://github.com/brave-experiments/frodo-pir", version = "0.0.1" }
+frodo-pir = { git = "https://github.com/whyamey/frodo-pir", version = "0.0.1" }
 base64 = "0.22.1"
 log = "0.4.22"
 env_logger = "0.11.5"
@@ -28,6 +28,8 @@ log4rs = "1.3.0"
 aes = "0.8.4"
 cbc = { version = "0.1.2", features = ["alloc"] }
 cipher = { version = "0.4.4", features = ["std"] }
-blake3 = "1.5.5"
 sonic-rs = "0.3.17"
 tikv-jemallocator = "0.6.0"
+dashmap = "6.1.0"
+rayon = "1.12.0"
+blake3 = { version = "1.8.5", features = ["rayon"] }
