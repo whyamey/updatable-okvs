@@ -92,10 +92,15 @@ impl EncryptedFileSystem {
 
         let json_value: sonic_rs::Value = sonic_rs::from_str(&buf)?;
 
-        let file_locations: Vec<String> =
+        let valid_file_names: std::collections::HashSet<String> =
             std::fs::read_to_string(Path::new(data_dir).join("files.txt"))?
                 .lines()
-                .map(String::from)
+                .filter_map(|loc| {
+                    Path::new(loc)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(String::from)
+                })
                 .collect();
 
         let mut multimap = MultiMap::new();
@@ -105,9 +110,7 @@ impl EncryptedFileSystem {
                 if let Some(file_names) = value.as_array() {
                     for file_name_value in file_names {
                         if let Some(file_name) = file_name_value.as_str() {
-                            if let Some(_) =
-                                file_locations.iter().find(|&loc| loc.ends_with(file_name))
-                            {
+                            if valid_file_names.contains(file_name) {
                                 if let Ok(file_id) = file_name.parse::<u32>() {
                                     multimap.insert(keyword.to_string(), file_id);
                                 }
