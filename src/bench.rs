@@ -290,15 +290,19 @@ impl Benchmarker {
                     if let Ok(decoded) = self.encrypted_fs.decode_base64(&output) {
                         let keyword_size = decoded[0] as usize;
                         if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
-                            if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size])
+                            let retrieved_bytes = &decoded[1..1 + keyword_size];
+
+                            if let Ok(count_bytes) =
+                                decoded[1 + keyword_size..1 + keyword_size + 4].try_into()
                             {
-                                if let Ok(count_bytes) =
-                                    decoded[1 + keyword_size..1 + keyword_size + 4].try_into()
-                                {
-                                    let count = u32::from_le_bytes(count_bytes);
-                                    if self.selected_keywords.contains(&keyword.to_string()) {
-                                        chunk_counts.push(count);
-                                    }
+                                let count = u32::from_le_bytes(count_bytes);
+
+                                if self.selected_keywords.iter().any(|k| {
+                                    let k_bytes = k.as_bytes();
+                                    let trunc_len = k_bytes.len().min(251);
+                                    &k_bytes[..trunc_len] == retrieved_bytes
+                                }) {
+                                    chunk_counts.push(count);
                                 }
                             }
                         }
@@ -477,14 +481,16 @@ impl Benchmarker {
                 if let Ok(decoded) = self.encrypted_fs.decode_base64(&output) {
                     let keyword_size = decoded[0] as usize;
                     if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
-                        if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size]) {
-                            if keyword == target_keyword {
-                                let count_bytes: [u8; 4] = decoded
-                                    [1 + keyword_size..1 + keyword_size + 4]
-                                    .try_into()
-                                    .unwrap();
-                                retrieved_count = u32::from_le_bytes(count_bytes);
-                            }
+                        let retrieved_bytes = &decoded[1..1 + keyword_size];
+                        let target_bytes = target_keyword.as_bytes();
+                        let trunc_len = target_bytes.len().min(251);
+
+                        if retrieved_bytes == &target_bytes[..trunc_len] {
+                            let count_bytes: [u8; 4] = decoded
+                                [1 + keyword_size..1 + keyword_size + 4]
+                                .try_into()
+                                .unwrap();
+                            retrieved_count = u32::from_le_bytes(count_bytes);
                         }
                     }
                 }

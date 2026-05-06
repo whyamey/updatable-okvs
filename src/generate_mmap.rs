@@ -570,12 +570,14 @@ impl EncryptedFileSystem {
 
             if let Some(pairs) = v.first() {
                 if let Some((keyword, count)) = pairs.first() {
-                    buffer[pos] = keyword.len() as u8;
+                    let keyword_bytes = keyword.as_bytes();
+                    let write_len = keyword_bytes.len().min(251); // Max 251 bytes
+
+                    buffer[pos] = write_len as u8;
                     pos += 1;
 
-                    let keyword_bytes = keyword.as_bytes();
-                    buffer[pos..pos + keyword_bytes.len()].copy_from_slice(keyword_bytes);
-                    pos += keyword_bytes.len();
+                    buffer[pos..pos + write_len].copy_from_slice(&keyword_bytes[..write_len]);
+                    pos += write_len;
 
                     buffer[pos..pos + 4].copy_from_slice(&(*count as u32).to_le_bytes());
                 }
@@ -713,17 +715,17 @@ impl EncryptedFileSystem {
 
                 let random_keyword = keywords
                     .choose(&mut rng)
-                    .ok_or(format!(
-                        "Keywords list is empty in {}",
-                        keywords_path.display()
-                    ))?
+                    .ok_or(format!("Keywords list is empty"))?
                     .to_string();
 
-                buffer[0] = random_keyword.len() as u8;
-                buffer[1..1 + random_keyword.len()].copy_from_slice(random_keyword.as_bytes());
+                let keyword_bytes = random_keyword.as_bytes();
+                let write_len = keyword_bytes.len().min(251);
+
+                buffer[0] = write_len as u8;
+                buffer[1..1 + write_len].copy_from_slice(&keyword_bytes[..write_len]);
 
                 let random_count = rng.gen_range(1..10);
-                buffer[1 + random_keyword.len()..1 + random_keyword.len() + 4]
+                buffer[1 + write_len..1 + write_len + 4]
                     .copy_from_slice(&(random_count as u32).to_le_bytes());
 
                 single_array[index] = general_purpose::STANDARD.encode(&buffer);
