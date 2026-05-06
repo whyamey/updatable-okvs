@@ -2,12 +2,16 @@ use multimap::MultiMap;
 use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use base64::{engine::general_purpose, Engine as _};
 use rand::Rng;
 use rand::RngCore;
+
+use dashmap::DashMap;
+use rayon::prelude::*;
+use std::sync::Mutex;
 
 use blake3;
 
@@ -213,90 +217,124 @@ impl EncryptedFileSystem {
     }
 
     pub fn encrypt_files(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut encrypted_files = std::collections::HashSet::new();
-        let mut keyword_count = std::collections::HashMap::new();
-
         std::fs::create_dir_all("encrypted_docs")?;
 
-        for (keyword, file_paths) in self.original_multimap.iter_all() {
-            trace!("Encrypting Keyword: {}", keyword);
-            let hashed_keyword = Self::hash_keyword(&keyword);
-            trace!("Hashed keyword: {:?}", hashed_keyword);
+        let unique_file_paths: std::collections::HashSet<u32> = self
+            .original_multimap
+            .iter_all()
+            .flat_map(|(_, paths)| paths.clone())
+            .collect();
+
+        info!(
+            "Starting parallel encryption of {} unique files...",
+            unique_file_paths.len()
+        );
+
+        let concurrent_nonces = DashMap::new();
+
+        unique_file_paths.par_iter().for_each(|&file_path| {
+            trace!("  Encrypting file path: {}", file_path);
+
+            let document_key = self
+                .document_keys
+                .get(&file_path)
+                .expect("Document key not found");
+            let nonce = Self::generate_nonce();
+            concurrent_nonces.insert(file_path, nonce);
+
+            let input_path = format!("{}/{}", self.data_dir, file_path);
+            if let Ok(file_content) = std::fs::read(&input_path) {
+                let encrypted_content = self.encrypt_document(document_key, &nonce, &file_content);
+
+                let encrypted_file_path_output =
+                    Path::new("encrypted_docs").join(format!("{}.enc", file_path));
+                let nonce_file_path =
+                    Path::new("encrypted_docs").join(format!("{}.nonce", file_path));
+
+                std::fs::write(&encrypted_file_path_output, encrypted_content).unwrap();
+                std::fs::write(&nonce_file_path, nonce).unwrap();
+            } else {
+                error!("Failed to read file: {}", input_path);
+            }
+        });
+
+        self.document_nonces.extend(concurrent_nonces.into_iter());
+
+        info!("File encryption complete. Starting metadata generation...");
+
+        let encrypted_multimap = Mutex::new(MultiMap::new());
+        let plaintext_encrypted_multimap = Mutex::new(MultiMap::new());
+        let encryption_keys = DashMap::new();
+        let keyword_value_map = DashMap::new();
+        let keyword_count_map = DashMap::new();
+        let shared_keyword_count = DashMap::new();
+
+        let entries: Vec<(&String, &Vec<u32>)> = self.original_multimap.iter_all().collect();
+
+        entries.par_iter().for_each(|&(keyword, file_paths)| {
+            let hashed_keyword = Self::hash_keyword(keyword);
             let random_key = Self::generate_aes_key();
             let encrypted_keyword = self.encrypt_data(&random_key, &hashed_keyword);
 
-            self.encryption_keys
-                .insert(encrypted_keyword.clone(), random_key);
+            encryption_keys.insert(encrypted_keyword.clone(), random_key);
+            keyword_count_map.insert(keyword.clone(), file_paths.len());
 
             for &file_path in file_paths {
-                trace!("  Encrypting file path: {}", file_path);
-                let document_key = self
-                    .document_keys
-                    .get(&file_path)
-                    .ok_or("Document key not found")?;
-
-                let nonce = Self::generate_nonce();
-                self.document_nonces.insert(file_path, nonce);
+                let document_key = self.document_keys.get(&file_path).unwrap();
+                let nonce = self.document_nonces.get(&file_path).unwrap();
 
                 let mut combined_path = [0u8; 32];
                 combined_path[..4].copy_from_slice(&file_path.to_le_bytes());
                 combined_path[4..20].copy_from_slice(document_key);
-                combined_path[20..].copy_from_slice(&nonce);
+                combined_path[20..].copy_from_slice(nonce);
 
                 let encrypted_file_path = self.encrypt_data(&random_key, &combined_path);
 
-                if !encrypted_files.contains(&file_path) {
-                    let mut file = File::open(format!("{}/{}", self.data_dir, file_path))?;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)?;
-
-                    let encrypted_content =
-                        self.encrypt_document(document_key, &nonce, &file_content);
-
-                    let encrypted_file_name = format!("{}.enc", file_path);
-                    let encrypted_file_path_output =
-                        Path::new("encrypted_docs").join(&encrypted_file_name);
-
-                    let mut encrypted_file = File::create(&encrypted_file_path_output)?;
-                    encrypted_file.write_all(&encrypted_content)?;
-
-                    let nonce_file_name = format!("{}.nonce", file_path);
-                    let nonce_file_path = Path::new("encrypted_docs").join(&nonce_file_name);
-                    let mut nonce_file = File::create(&nonce_file_path)?;
-                    nonce_file.write_all(&nonce)?;
-
-                    trace!(
-                        "  Encrypted file saved as: {:?}",
-                        encrypted_file_path_output
-                    );
-
-                    encrypted_files.insert(file_path);
-                }
-
-                self.encrypted_multimap
+                encrypted_multimap
+                    .lock()
+                    .unwrap()
                     .insert(encrypted_keyword.clone(), encrypted_file_path.clone());
-                self.plaintext_encrypted_multimap
+                plaintext_encrypted_multimap
+                    .lock()
+                    .unwrap()
                     .insert(keyword.clone(), encrypted_file_path.clone());
 
-                let modified_keyword = self.get_modified_keyword(keyword, &mut keyword_count);
+                let mut count_ref = shared_keyword_count.entry(keyword.to_string()).or_insert(0);
+                *count_ref += 1;
+                let current_count = *count_ref;
+                drop(count_ref);
+
+                let modified_keyword = if current_count <= self.p {
+                    keyword.to_string()
+                } else {
+                    let ones_to_append = (current_count - 1) / self.p;
+                    let mut mk = keyword.to_string();
+                    mk.push_str(&"1".repeat(ones_to_append));
+                    mk
+                };
 
                 let combined_key = format!("{}||{:?}", modified_keyword, encrypted_file_path);
-                trace!(
-                    "Keyword: {}, Plaintext length: {}, Ciphertext length: {}",
-                    modified_keyword,
-                    combined_key.len(),
-                    encrypted_file_path.len()
-                );
-
-                self.keyword_value_map
-                    .insert(combined_key, encrypted_file_path);
+                keyword_value_map.insert(combined_key, encrypted_file_path);
             }
+        });
 
-            self.keyword_count_map
-                .insert(keyword.clone(), file_paths.len());
+        self.encryption_keys.extend(encryption_keys.into_iter());
+        self.keyword_value_map.extend(keyword_value_map.into_iter());
+        self.keyword_count_map.extend(keyword_count_map.into_iter());
+        self.encrypted_multimap = encrypted_multimap.into_inner().unwrap();
+        self.plaintext_encrypted_multimap = plaintext_encrypted_multimap.into_inner().unwrap();
+
+        for (kw, total_count) in shared_keyword_count.into_iter() {
+            if total_count > self.p {
+                let ones_to_append = (total_count - 1) / self.p;
+                let new_count = total_count - (ones_to_append * self.p);
+                let mut final_kw = kw;
+                final_kw.push_str(&"1".repeat(ones_to_append));
+                self.keyword_count_map.insert(final_kw, new_count);
+            }
         }
 
-        info!("Encryption successful!");
+        info!("Encryption and metadata generation successful!");
         Ok(())
     }
 
@@ -390,31 +428,6 @@ impl EncryptedFileSystem {
 
         info!("Decryption verification successful!");
         Ok(true)
-    }
-
-    fn get_modified_keyword(
-        &self,
-        original_keyword: &str,
-        keyword_count: &mut HashMap<String, usize>,
-    ) -> String {
-        let count = keyword_count
-            .entry(original_keyword.to_string())
-            .or_insert(0);
-        *count += 1;
-
-        if *count <= self.p {
-            return original_keyword.to_string();
-        }
-
-        let ones_to_append = (*count - 1) / self.p;
-
-        let mut modified_keyword = original_keyword.to_string();
-        modified_keyword.push_str(&"1".repeat(ones_to_append));
-
-        let new_count = *count - (ones_to_append * self.p);
-        keyword_count.insert(modified_keyword.clone(), new_count);
-
-        modified_keyword
     }
 
     fn create_modified_keyword_count_map(&self) -> HashMap<String, usize> {
@@ -520,16 +533,20 @@ impl EncryptedFileSystem {
             let target_size = 1024;
             let b64_len = (target_size * 4 / 3) + 4;
 
-            for (&bucket_id, bucket_content) in buckets {
-                let combined_bucket_data: Vec<u8> =
-                    bucket_content.iter().flatten().cloned().collect();
+            let encoded_buckets: Vec<(usize, String)> = buckets
+                .par_iter()
+                .map(|(&bucket_id, bucket_content)| {
+                    let combined_bucket_data: Vec<u8> =
+                        bucket_content.iter().flatten().cloned().collect();
+                    let mut encoded = String::with_capacity(b64_len);
+                    general_purpose::STANDARD.encode_string(&combined_bucket_data, &mut encoded);
+                    (bucket_id, encoded)
+                })
+                .collect();
 
-                let mut encoded = String::with_capacity(b64_len);
-                general_purpose::STANDARD.encode_string(&combined_bucket_data, &mut encoded);
-
-                single_array[bucket_id] = encoded;
+            for (id, enc) in encoded_buckets {
+                single_array[id] = enc;
             }
-
             single_array
         });
     }
