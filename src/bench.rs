@@ -284,8 +284,7 @@ impl Benchmarker {
                         single_resp.push(resp.results[w][j]);
                     }
 
-                    let serialized_vec = bincode::serialize(&single_resp).unwrap();
-                    let parsed_resp: Response = bincode::deserialize(&serialized_vec).unwrap();
+                    let parsed_resp = Response(single_resp);
 
                     let output = parsed_resp.parse_output_as_base64(&qps[j]);
                     if let Ok(decoded) = self.encrypted_fs.decode_base64(&output) {
@@ -394,8 +393,7 @@ impl Benchmarker {
                     single_resp.push(resp.results[w][j]);
                 }
 
-                let serialized_vec = bincode::serialize(&single_resp).unwrap();
-                let parsed_resp: Response = bincode::deserialize(&serialized_vec).unwrap();
+                let parsed_resp = Response(single_resp);
 
                 let _ = parsed_resp.parse_output_as_base64(&qps[j]);
             }
@@ -473,8 +471,7 @@ impl Benchmarker {
                 for w in 0..width {
                     single_resp.push(resp.results[w][j]);
                 }
-                let parsed_resp: Response =
-                    bincode::deserialize(&bincode::serialize(&single_resp).unwrap()).unwrap();
+                let parsed_resp = Response(single_resp);
                 let output = parsed_resp.parse_output_as_base64(&qps[j]);
 
                 if let Ok(decoded) = self.encrypted_fs.decode_base64(&output) {
@@ -573,8 +570,7 @@ impl Benchmarker {
                 for w in 0..width {
                     single_resp.push(resp.results[w][j]);
                 }
-                let parsed_resp: Response =
-                    bincode::deserialize(&bincode::serialize(&single_resp).unwrap()).unwrap();
+                let parsed_resp = Response(single_resp);
                 let output = parsed_resp.parse_output_as_base64(&qps[j]);
 
                 if let Ok(decoded_bucket) = self.encrypted_fs.decode_base64(&output) {
