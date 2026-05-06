@@ -64,15 +64,8 @@ impl<const N: usize> HashDIP<N> {
         _keyword_count_map: &HashMap<String, usize>,
         keyword_value_map: &HashMap<String, Vec<u8>>,
     ) -> (HashMap<usize, Vec<Vec<u8>>>, Vec<Vec<u8>>) {
-        let mut value_to_key_map: HashMap<Vec<u8>, String> =
-            HashMap::with_capacity(keyword_value_map.len());
-        for (k, v) in keyword_value_map {
-            value_to_key_map.insert(v.clone(), k.clone());
-        }
-
-        let mut buckets: HashMap<usize, Vec<Arc<Vec<u8>>>> = (0..self.m)
-            .map(|i| (i, Vec::with_capacity(self.p)))
-            .collect();
+        let mut buckets: Vec<Vec<(String, Arc<Vec<u8>>)>> =
+            (0..self.m).map(|_| Vec::with_capacity(self.p)).collect();
 
         let mut stash = Vec::new();
         let mut rng = rand::thread_rng();
@@ -94,9 +87,9 @@ impl<const N: usize> HashDIP<N> {
 
                 let mut placed = false;
                 for &h in hashes {
-                    let bucket = buckets.get_mut(&h).unwrap();
+                    let bucket = &mut buckets[h];
                     if bucket.len() < self.p {
-                        bucket.push(Arc::clone(&current_val));
+                        bucket.push((current_key.clone(), Arc::clone(&current_val)));
                         placed = true;
                         break;
                     }
@@ -106,24 +99,26 @@ impl<const N: usize> HashDIP<N> {
                 }
 
                 let target_hash = hashes[rng.gen_range(0..N)];
-                let bucket = buckets.get_mut(&target_hash).unwrap();
+                let bucket = &mut buckets[target_hash];
 
                 let idx = rng.gen_range(0..bucket.len());
-                let evicted_val = bucket.swap_remove(idx);
-                bucket.push(current_val);
+                let evicted = bucket.swap_remove(idx);
+                bucket.push((current_key.clone(), current_val));
 
-                current_val = evicted_val;
-                let full_evicted_key = value_to_key_map.get(current_val.as_ref()).unwrap();
-                current_key = full_evicted_key.split("||").next().unwrap().to_string();
+                current_key = evicted.0;
+                current_val = evicted.1;
             }
 
             stash.push(current_val);
         }
 
-        let final_buckets = buckets
+        let final_buckets: HashMap<usize, Vec<Vec<u8>>> = buckets
             .into_iter()
-            .map(|(k, v)| (k, v.into_iter().map(|arc| (*arc).clone()).collect()))
+            .enumerate()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k, v.into_iter().map(|(_, arc)| (*arc).clone()).collect()))
             .collect();
+
         let final_stash = stash.into_iter().map(|arc| (*arc).clone()).collect();
 
         (final_buckets, final_stash)
@@ -137,15 +132,8 @@ impl<const N: usize> HashDIP<N> {
         HashMap<usize, Vec<Vec<(String, usize)>>>,
         Vec<Vec<(String, usize)>>,
     ) {
-        let mut value_to_key_map: HashMap<Vec<(String, usize)>, String> =
-            HashMap::with_capacity(keyword_value_map.len());
-        for (k, v) in keyword_value_map {
-            value_to_key_map.insert(v.clone(), k.clone());
-        }
-
-        let mut buckets: HashMap<usize, Vec<Arc<Vec<(String, usize)>>>> = (0..self.m)
-            .map(|i| (i, Vec::with_capacity(self.p)))
-            .collect();
+        let mut buckets: Vec<Vec<(String, Arc<Vec<(String, usize)>>)>> =
+            (0..self.m).map(|_| Vec::with_capacity(self.p)).collect();
 
         let mut stash = Vec::new();
         let mut rng = rand::thread_rng();
@@ -165,9 +153,9 @@ impl<const N: usize> HashDIP<N> {
 
                 let mut placed = false;
                 for &h in hashes {
-                    let bucket = buckets.get_mut(&h).unwrap();
+                    let bucket = &mut buckets[h];
                     if bucket.len() < self.p {
-                        bucket.push(Arc::clone(&current_val));
+                        bucket.push((current_key.clone(), Arc::clone(&current_val)));
                         placed = true;
                         break;
                     }
@@ -177,23 +165,26 @@ impl<const N: usize> HashDIP<N> {
                 }
 
                 let target_hash = hashes[rng.gen_range(0..N)];
-                let bucket = buckets.get_mut(&target_hash).unwrap();
+                let bucket = &mut buckets[target_hash];
 
                 let idx = rng.gen_range(0..bucket.len());
-                let evicted_val = bucket.swap_remove(idx);
-                bucket.push(current_val);
+                let evicted = bucket.swap_remove(idx);
+                bucket.push((current_key.clone(), current_val));
 
-                current_val = evicted_val;
-                current_key = value_to_key_map.get(current_val.as_ref()).unwrap().clone();
+                current_key = evicted.0;
+                current_val = evicted.1;
             }
 
             stash.push(current_val);
         }
 
-        let final_buckets = buckets
+        let final_buckets: HashMap<usize, Vec<Vec<(String, usize)>>> = buckets
             .into_iter()
-            .map(|(k, v)| (k, v.into_iter().map(|arc| (*arc).clone()).collect()))
+            .enumerate()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k, v.into_iter().map(|(_, arc)| (*arc).clone()).collect()))
             .collect();
+
         let final_stash = stash.into_iter().map(|arc| (*arc).clone()).collect();
 
         (final_buckets, final_stash)
@@ -271,15 +262,8 @@ impl<const N: usize> BfsDIP<N> {
         _keyword_count_map: &HashMap<String, usize>,
         keyword_value_map: &HashMap<String, Vec<u8>>,
     ) -> (HashMap<usize, Vec<Vec<u8>>>, Vec<Vec<u8>>) {
-        let mut value_to_key_map: HashMap<Vec<u8>, String> =
-            HashMap::with_capacity(keyword_value_map.len());
-        for (k, v) in keyword_value_map {
-            value_to_key_map.insert(v.clone(), k.clone());
-        }
-
-        let mut buckets: HashMap<usize, Vec<Arc<Vec<u8>>>> = (0..self.m)
-            .map(|i| (i, Vec::with_capacity(self.p)))
-            .collect();
+        let mut buckets: Vec<Vec<(String, Arc<Vec<u8>>)>> =
+            (0..self.m).map(|_| Vec::with_capacity(self.p)).collect();
         let mut stash = Vec::new();
 
         let mut precomputed_hashes: HashMap<String, [usize; N]> =
@@ -297,9 +281,9 @@ impl<const N: usize> BfsDIP<N> {
             let hashes = precomputed_hashes.get(&current_key).unwrap();
             let mut placed = false;
             for &h in hashes {
-                let bucket = buckets.get_mut(&h).unwrap();
+                let bucket = &mut buckets[h];
                 if bucket.len() < self.p {
-                    bucket.push(Arc::clone(&current_val));
+                    bucket.push((current_key.clone(), Arc::clone(&current_val)));
                     placed = true;
                     break;
                 }
@@ -308,15 +292,15 @@ impl<const N: usize> BfsDIP<N> {
                 continue;
             }
 
-            let mut queue: VecDeque<(
-                usize,
-                Arc<Vec<u8>>,
-                Vec<(usize, Arc<Vec<u8>>, Arc<Vec<u8>>)>,
-            )> = VecDeque::new();
+            type TupleType = (String, Arc<Vec<u8>>);
+            let mut queue: VecDeque<(usize, TupleType, Vec<(usize, TupleType, TupleType)>)> =
+                VecDeque::new();
             let mut visited_buckets = HashSet::new();
 
+            let insert_tuple = (current_key.clone(), Arc::clone(&current_val));
+
             for &h in hashes {
-                queue.push_back((h, Arc::clone(&current_val), Vec::new()));
+                queue.push_back((h, insert_tuple.clone(), Vec::new()));
                 visited_buckets.insert(h);
             }
 
@@ -329,11 +313,10 @@ impl<const N: usize> BfsDIP<N> {
                 }
                 nodes_expanded += 1;
 
-                let current_bucket_items = buckets.get(&curr_b).unwrap().clone();
+                let current_bucket_items = buckets[curr_b].clone();
 
                 for (i, item) in current_bucket_items.iter().enumerate() {
-                    let full_key = value_to_key_map.get(item.as_ref()).unwrap();
-                    let b_key = full_key.split("||").next().unwrap();
+                    let b_key = &item.0;
                     let item_hashes = precomputed_hashes.get(b_key).unwrap();
 
                     for &alt_b in item_hashes {
@@ -341,20 +324,21 @@ impl<const N: usize> BfsDIP<N> {
                             continue;
                         }
 
-                        if buckets.get(&alt_b).unwrap().len() < self.p {
-                            buckets.get_mut(&alt_b).unwrap().push(Arc::clone(item));
-                            let cb = buckets.get_mut(&curr_b).unwrap();
+                        if buckets[alt_b].len() < self.p {
+                            buckets[alt_b].push(item.clone());
+                            let cb = &mut buckets[curr_b];
                             cb.remove(i);
-                            cb.push(Arc::clone(&val_to_insert));
+                            cb.push(val_to_insert.clone());
 
                             for (b, v_in, v_out) in path.iter().rev() {
-                                let bb = buckets.get_mut(b).unwrap();
-                                if let Some(pos) =
-                                    bb.iter().position(|x| Arc::ptr_eq(x, v_out) || x == v_out)
+                                let bb = &mut buckets[*b];
+                                if let Some(pos) = bb
+                                    .iter()
+                                    .position(|x| Arc::ptr_eq(&x.1, &v_out.1) || x.1 == v_out.1)
                                 {
                                     bb.remove(pos);
                                 }
-                                bb.push(Arc::clone(v_in));
+                                bb.push(v_in.clone());
                             }
 
                             success = true;
@@ -364,8 +348,8 @@ impl<const N: usize> BfsDIP<N> {
                         if !visited_buckets.contains(&alt_b) {
                             visited_buckets.insert(alt_b);
                             let mut new_path = path.clone();
-                            new_path.push((curr_b, Arc::clone(&val_to_insert), Arc::clone(item)));
-                            queue.push_back((alt_b, Arc::clone(item), new_path));
+                            new_path.push((curr_b, val_to_insert.clone(), item.clone()));
+                            queue.push_back((alt_b, item.clone(), new_path));
                         }
                     }
                 }
@@ -376,9 +360,11 @@ impl<const N: usize> BfsDIP<N> {
             }
         }
 
-        let final_buckets = buckets
+        let final_buckets: HashMap<usize, Vec<Vec<u8>>> = buckets
             .into_iter()
-            .map(|(k, v)| (k, v.into_iter().map(|arc| (*arc).clone()).collect()))
+            .enumerate()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k, v.into_iter().map(|(_, arc)| (*arc).clone()).collect()))
             .collect();
         let final_stash = stash.into_iter().map(|arc| (*arc).clone()).collect();
 
@@ -393,15 +379,8 @@ impl<const N: usize> BfsDIP<N> {
         HashMap<usize, Vec<Vec<(String, usize)>>>,
         Vec<Vec<(String, usize)>>,
     ) {
-        let mut value_to_key_map: HashMap<Vec<(String, usize)>, String> =
-            HashMap::with_capacity(keyword_value_map.len());
-        for (k, v) in keyword_value_map {
-            value_to_key_map.insert(v.clone(), k.clone());
-        }
-
-        let mut buckets: HashMap<usize, Vec<Arc<Vec<(String, usize)>>>> = (0..self.m)
-            .map(|i| (i, Vec::with_capacity(self.p)))
-            .collect();
+        let mut buckets: Vec<Vec<(String, Arc<Vec<(String, usize)>>)>> =
+            (0..self.m).map(|_| Vec::with_capacity(self.p)).collect();
         let mut stash = Vec::new();
 
         let mut precomputed_hashes: HashMap<String, [usize; N]> =
@@ -417,9 +396,9 @@ impl<const N: usize> BfsDIP<N> {
             let hashes = precomputed_hashes.get(&current_key).unwrap();
             let mut placed = false;
             for &h in hashes {
-                let bucket = buckets.get_mut(&h).unwrap();
+                let bucket = &mut buckets[h];
                 if bucket.len() < self.p {
-                    bucket.push(Arc::clone(&current_val));
+                    bucket.push((current_key.clone(), Arc::clone(&current_val)));
                     placed = true;
                     break;
                 }
@@ -428,15 +407,15 @@ impl<const N: usize> BfsDIP<N> {
                 continue;
             }
 
-            let mut queue: VecDeque<(
-                usize,
-                Arc<Vec<(String, usize)>>,
-                Vec<(usize, Arc<Vec<(String, usize)>>, Arc<Vec<(String, usize)>>)>,
-            )> = VecDeque::new();
+            type TupleType = (String, Arc<Vec<(String, usize)>>);
+            let mut queue: VecDeque<(usize, TupleType, Vec<(usize, TupleType, TupleType)>)> =
+                VecDeque::new();
             let mut visited_buckets = HashSet::new();
 
+            let insert_tuple = (current_key.clone(), Arc::clone(&current_val));
+
             for &h in hashes {
-                queue.push_back((h, Arc::clone(&current_val), Vec::new()));
+                queue.push_back((h, insert_tuple.clone(), Vec::new()));
                 visited_buckets.insert(h);
             }
 
@@ -449,10 +428,10 @@ impl<const N: usize> BfsDIP<N> {
                 }
                 nodes_expanded += 1;
 
-                let current_bucket_items = buckets.get(&curr_b).unwrap().clone();
+                let current_bucket_items = buckets[curr_b].clone();
 
                 for (i, item) in current_bucket_items.iter().enumerate() {
-                    let b_key = value_to_key_map.get(item.as_ref()).unwrap();
+                    let b_key = &item.0;
                     let item_hashes = precomputed_hashes.get(b_key).unwrap();
 
                     for &alt_b in item_hashes {
@@ -460,20 +439,21 @@ impl<const N: usize> BfsDIP<N> {
                             continue;
                         }
 
-                        if buckets.get(&alt_b).unwrap().len() < self.p {
-                            buckets.get_mut(&alt_b).unwrap().push(Arc::clone(item));
-                            let cb = buckets.get_mut(&curr_b).unwrap();
+                        if buckets[alt_b].len() < self.p {
+                            buckets[alt_b].push(item.clone());
+                            let cb = &mut buckets[curr_b];
                             cb.remove(i);
-                            cb.push(Arc::clone(&val_to_insert));
+                            cb.push(val_to_insert.clone());
 
                             for (b, v_in, v_out) in path.iter().rev() {
-                                let bb = buckets.get_mut(b).unwrap();
-                                if let Some(pos) =
-                                    bb.iter().position(|x| Arc::ptr_eq(x, v_out) || x == v_out)
+                                let bb = &mut buckets[*b];
+                                if let Some(pos) = bb
+                                    .iter()
+                                    .position(|x| Arc::ptr_eq(&x.1, &v_out.1) || x.1 == v_out.1)
                                 {
                                     bb.remove(pos);
                                 }
-                                bb.push(Arc::clone(v_in));
+                                bb.push(v_in.clone());
                             }
 
                             success = true;
@@ -483,8 +463,8 @@ impl<const N: usize> BfsDIP<N> {
                         if !visited_buckets.contains(&alt_b) {
                             visited_buckets.insert(alt_b);
                             let mut new_path = path.clone();
-                            new_path.push((curr_b, Arc::clone(&val_to_insert), Arc::clone(item)));
-                            queue.push_back((alt_b, Arc::clone(item), new_path));
+                            new_path.push((curr_b, val_to_insert.clone(), item.clone()));
+                            queue.push_back((alt_b, item.clone(), new_path));
                         }
                     }
                 }
@@ -495,9 +475,11 @@ impl<const N: usize> BfsDIP<N> {
             }
         }
 
-        let final_buckets = buckets
+        let final_buckets: HashMap<usize, Vec<Vec<(String, usize)>>> = buckets
             .into_iter()
-            .map(|(k, v)| (k, v.into_iter().map(|arc| (*arc).clone()).collect()))
+            .enumerate()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k, v.into_iter().map(|(_, arc)| (*arc).clone()).collect()))
             .collect();
         let final_stash = stash.into_iter().map(|arc| (*arc).clone()).collect();
 
