@@ -11,6 +11,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
+
 pub struct Benchmarker {
     encrypted_fs: EncryptedFileSystem,
     keywords_file: Option<String>,
@@ -238,33 +240,34 @@ impl Benchmarker {
             self.get_indexes_for_keywords(&self.selected_keywords, self.volmap_m);
         self.volmap_keyword_counts.clear();
 
-        for &index in &indexes_to_query {
-            let mut qp = QueryParams::new(&cp, bp).unwrap();
-            let q = match qp.generate_query(index) {
-                Ok(query) => query,
-                Err(_) => continue,
-            };
-            let d_resp = shard.respond(&q).unwrap();
-            let resp: Response = bincode::deserialize(&d_resp).unwrap();
-            let output = resp.parse_output_as_base64(&qp);
-            let decoded = self.encrypted_fs.decode_base64(&output)?;
+        let counts: Vec<u32> = indexes_to_query
+            .par_iter()
+            .filter_map(|&index| {
+                let mut qp = QueryParams::new(&cp, bp).unwrap();
+                let q = qp.generate_query(index).ok()?;
+                let d_resp = shard.respond(&q).unwrap();
+                let resp: Response = bincode::deserialize(&d_resp).unwrap();
+                let output = resp.parse_output_as_base64(&qp);
+                let decoded = self.encrypted_fs.decode_base64(&output).ok()?;
 
-            let keyword_size = decoded[0] as usize;
-            if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
-                if let Ok(keyword) = String::from_utf8(decoded[1..1 + keyword_size].to_vec()) {
-                    if let Ok(count_bytes) =
-                        decoded[1 + keyword_size..1 + keyword_size + 4].try_into()
-                    {
-                        let count = u32::from_le_bytes(count_bytes);
-
-                        if self.selected_keywords.contains(&keyword) {
-                            self.volmap_keyword_counts.push(count);
+                let keyword_size = decoded[0] as usize;
+                if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
+                    if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size]) {
+                        if let Ok(count_bytes) =
+                            decoded[1 + keyword_size..1 + keyword_size + 4].try_into()
+                        {
+                            let count = u32::from_le_bytes(count_bytes);
+                            if self.selected_keywords.contains(&keyword.to_string()) {
+                                return Some(count);
+                            }
                         }
                     }
                 }
-            }
-        }
+                None
+            })
+            .collect();
 
+        self.volmap_keyword_counts.extend(counts);
         self.volmap_query_time = volmap_query_start.elapsed();
         info!("FrodoPIR query finished executing.");
 
@@ -308,16 +311,14 @@ impl Benchmarker {
         let valmap_keywords = self.generate_valmap_keywords();
         let indexes_to_query = self.get_indexes_for_keywords(&valmap_keywords, self.valmap_m);
 
-        for &index in &indexes_to_query {
+        indexes_to_query.par_iter().for_each(|&index| {
             let mut qp = QueryParams::new(&cp, bp).unwrap();
-            let q = match qp.generate_query(index) {
-                Ok(query) => query,
-                Err(_) => continue,
-            };
-            let d_resp = shard.respond(&q).unwrap();
-            let resp: Response = bincode::deserialize(&d_resp).unwrap();
-            let _ = resp.parse_output_as_base64(&qp);
-        }
+            if let Ok(query) = qp.generate_query(index) {
+                let d_resp = shard.respond(&query).unwrap();
+                let resp: Response = bincode::deserialize(&d_resp).unwrap();
+                let _ = resp.parse_output_as_base64(&qp);
+            }
+        });
 
         self.valmap_query_time = valmap_query_time.elapsed();
         info!("FrodoPIR query for ValMap finished executing.");
@@ -354,7 +355,7 @@ impl Benchmarker {
 
                 let keyword_size = decoded[0] as usize;
                 if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
-                    if let Ok(keyword) = String::from_utf8(decoded[1..1 + keyword_size].to_vec()) {
+                    if let Ok(keyword) = std::str::from_utf8(&decoded[1..1 + keyword_size]) {
                         if keyword == target_keyword {
                             let count_bytes: [u8; 4] = decoded
                                 [1 + keyword_size..1 + keyword_size + 4]
