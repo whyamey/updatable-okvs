@@ -224,7 +224,7 @@ impl Benchmarker {
         let m = volmap_db_array.len() as usize;
         let elem_size = 2u32.pow(8) as usize;
         let plaintext_bits = 10usize;
-        let lwe_dim = 1572;
+        let lwe_dim = 1288;
         let shard =
             Shard::from_base64_strings(&volmap_db_array, lwe_dim, m, elem_size, plaintext_bits)
                 .unwrap();
@@ -341,7 +341,7 @@ impl Benchmarker {
         let m = db_array.len() as usize;
         let elem_size = 2u32.pow(13) as usize;
         let plaintext_bits = 10usize;
-        let lwe_dim = 1572;
+        let lwe_dim = 1288;
         let shard =
             Shard::from_base64_strings(&db_array, lwe_dim, m, elem_size, plaintext_bits).unwrap();
 
@@ -418,7 +418,7 @@ impl Benchmarker {
 
         let volmap_db_array = self.encrypted_fs.get_single_string_array_volmap().unwrap();
         let m_vol = volmap_db_array.len() as usize;
-        let vol_shard = Shard::from_base64_strings(&volmap_db_array, 1572, m_vol, 256, 10).unwrap();
+        let vol_shard = Shard::from_base64_strings(&volmap_db_array, 1288, m_vol, 256, 10).unwrap();
         let bp_vol = vol_shard.get_base_params();
         let cp_vol = CommonParams::from(bp_vol);
 
@@ -517,7 +517,7 @@ impl Benchmarker {
         let valmap_db_array = self.encrypted_fs.get_single_string_array().unwrap();
         let m_val = valmap_db_array.len() as usize;
         let val_shard =
-            Shard::from_base64_strings(&valmap_db_array, 1572, m_val, 8192, 10).unwrap();
+            Shard::from_base64_strings(&valmap_db_array, 1288, m_val, 8192, 10).unwrap();
         let bp_val = val_shard.get_base_params();
         let cp_val = CommonParams::from(bp_val);
 
