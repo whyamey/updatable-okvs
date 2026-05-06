@@ -458,10 +458,10 @@ impl EncryptedFileSystem {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let modified_keyword_count_map = self.create_modified_keyword_count_map();
         let result = if self.use_bfs {
-            let dip = BfsDIP::<2>::new(m, p);
+            let dip = BfsDIP::<4>::new(m, p);
             dip.build_valmap(&modified_keyword_count_map, &self.keyword_value_map)
         } else {
-            let dip = HashDIP::<2>::new(m, p);
+            let dip = HashDIP::<4>::new(m, p);
             dip.build_valmap(&modified_keyword_count_map, &self.keyword_value_map)
         };
 
@@ -481,10 +481,10 @@ impl EncryptedFileSystem {
             .collect();
 
         let result = if self.use_bfs {
-            let dip = BfsDIP::<2>::new(m, p);
+            let dip = BfsDIP::<4>::new(m, p);
             dip.build_volmap(&self.keyword_count_map, &keyword_count_as_value_map)
         } else {
-            let dip = HashDIP::<2>::new(m, p);
+            let dip = HashDIP::<4>::new(m, p);
             dip.build_volmap(&self.keyword_count_map, &keyword_count_as_value_map)
         };
 

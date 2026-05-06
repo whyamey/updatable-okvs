@@ -202,40 +202,16 @@ impl Benchmarker {
 
     fn get_indexes_for_keywords(&self, keywords: &[String], m: usize) -> HashSet<usize> {
         let mut indexes = HashSet::new();
+        let dip_hasher = HashDIP::<4>::new(m, 1);
 
         for keyword in keywords {
-            let (base_keyword, num_ones) = HashDIP::<2>::parse_keyword(keyword);
-
-            if num_ones == 0 {
-                indexes.insert(self.hash1(base_keyword, m));
-                indexes.insert(self.hash2(base_keyword, m));
-            } else {
-                let h1 = (self.hash1(base_keyword, m) + self.hash1(&num_ones.to_string(), m)) % m;
-                let h2 = (self.hash2(base_keyword, m) + self.hash2(&num_ones.to_string(), m)) % m;
-
-                indexes.insert(h1);
-                indexes.insert(h2);
+            let hashes = dip_hasher.get_hashes(keyword);
+            for h in hashes {
+                indexes.insert(h);
             }
         }
 
         indexes
-    }
-
-    fn hash1(&self, key: &str, m: usize) -> usize {
-        let hash = blake3::hash(key.as_bytes());
-        let hash_bytes = hash.as_bytes();
-        let hash_value = u64::from_le_bytes(hash_bytes[..8].try_into().unwrap());
-        (hash_value as usize) % m
-    }
-
-    fn hash2(&self, key: &str, m: usize) -> usize {
-        let mut keyed_hasher = blake3::Hasher::new_keyed(b"different key for second hashing");
-        keyed_hasher.update(key.as_bytes());
-        let hash = keyed_hasher.finalize();
-
-        let hash_bytes = hash.as_bytes();
-        let hash_value = u64::from_le_bytes(hash_bytes[..8].try_into().unwrap());
-        (hash_value as usize) % m
     }
 
     fn run_volmap_benchmark(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -274,7 +250,7 @@ impl Benchmarker {
             let decoded = self.encrypted_fs.decode_base64(&output)?;
 
             let keyword_size = decoded[0] as usize;
-            if keyword_size > 0 {
+            if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
                 if let Ok(keyword) = String::from_utf8(decoded[1..1 + keyword_size].to_vec()) {
                     if let Ok(count_bytes) =
                         decoded[1 + keyword_size..1 + keyword_size + 4].try_into()

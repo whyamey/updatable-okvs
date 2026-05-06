@@ -4,7 +4,7 @@ use blake3;
 use rand::Rng;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const MAX_EVICTIONS: usize = 100;
+const MAX_EVICTIONS: usize = 5;
 
 pub struct HashDIP<const N: usize = 2> {
     m: usize,
@@ -42,7 +42,7 @@ impl<const N: usize> HashDIP<N> {
     }
 
     /// Tabulation Hashing is just (hash(kwd) + hash(counter)) mod m
-    fn get_hashes(&self, keyword: &str) -> [usize; N] {
+    pub fn get_hashes(&self, keyword: &str) -> [usize; N] {
         let (base_keyword, num_ones) = Self::parse_keyword(keyword);
         let mut hashes = [0; N];
 
@@ -249,7 +249,7 @@ impl<const N: usize> BfsDIP<N> {
         (hash_value as usize) % self.m
     }
 
-    fn get_hashes(&self, keyword: &str) -> [usize; N] {
+    pub fn get_hashes(&self, keyword: &str) -> [usize; N] {
         let (base_keyword, num_ones) = Self::parse_keyword(keyword);
         let mut hashes = [0; N];
 
