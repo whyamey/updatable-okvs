@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log4rs::init_config(config)?;
 
     let p = 31;
-    let epsilon = 0.1;
+    let epsilon = 0.2;
     let run_decryption_test = false;
 
     let mut benchmarker = Benchmarker::new(
