@@ -32,6 +32,9 @@ pub struct EncryptedFileSystem {
     original_multimap: MultiMap<String, u32>,
     encrypted_multimap: MultiMap<Vec<u8>, Vec<u8>>,
     pub plaintext_encrypted_multimap: MultiMap<String, Vec<u8>>,
+    pub docmap_dip_result: Option<(HashMap<usize, Vec<Vec<u8>>>, Vec<Vec<u8>>)>,
+    pub single_string_array_docmap: Option<Vec<String>>,
+    pub doc_chunk_counts: HashMap<u32, usize>,
     iv: [u8; 16],
     encryption_keys: HashMap<Vec<u8>, [u8; 32]>,
     document_keys: HashMap<u32, [u8; 16]>,
@@ -69,6 +72,9 @@ impl EncryptedFileSystem {
             original_multimap,
             encrypted_multimap,
             plaintext_encrypted_multimap,
+            docmap_dip_result: None,
+            single_string_array_docmap: None,
+            doc_chunk_counts: HashMap::new(),
             iv,
             encryption_keys,
             document_keys,
@@ -152,6 +158,10 @@ impl EncryptedFileSystem {
         let mut iv = [0u8; 16];
         rng.fill(&mut iv);
         iv
+    }
+
+    pub fn get_original_paths(&self, keyword: &str) -> Option<Vec<u32>> {
+        self.original_multimap.get_vec(keyword).cloned()
     }
 
     fn hash_keyword(keyword: &str) -> Vec<u8> {
@@ -493,6 +503,88 @@ impl EncryptedFileSystem {
 
         self.tethys_dip_result_volmap = Some(result);
         Ok(())
+    }
+
+    pub fn build_and_apply_docmap(&mut self, m: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let mut docmap_kv = HashMap::new();
+        let chunk_size = 4096;
+
+        for entry in std::fs::read_dir("encrypted_docs")? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("enc") {
+                let file_stem = path.file_stem().unwrap().to_str().unwrap();
+                let file_id: u32 = file_stem.parse()?;
+
+                let content = std::fs::read(&path)?;
+                let mut chunks = content.chunks(chunk_size);
+                let mut chunk_idx = 0;
+
+                while let Some(chunk) = chunks.next() {
+                    let mut padded_chunk = vec![0u8; chunk_size];
+                    padded_chunk[..chunk.len()].copy_from_slice(chunk);
+
+                    let mut key_str = format!("doc_{}_", file_id);
+                    key_str.push_str(&"1".repeat(chunk_idx));
+
+                    docmap_kv.insert(key_str, padded_chunk);
+                    chunk_idx += 1;
+                }
+                self.doc_chunk_counts.insert(file_id, chunk_idx);
+            }
+        }
+
+        let empty_count_map = HashMap::new();
+        let result = if self.use_bfs {
+            let dip = BfsDIP::<4>::new(m, 1);
+            dip.build_valmap(&empty_count_map, &docmap_kv)
+        } else {
+            let dip = HashDIP::<4>::new(m, 1);
+            dip.build_valmap(&empty_count_map, &docmap_kv)
+        };
+
+        self.docmap_dip_result = Some(result);
+        Ok(())
+    }
+
+    pub fn generate_single_string_array_docmap(&mut self) {
+        self.single_string_array_docmap = self.docmap_dip_result.as_ref().map(|(buckets, _)| {
+            let max_bucket_id = buckets.keys().max().unwrap_or(&0);
+            let mut single_array = vec![String::new(); max_bucket_id + 1];
+
+            let encoded_buckets: Vec<(usize, String)> = buckets
+                .par_iter()
+                .map(|(&bucket_id, bucket_content)| {
+                    let combined_bucket_data: Vec<u8> =
+                        bucket_content.iter().flatten().cloned().collect();
+                    let mut encoded = String::new();
+                    if !combined_bucket_data.is_empty() {
+                        general_purpose::STANDARD
+                            .encode_string(&combined_bucket_data, &mut encoded);
+                    }
+                    (bucket_id, encoded)
+                })
+                .collect();
+
+            for (id, enc) in encoded_buckets {
+                single_array[id] = enc;
+            }
+            single_array
+        });
+    }
+
+    pub fn fill_empty_index_docmap(&mut self) {
+        if let Some(single_array) = &mut self.single_string_array_docmap {
+            let random_data_size = 4096;
+            let mut rng = rand::thread_rng();
+            for index in 0..single_array.len() {
+                if single_array[index].is_empty() {
+                    let mut random_data = vec![0u8; random_data_size];
+                    rng.fill_bytes(&mut random_data);
+                    single_array[index] = general_purpose::STANDARD.encode(&random_data);
+                }
+            }
+        }
     }
 
     pub fn get_tethys_dip_stats(&self) -> Option<(usize, usize, usize)> {
