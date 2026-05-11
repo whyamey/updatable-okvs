@@ -517,7 +517,7 @@ impl EncryptedFileSystem {
 
     pub fn add_padding_to_buckets(&mut self) {
         if let Some((buckets, _)) = self.tethys_dip_result.as_mut() {
-            let target_size = 1024;
+            let target_size = 8192;
             for bucket in buckets.values_mut() {
                 let current_size: usize = bucket.iter().map(|item| item.len()).sum();
                 let padding_needed = target_size - current_size;
@@ -533,7 +533,7 @@ impl EncryptedFileSystem {
             let max_bucket_id = buckets.keys().max().unwrap_or(&0);
             let mut single_array = vec![String::new(); max_bucket_id + 1];
 
-            let target_size = 1024;
+            let target_size = 8192;
             let b64_len = (target_size * 4 / 3) + 4;
 
             let encoded_buckets: Vec<(usize, String)> = buckets

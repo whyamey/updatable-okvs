@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log4rs::init_config(config)?;
 
-    let p = 31;
+    let p = 256;
     let epsilon = 0.2;
     let run_decryption_test = false;
 
