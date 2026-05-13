@@ -287,7 +287,7 @@ impl Benchmarker {
 
         let volmap_db_array = self.encrypted_fs.get_single_string_array_volmap().unwrap();
         let m = volmap_db_array.len() as usize;
-        let elem_size = 2u32.pow(8) as usize;
+        let elem_size = 2u32.pow(11) as usize;
         let plaintext_bits = 10usize;
         let lwe_dim = 1288;
         let shard =
@@ -420,8 +420,8 @@ impl Benchmarker {
 
         let db_array = self.encrypted_fs.get_single_string_array().unwrap();
         let m = db_array.len() as usize;
-        let elem_size = 2u32.pow(13) as usize;
-        let plaintext_bits = 10usize;
+        let elem_size = 2u32.pow(16) as usize;
+        let plaintext_bits = 9usize;
         let lwe_dim = 1288;
         let shard =
             Shard::from_base64_strings(&db_array, lwe_dim, m, elem_size, plaintext_bits).unwrap();
@@ -577,8 +577,8 @@ impl Benchmarker {
             .as_ref()
             .unwrap();
         let m = db_array.len();
-        let elem_size = 4096;
-        let plaintext_bits = 10usize;
+        let elem_size = 2u32.pow(15) as usize;
+        let plaintext_bits = 9usize;
         let lwe_dim = 1288;
         let shard =
             Shard::from_base64_strings(db_array, lwe_dim, m, elem_size, plaintext_bits).unwrap();
@@ -687,7 +687,8 @@ impl Benchmarker {
 
         let volmap_db_array = self.encrypted_fs.get_single_string_array_volmap().unwrap();
         let m_vol = volmap_db_array.len() as usize;
-        let vol_shard = Shard::from_base64_strings(&volmap_db_array, 1288, m_vol, 256, 10).unwrap();
+        let vol_shard =
+            Shard::from_base64_strings(&volmap_db_array, 1288, m_vol, 2048, 10).unwrap();
         let bp_vol = vol_shard.get_base_params();
         let cp_vol = CommonParams::from(bp_vol);
 
@@ -805,7 +806,7 @@ impl Benchmarker {
         let valmap_db_array = self.encrypted_fs.get_single_string_array().unwrap();
         let m_val = valmap_db_array.len() as usize;
         let val_shard =
-            Shard::from_base64_strings(&valmap_db_array, 1288, m_val, 8192, 10).unwrap();
+            Shard::from_base64_strings(&valmap_db_array, 1288, m_val, 65536, 9).unwrap();
         let bp_val = val_shard.get_base_params();
         let cp_val = CommonParams::from(bp_val);
 
@@ -977,7 +978,7 @@ impl Benchmarker {
                 }
 
                 if self.run_docmap_test {
-                    info!("> Proceeding to DocMap retrieval for the discovered documents...");
+                    info!("> Proceeding to DocMap retrieval test for the discovered documents...");
 
                     let mut docmap_keywords = Vec::new();
                     for &doc_id in &ordered_docs {
@@ -1006,14 +1007,16 @@ impl Benchmarker {
                         .expect("DocMap not initialized");
                     let m_doc = docmap_db_array.len() as usize;
                     let doc_shard =
-                        Shard::from_base64_strings(&docmap_db_array, 1288, m_doc, 4096, 10)
+                        Shard::from_base64_strings(&docmap_db_array, 1288, m_doc, 32768, 9)
                             .unwrap();
                     let bp_doc = doc_shard.get_base_params();
                     let cp_doc = CommonParams::from(bp_doc);
 
-                    let docmap_indexes_set =
-                        self.get_indexes_for_keywords(&docmap_keywords, self.docmap_m);
-                    let mut docmap_indexes: Vec<usize> = docmap_indexes_set.into_iter().collect();
+                    let mut docmap_indexes: Vec<usize> = docmap_keywords
+                        .iter()
+                        .filter_map(|kw| self.encrypted_fs.docmap_indices.get(kw).copied())
+                        .collect();
+
                     let original_docmap_len = docmap_indexes.len();
 
                     while docmap_indexes.len() % 8 != 0 {
