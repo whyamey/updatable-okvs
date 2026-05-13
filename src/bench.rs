@@ -182,32 +182,15 @@ impl Benchmarker {
 
         if self.run_docmap_test {
             info!("Setting up DocMap...");
-            let chunk_size = 4096;
-            let mut total_chunks = 0;
-
-            for entry in std::fs::read_dir("encrypted_docs")? {
-                let entry = entry?;
-                if entry.path().extension().and_then(|s| s.to_str()) == Some("enc") {
-                    let size = entry.metadata()?.len() as usize;
-                    total_chunks += (size + chunk_size - 1) / chunk_size;
-                }
-            }
-            if total_chunks == 0 {
-                total_chunks = 1;
-            }
-            self.docmap_m = ((1.8 + self.epsilon) * total_chunks as f64).ceil() as usize;
-
             let docmap_setup_start = Instant::now();
-            self.encrypted_fs.build_and_apply_docmap(self.docmap_m)?;
-            self.encrypted_fs.generate_single_string_array_docmap();
-            self.encrypted_fs.fill_empty_index_docmap();
-            self.docmap_setup_time = docmap_setup_start.elapsed();
+            self.encrypted_fs.build_and_apply_docmap()?;
 
-            if let Some((buckets, stash)) = &self.encrypted_fs.docmap_dip_result {
-                info!("\nTethysDIP Statistics for DocMap:");
-                info!("Total buckets built: {}", buckets.len());
-                info!("Stash size: {}", stash.len());
+            if let Some(arr) = &self.encrypted_fs.single_string_array_docmap {
+                self.docmap_m = arr.len();
+                info!("\nFlat Array Statistics for DocMap:");
+                info!("Total chunks built: {}", self.docmap_m);
             }
+            self.docmap_setup_time = docmap_setup_start.elapsed();
         }
 
         self.setup_time = setup_start.elapsed();
@@ -527,10 +510,13 @@ impl Benchmarker {
 
         info!("Querying {} 4KB chunks from DocMap.", docmap_keywords.len());
 
-        let indexes_to_query = self.get_indexes_for_keywords(&docmap_keywords, self.docmap_m);
-        let mut indices: Vec<usize> = indexes_to_query.into_iter().collect();
+        let mut indices: Vec<usize> = docmap_keywords
+            .iter()
+            .filter_map(|kw| self.encrypted_fs.docmap_indices.get(kw).copied())
+            .collect();
+
         while indices.len() % 8 != 0 {
-            indices.push(0); // Pad to multiples of 8 for batched query compatibility
+            indices.push(0);
         }
 
         indices.par_chunks(8).for_each(|chunk| {
@@ -802,7 +788,7 @@ impl Benchmarker {
             .collect();
 
         info!(
-            "> Retrieved {} potential 48-byte encrypted payloads from ValMap.",
+            "> Retrieved {} potential 32-byte encrypted payloads from ValMap.",
             retrieved_encrypted_paths.len()
         );
 
@@ -812,23 +798,64 @@ impl Benchmarker {
             stash.len()
         );
 
+        let mut valid_payloads = Vec::new();
+        let mut valid_doc_ids = std::collections::HashSet::new();
+        let mut failed_decrypts = 0;
+
+        let all_payloads: Vec<_> = retrieved_encrypted_paths
+            .iter()
+            .chain(stash.iter())
+            .collect();
+        let client_key = self
+            .encrypted_fs
+            .client_keys
+            .get(target_keyword)
+            .expect("Client key not found");
+
+        for payload in all_payloads {
+            if payload.len() != 32 {
+                failed_decrypts += 1;
+                continue;
+            }
+            let decrypted = self.encrypted_fs.decrypt_data_public(client_key, payload);
+            let file_id = u32::from_le_bytes(decrypted[..4].try_into().unwrap());
+
+            if let Some(expected_paths) = self
+                .encrypted_fs
+                .plaintext_encrypted_multimap
+                .get_vec(target_keyword)
+            {
+                if expected_paths.contains(payload) {
+                    valid_payloads.push(payload.clone());
+                    valid_doc_ids.insert(file_id);
+                } else {
+                    failed_decrypts += 1;
+                }
+            } else {
+                failed_decrypts += 1;
+            }
+        }
+
+        info!(
+            "> Attempting to decrypt {} payloads using client key...",
+            retrieved_encrypted_paths.len() + stash.len()
+        );
+        info!(
+            "> Decryption failed on {} payloads (belonged to other buckets/padding).",
+            failed_decrypts
+        );
+        info!(
+            "> Decryption succeeded on {} payloads! Retrieved Document IDs: {:?}",
+            valid_payloads.len(),
+            valid_doc_ids
+        );
+
         if let Some(expected_paths) = self
             .encrypted_fs
             .plaintext_encrypted_multimap
             .get_vec(target_keyword)
         {
-            let mut matched_in_db = 0;
-            let mut matched_in_stash = 0;
-
-            for expected_path in expected_paths {
-                if retrieved_encrypted_paths.contains(expected_path) {
-                    matched_in_db += 1;
-                } else if stash.contains(expected_path) {
-                    matched_in_stash += 1;
-                }
-            }
-
-            let total_matched = matched_in_db + matched_in_stash;
+            let total_matched = valid_payloads.len();
 
             if total_matched == expected_paths.len() {
                 info!(
@@ -841,133 +868,133 @@ impl Benchmarker {
                 if self.run_docmap_test {
                     info!("> Proceeding to DocMap retrieval for the discovered documents...");
 
-                    if let Some(original_doc_ids) =
-                        self.encrypted_fs.get_original_paths(target_keyword)
-                    {
-                        let mut docmap_keywords = Vec::new();
+                    let mut docmap_keywords = Vec::new();
 
-                        for &doc_id in &original_doc_ids {
-                            let chunks = *self
-                                .encrypted_fs
-                                .doc_chunk_counts
-                                .get(&doc_id)
-                                .unwrap_or(&1);
-                            for i in 0..chunks {
-                                let mut modified_keyword = format!("doc_{}_", doc_id);
-                                modified_keyword.push_str(&"1".repeat(i));
-                                docmap_keywords.push(modified_keyword);
-                            }
-                        }
-
-                        info!(
-                            "> Generating {} queries for DocMap to fetch {} documents...",
-                            docmap_keywords.len(),
-                            original_doc_ids.len()
-                        );
-
-                        let docmap_db_array = self
+                    for &doc_id in &valid_doc_ids {
+                        let chunks = *self
                             .encrypted_fs
-                            .single_string_array_docmap
-                            .as_ref()
-                            .expect("DocMap not initialized");
-                        let m_doc = docmap_db_array.len() as usize;
-                        let doc_shard =
-                            Shard::from_base64_strings(&docmap_db_array, 1288, m_doc, 4096, 10)
-                                .unwrap();
-                        let bp_doc = doc_shard.get_base_params();
-                        let cp_doc = CommonParams::from(bp_doc);
-
-                        let docmap_indexes_set =
-                            self.get_indexes_for_keywords(&docmap_keywords, self.docmap_m);
-                        let mut docmap_indexes: Vec<usize> =
-                            docmap_indexes_set.into_iter().collect();
-                        let original_docmap_len = docmap_indexes.len();
-
-                        while docmap_indexes.len() % 8 != 0 {
-                            docmap_indexes.push(0);
+                            .doc_chunk_counts
+                            .get(&doc_id)
+                            .unwrap_or(&1);
+                        for i in 0..chunks {
+                            let mut modified_keyword = format!("doc_{}_", doc_id);
+                            modified_keyword.push_str(&"1".repeat(i));
+                            docmap_keywords.push(modified_keyword);
                         }
-
-                        let retrieved_doc_chunks: Vec<Vec<u8>> = docmap_indexes
-                            .par_chunks(8)
-                            .flat_map(|chunk| {
-                                let mut local_chunks = Vec::new();
-                                let mut qps = Vec::with_capacity(8);
-                                let mut queries = Vec::with_capacity(8);
-                                let mut batched_qps =
-                                    BatchedQueryParams8::new(&cp_doc, bp_doc).unwrap();
-
-                                for i in 0..8 {
-                                    let mut success = false;
-                                    let mut qp = batched_qps.extract_query_params(i).unwrap();
-
-                                    if let Ok(q) = qp.generate_query(chunk[i]) {
-                                        qps.push(qp);
-                                        queries.push(q);
-                                        success = true;
-                                    }
-
-                                    if !success {
-                                        loop {
-                                            let mut fallback_qp =
-                                                QueryParams::new(&cp_doc, bp_doc).unwrap();
-                                            if let Ok(q) = fallback_qp.generate_query(chunk[i]) {
-                                                qps.push(fallback_qp);
-                                                queries.push(q);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let interleaved: Vec<[u32; 8]> = (0..m_doc)
-                                    .map(|row| {
-                                        let mut vals = [0u32; 8];
-                                        for j in 0..8 {
-                                            vals[j] = queries[j].as_slice()[row];
-                                        }
-                                        vals
-                                    })
-                                    .collect();
-
-                                let bq = BatchedQuery8 { interleaved };
-                                let d_resp = doc_shard.respond_batched_8(&bq).unwrap();
-                                let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
-                                let width = doc_shard.get_db().get_matrix_width_self();
-
-                                for j in 0..8 {
-                                    if chunk[j] == 0
-                                        && !docmap_keywords.contains(&"0".to_string())
-                                        && chunk[j]
-                                            != docmap_indexes[original_docmap_len.saturating_sub(1)]
-                                    {
-                                        continue;
-                                    }
-
-                                    let mut single_resp = Vec::with_capacity(width);
-                                    for w in 0..width {
-                                        single_resp.push(resp.results[w][j]);
-                                    }
-                                    let parsed_resp = Response(single_resp);
-                                    let output = parsed_resp.parse_output_as_base64(&qps[j]);
-
-                                    if let Ok(decoded_chunk) = fs.decode_base64(&output) {
-                                        local_chunks.push(decoded_chunk);
-                                    }
-                                }
-                                local_chunks
-                            })
-                            .collect();
-
-                        info!(
-                            "> Success! Retrieved {} 4KB document chunks from DocMap.",
-                            retrieved_doc_chunks.len()
-                        );
-                        info!("> End-to-End Test Complete.");
                     }
+
+                    info!(
+                        "> Generating {} queries for DocMap to fetch {} documents...",
+                        docmap_keywords.len(),
+                        valid_doc_ids.len()
+                    );
+
+                    let docmap_db_array = self
+                        .encrypted_fs
+                        .single_string_array_docmap
+                        .as_ref()
+                        .expect("DocMap not initialized");
+                    let m_doc = docmap_db_array.len() as usize;
+                    let doc_shard =
+                        Shard::from_base64_strings(&docmap_db_array, 1288, m_doc, 4096, 10)
+                            .unwrap();
+                    let bp_doc = doc_shard.get_base_params();
+                    let cp_doc = CommonParams::from(bp_doc);
+
+                    let mut docmap_indexes: Vec<usize> = docmap_keywords
+                        .iter()
+                        .filter_map(|kw| self.encrypted_fs.docmap_indices.get(kw).copied())
+                        .collect();
+                    let original_docmap_len = docmap_indexes.len();
+
+                    while docmap_indexes.len() % 8 != 0 {
+                        docmap_indexes.push(0);
+                    }
+
+                    let retrieved_doc_chunks: Vec<Vec<u8>> = docmap_indexes
+                        .par_chunks(8)
+                        .flat_map(|chunk| {
+                            let mut local_chunks = Vec::new();
+                            let mut qps = Vec::with_capacity(8);
+                            let mut queries = Vec::with_capacity(8);
+                            let mut batched_qps =
+                                BatchedQueryParams8::new(&cp_doc, bp_doc).unwrap();
+
+                            for i in 0..8 {
+                                let mut success = false;
+                                let mut qp = batched_qps.extract_query_params(i).unwrap();
+
+                                if let Ok(q) = qp.generate_query(chunk[i]) {
+                                    qps.push(qp);
+                                    queries.push(q);
+                                    success = true;
+                                }
+
+                                if !success {
+                                    loop {
+                                        let mut fallback_qp =
+                                            QueryParams::new(&cp_doc, bp_doc).unwrap();
+                                        if let Ok(q) = fallback_qp.generate_query(chunk[i]) {
+                                            qps.push(fallback_qp);
+                                            queries.push(q);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            let interleaved: Vec<[u32; 8]> = (0..m_doc)
+                                .map(|row| {
+                                    let mut vals = [0u32; 8];
+                                    for j in 0..8 {
+                                        vals[j] = queries[j].as_slice()[row];
+                                    }
+                                    vals
+                                })
+                                .collect();
+
+                            let bq = BatchedQuery8 { interleaved };
+                            let d_resp = doc_shard.respond_batched_8(&bq).unwrap();
+                            let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+                            let width = doc_shard.get_db().get_matrix_width_self();
+
+                            for j in 0..8 {
+                                if chunk[j] == 0
+                                    && !docmap_keywords.contains(&"0".to_string())
+                                    && chunk[j]
+                                        != docmap_indexes[original_docmap_len.saturating_sub(1)]
+                                {
+                                    continue;
+                                }
+
+                                let mut single_resp = Vec::with_capacity(width);
+                                for w in 0..width {
+                                    single_resp.push(resp.results[w][j]);
+                                }
+                                let parsed_resp = Response(single_resp);
+                                let output = parsed_resp.parse_output_as_base64(&qps[j]);
+
+                                if let Ok(decoded_chunk) = fs.decode_base64(&output) {
+                                    local_chunks.push(decoded_chunk);
+                                }
+                            }
+                            local_chunks
+                        })
+                        .collect();
+
+                    info!(
+                        "> Success! Retrieved {} 4KB document chunks from DocMap.",
+                        retrieved_doc_chunks.len()
+                    );
+                    info!("> End-to-End Test Complete.");
                 }
             } else {
-                error!("> Failed: Only found {}/{} document payloads for '{}'. ({} in DB, {} in Stash)",
-                                total_matched, expected_paths.len(), target_keyword, matched_in_db, matched_in_stash);
+                error!(
+                    "> Failed: Only verified {}/{} document payloads for '{}'.",
+                    total_matched,
+                    expected_paths.len(),
+                    target_keyword
+                );
             }
         }
 
