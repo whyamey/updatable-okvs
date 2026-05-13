@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use rayon::prelude::*;
 
 pub struct Benchmarker {
@@ -33,6 +34,9 @@ pub struct Benchmarker {
     docmap_m: usize,
     docmap_setup_time: Duration,
     docmap_query_time: Duration,
+    run_ddr_test: bool,
+    ddr_setup_time: Duration,
+    ddr_query_time: Duration,
 }
 
 impl Benchmarker {
@@ -45,6 +49,7 @@ impl Benchmarker {
         use_bfs: bool,
         run_plaintext_retrieval: bool,
         run_docmap_test: bool,
+        run_ddr_test: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let encrypted_fs = EncryptedFileSystem::new(p, data_dir.clone(), use_bfs)?;
         Ok(Benchmarker {
@@ -67,6 +72,9 @@ impl Benchmarker {
             docmap_m: 0,
             docmap_setup_time: Duration::new(0, 0),
             docmap_query_time: Duration::new(0, 0),
+            run_ddr_test,
+            ddr_setup_time: Duration::new(0, 0),
+            ddr_query_time: Duration::new(0, 0),
         })
     }
 
@@ -82,15 +90,25 @@ impl Benchmarker {
             self.run_docmap_benchmark()?;
         }
 
+        if self.run_ddr_test {
+            self.run_ddr_benchmark()?;
+        }
+
         let num_keywords = self.selected_keywords.len() as f64;
 
         let total_time = total_start.elapsed();
+
         let total_setup_time = self.setup_time
             + self.volmap_setup_time
             + self.valmap_setup_time
-            + self.docmap_setup_time;
-        let total_query_time =
-            self.volmap_query_time + self.valmap_query_time + self.docmap_query_time;
+            + self.docmap_setup_time
+            + self.ddr_setup_time;
+
+        let total_query_time = self.volmap_query_time
+            + self.valmap_query_time
+            + self.docmap_query_time
+            + self.ddr_query_time;
+
         let query_time_per_keyword = total_query_time.div_f64(num_keywords);
 
         info!("Timing Results:");
@@ -101,6 +119,8 @@ impl Benchmarker {
         info!("ValMap Query Time: {:?}", self.valmap_query_time);
         info!("DocMap Setup Time: {:?}", self.docmap_setup_time);
         info!("DocMap Query Time: {:?}", self.docmap_query_time);
+        info!("DDR Setup Time: {:?}", self.ddr_setup_time);
+        info!("DDR Query Time: {:?}", self.ddr_query_time);
         info!("Total Setup Time: {:?}", total_setup_time);
         info!(
             "Total Query Time: {:?} (avg per keyword: {:?})",
@@ -191,6 +211,18 @@ impl Benchmarker {
                 info!("Total chunks built: {}", self.docmap_m);
             }
             self.docmap_setup_time = docmap_setup_start.elapsed();
+        }
+
+        if self.run_ddr_test {
+            info!("Setting up DDR-SSE Document Store...");
+            let ddr_setup_start = Instant::now();
+            self.encrypted_fs.build_ddr_store()?;
+            info!("\nDDR Store Statistics:");
+            info!(
+                "Total KV pairs stored: {}",
+                self.encrypted_fs.ddr_server_store.len()
+            );
+            self.ddr_setup_time = ddr_setup_start.elapsed();
         }
 
         self.setup_time = setup_start.elapsed();
@@ -463,6 +495,74 @@ impl Benchmarker {
         self.valmap_query_time = valmap_query_time.elapsed();
         info!("FrodoPIR batched query for ValMap finished executing.");
 
+        Ok(())
+    }
+
+    fn run_ddr_benchmark(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Running DDR-SSE Document Retrieval Benchmark.");
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let query_start = Instant::now();
+        let mut ddr_addresses = Vec::new();
+
+        for kw in &self.selected_keywords {
+            if let Some(paths) = self.encrypted_fs.get_original_paths(kw) {
+                let mut seed_val = 0u64;
+                for (i, &b) in self.encrypted_fs.ddr_query_seed[..8].iter().enumerate() {
+                    seed_val |= (b as u64) << (8 * i);
+                }
+                for &b in kw.as_bytes() {
+                    seed_val = seed_val.wrapping_add(b as u64);
+                }
+
+                let mut rng = StdRng::seed_from_u64(seed_val);
+                let midpoint = rng.gen_range(0..=paths.len());
+                let side = rng.gen_range(0..2);
+
+                for (ii, &doc_id) in paths.iter().enumerate() {
+                    let chunks = *self
+                        .encrypted_fs
+                        .doc_chunk_counts
+                        .get(&doc_id)
+                        .unwrap_or(&1);
+
+                    let key_to_use =
+                        if (ii < midpoint && side == 0) || (ii >= midpoint && side == 1) {
+                            &self.encrypted_fs.ddr_doc_keys.0
+                        } else {
+                            &self.encrypted_fs.ddr_doc_keys.1
+                        };
+
+                    for chunk_idx in 0..chunks {
+                        let data_to_hash = format!("doc_{}_{}", doc_id, chunk_idx);
+                        let mut hasher = blake3::Hasher::new_keyed(key_to_use);
+                        hasher.update(data_to_hash.as_bytes());
+                        let addr = base64::engine::general_purpose::STANDARD
+                            .encode(hasher.finalize().as_bytes());
+                        ddr_addresses.push(addr);
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Querying {} 4KB chunks from DDR Server Store.",
+            ddr_addresses.len()
+        );
+
+        let mut retrieved_chunks = 0;
+        for addr in ddr_addresses {
+            if self.encrypted_fs.ddr_server_store.contains_key(&addr) {
+                retrieved_chunks += 1;
+            }
+        }
+
+        self.ddr_query_time = query_start.elapsed();
+        info!(
+            "DDR batched query finished executing. Retrieved {} chunks.",
+            retrieved_chunks
+        );
         Ok(())
     }
 
@@ -864,6 +964,73 @@ impl Benchmarker {
                     expected_paths.len(),
                     target_keyword
                 );
+
+                if self.run_ddr_test {
+                    info!("> Proceeding to DDR retrieval for the discovered documents...");
+                    use rand::rngs::StdRng;
+                    use rand::{Rng, SeedableRng};
+
+                    let mut ddr_addresses = Vec::new();
+
+                    let mut seed_val = 0u64;
+                    for (i, &b) in self.encrypted_fs.ddr_query_seed[..8].iter().enumerate() {
+                        seed_val |= (b as u64) << (8 * i);
+                    }
+                    for &b in target_keyword.as_bytes() {
+                        seed_val = seed_val.wrapping_add(b as u64);
+                    }
+
+                    let mut rng = StdRng::seed_from_u64(seed_val);
+
+                    let mut ordered_docs: Vec<u32> = valid_doc_ids.iter().copied().collect();
+                    ordered_docs.sort_unstable();
+
+                    let midpoint = rng.gen_range(0..=ordered_docs.len());
+                    let side = rng.gen_range(0..2);
+
+                    for (ii, &doc_id) in ordered_docs.iter().enumerate() {
+                        let chunks = *self
+                            .encrypted_fs
+                            .doc_chunk_counts
+                            .get(&doc_id)
+                            .unwrap_or(&1);
+
+                        let key_to_use =
+                            if (ii < midpoint && side == 0) || (ii >= midpoint && side == 1) {
+                                &self.encrypted_fs.ddr_doc_keys.0
+                            } else {
+                                &self.encrypted_fs.ddr_doc_keys.1
+                            };
+
+                        for chunk_idx in 0..chunks {
+                            let data_to_hash = format!("doc_{}_{}", doc_id, chunk_idx);
+                            let mut hasher = blake3::Hasher::new_keyed(key_to_use);
+                            hasher.update(data_to_hash.as_bytes());
+                            let addr = base64::engine::general_purpose::STANDARD
+                                .encode(hasher.finalize().as_bytes());
+                            ddr_addresses.push(addr);
+                        }
+                    }
+
+                    info!(
+                        "> Generating {} queries for DDR to fetch {} documents...",
+                        ddr_addresses.len(),
+                        valid_doc_ids.len()
+                    );
+
+                    let mut retrieved_doc_chunks = Vec::new();
+                    for addr in ddr_addresses {
+                        if let Some(chunk) = self.encrypted_fs.ddr_server_store.get(&addr) {
+                            retrieved_doc_chunks.push(chunk.clone());
+                        }
+                    }
+
+                    info!(
+                        "> Success! Retrieved {} 4KB document chunks from DDR.",
+                        retrieved_doc_chunks.len()
+                    );
+                    info!("> End-to-End Test Complete.");
+                }
 
                 if self.run_docmap_test {
                     info!("> Proceeding to DocMap retrieval for the discovered documents...");

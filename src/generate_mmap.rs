@@ -36,6 +36,9 @@ pub struct EncryptedFileSystem {
     pub doc_chunk_counts: HashMap<u32, usize>,
     pub docmap_indices: HashMap<String, usize>,
     pub client_keys: HashMap<String, [u8; 32]>,
+    pub ddr_server_store: HashMap<String, Vec<u8>>,
+    pub ddr_doc_keys: ([u8; 32], [u8; 32]),
+    pub ddr_query_seed: [u8; 32],
     iv: [u8; 16],
     encryption_keys: HashMap<Vec<u8>, [u8; 32]>,
     document_keys: HashMap<u32, [u8; 16]>,
@@ -77,6 +80,9 @@ impl EncryptedFileSystem {
             doc_chunk_counts: HashMap::new(),
             docmap_indices: HashMap::new(),
             client_keys: HashMap::new(),
+            ddr_server_store: HashMap::new(),
+            ddr_doc_keys: (Self::generate_aes_key(), Self::generate_aes_key()),
+            ddr_query_seed: Self::generate_aes_key(),
             iv,
             encryption_keys,
             document_keys,
@@ -468,6 +474,50 @@ impl EncryptedFileSystem {
         }
 
         modified_map
+    }
+
+    pub fn build_ddr_store(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let chunk_size = 4096;
+        let mut store = HashMap::new();
+
+        for entry in std::fs::read_dir("encrypted_docs")? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("enc") {
+                let file_stem = path.file_stem().unwrap().to_str().unwrap();
+                let file_id: u32 = file_stem.parse()?;
+
+                let content = std::fs::read(&path)?;
+                let mut chunks = content.chunks(chunk_size);
+                let mut chunk_idx = 0;
+
+                while let Some(chunk) = chunks.next() {
+                    let mut padded_chunk = vec![0u8; chunk_size];
+                    padded_chunk[..chunk.len()].copy_from_slice(chunk);
+
+                    let data_to_hash = format!("doc_{}_{}", file_id, chunk_idx);
+
+                    let mut hasher1 = blake3::Hasher::new_keyed(&self.ddr_doc_keys.0);
+                    hasher1.update(data_to_hash.as_bytes());
+                    let addr1 = base64::engine::general_purpose::STANDARD
+                        .encode(hasher1.finalize().as_bytes());
+
+                    let mut hasher2 = blake3::Hasher::new_keyed(&self.ddr_doc_keys.1);
+                    hasher2.update(data_to_hash.as_bytes());
+                    let addr2 = base64::engine::general_purpose::STANDARD
+                        .encode(hasher2.finalize().as_bytes());
+
+                    store.insert(addr1, padded_chunk.clone());
+                    store.insert(addr2, padded_chunk);
+
+                    chunk_idx += 1;
+                }
+                self.doc_chunk_counts.insert(file_id, chunk_idx);
+            }
+        }
+
+        self.ddr_server_store = store;
+        Ok(())
     }
 
     pub fn apply_tethys_dip(
