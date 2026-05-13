@@ -298,12 +298,11 @@ impl EncryptedFileSystem {
             let random_key = Self::generate_aes_key();
 
             keyword_client_keys.insert(keyword.clone(), random_key);
-
-            let encrypted_keyword = self.encrypt_data(&random_key, &hashed_keyword);
-            encryption_keys.insert(encrypted_keyword.clone(), random_key);
+            encryption_keys.insert(self.encrypt_data(&random_key, &hashed_keyword), random_key);
             keyword_count_map.insert(keyword.clone(), file_paths.len());
 
-            for &file_path in file_paths {
+            // edge_index to guarantee absolute uniqueness for map keys
+            for (edge_index, &file_path) in file_paths.iter().enumerate() {
                 let document_key = self.document_keys.get(&file_path).unwrap();
                 let nonce = self.document_nonces.get(&file_path).unwrap();
 
@@ -314,10 +313,10 @@ impl EncryptedFileSystem {
 
                 let encrypted_file_path = self.encrypt_data(&random_key, &combined_path);
 
-                encrypted_multimap
-                    .lock()
-                    .unwrap()
-                    .insert(encrypted_keyword.clone(), encrypted_file_path.clone());
+                encrypted_multimap.lock().unwrap().insert(
+                    self.encrypt_data(&random_key, &hashed_keyword),
+                    encrypted_file_path.clone(),
+                );
                 plaintext_encrypted_multimap
                     .lock()
                     .unwrap()
@@ -337,7 +336,10 @@ impl EncryptedFileSystem {
                     mk
                 };
 
-                let combined_key = format!("{}||{:?}", modified_keyword, encrypted_file_path);
+                let combined_key = format!(
+                    "{}||{:?}||{}",
+                    modified_keyword, encrypted_file_path, edge_index
+                );
                 keyword_value_map.insert(combined_key, encrypted_file_path);
             }
         });
@@ -641,10 +643,9 @@ impl EncryptedFileSystem {
         }
     }
 
-    pub fn generate_single_string_array(&mut self) {
+    pub fn generate_single_string_array(&mut self, m: usize) {
         self.single_string_array = self.tethys_dip_result.as_ref().map(|(buckets, _)| {
-            let max_bucket_id = buckets.keys().max().unwrap_or(&0);
-            let mut single_array = vec![String::new(); max_bucket_id + 1];
+            let mut single_array = vec![String::new(); m];
 
             let target_size = 8192;
             let b64_len = (target_size * 4 / 3) + 4;
@@ -661,7 +662,9 @@ impl EncryptedFileSystem {
                 .collect();
 
             for (id, enc) in encoded_buckets {
-                single_array[id] = enc;
+                if id < m {
+                    single_array[id] = enc;
+                }
             }
             single_array
         });
@@ -669,6 +672,7 @@ impl EncryptedFileSystem {
 
     pub fn generate_single_string_array_from_volmap(
         &mut self,
+        m: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (buckets, _) = self
             .tethys_dip_result_volmap
@@ -684,7 +688,7 @@ impl EncryptedFileSystem {
             if let Some(pairs) = v.first() {
                 if let Some((keyword, count)) = pairs.first() {
                     let keyword_bytes = keyword.as_bytes();
-                    let write_len = keyword_bytes.len().min(251); // Max 251 bytes
+                    let write_len = keyword_bytes.len().min(251);
 
                     buffer[pos] = write_len as u8;
                     pos += 1;
@@ -695,22 +699,18 @@ impl EncryptedFileSystem {
                     buffer[pos..pos + 4].copy_from_slice(&(*count as u32).to_le_bytes());
                 }
             }
-
             general_purpose::STANDARD.encode(&buffer)
         };
 
-        let max_bucket_index = buckets.keys().max().unwrap_or(&0);
-        let encoded_buckets: Vec<String> = (0..=*max_bucket_index)
-            .map(|i| {
-                buckets.get(&i).map_or(
-                    general_purpose::STANDARD.encode(&vec![0u8; elem_size]),
-                    |b| encode_vec(b),
-                )
-            })
-            .collect();
+        let mut single_array = vec![general_purpose::STANDARD.encode(&vec![0u8; elem_size]); m];
 
-        self.single_string_array_volmap = Some(encoded_buckets);
+        for (bucket_id, bucket) in buckets {
+            if *bucket_id < m {
+                single_array[*bucket_id] = encode_vec(bucket);
+            }
+        }
 
+        self.single_string_array_volmap = Some(single_array);
         Ok(())
     }
 

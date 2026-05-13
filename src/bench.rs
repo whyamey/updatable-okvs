@@ -170,7 +170,7 @@ impl Benchmarker {
             .apply_tethys_dip_on_volmap(self.volmap_m, 1)?;
         self.encrypted_fs.print_volmap_tethys_dip_distribution();
         self.encrypted_fs
-            .generate_single_string_array_from_volmap()?;
+            .generate_single_string_array_from_volmap(self.volmap_m)?;
         self.encrypted_fs.fill_empty_index_volmap()?;
         self.encrypted_fs.print_single_string_array_volmap();
 
@@ -196,7 +196,8 @@ impl Benchmarker {
 
         self.encrypted_fs.print_tethys_dip_distribution();
         self.encrypted_fs.add_padding_to_buckets();
-        self.encrypted_fs.generate_single_string_array();
+        self.encrypted_fs
+            .generate_single_string_array(self.valmap_m);
         self.encrypted_fs.fill_empty_index();
         self.encrypted_fs.print_single_string_array();
 
@@ -690,22 +691,21 @@ impl Benchmarker {
         let bp_vol = vol_shard.get_base_params();
         let cp_vol = CommonParams::from(bp_vol);
 
-        let volmap_indexes: Vec<usize> = self
-            .get_indexes_for_keywords(&[target_keyword.to_string()], self.volmap_m)
-            .into_iter()
-            .collect();
+        let volmap_indexes_set =
+            self.get_indexes_for_keywords(&[target_keyword.to_string()], self.volmap_m);
+        let mut vol_indices: Vec<usize> = volmap_indexes_set.into_iter().collect();
+        let original_volmap_len = vol_indices.len();
 
-        let mut vol_indices = volmap_indexes.clone();
         while vol_indices.len() % 8 != 0 {
             vol_indices.push(0);
         }
 
         let fs = &self.encrypted_fs;
 
-        let retrieved_count: u32 = vol_indices
+        let mut retrieved_counts: Vec<u32> = vol_indices
             .par_chunks(8)
-            .map(|chunk| {
-                let mut local_count = 0;
+            .flat_map(|chunk| {
+                let mut local_counts = Vec::new();
                 let mut qps = Vec::with_capacity(8);
                 let mut queries = Vec::with_capacity(8);
 
@@ -749,10 +749,6 @@ impl Benchmarker {
                 let width = vol_shard.get_db().get_matrix_width_self();
 
                 for j in 0..8 {
-                    if chunk[j] == 0 && !volmap_indexes.contains(&0) {
-                        continue;
-                    }
-
                     let mut single_resp = Vec::with_capacity(width);
                     for w in 0..width {
                         single_resp.push(resp.results[w][j]);
@@ -760,6 +756,7 @@ impl Benchmarker {
                     let parsed_resp = Response(single_resp);
                     let output = parsed_resp.parse_output_as_base64(&qps[j]);
 
+                    let mut local_count = 0;
                     if let Ok(decoded) = fs.decode_base64(&output) {
                         let keyword_size = decoded[0] as usize;
                         if keyword_size > 0 && decoded.len() >= 1 + keyword_size + 4 {
@@ -776,11 +773,14 @@ impl Benchmarker {
                             }
                         }
                     }
+                    local_counts.push(local_count);
                 }
-                local_count
+                local_counts
             })
-            .max()
-            .unwrap_or(0);
+            .collect();
+
+        retrieved_counts.truncate(original_volmap_len);
+        let retrieved_count = retrieved_counts.into_iter().max().unwrap_or(0);
 
         info!("> VolMap returned count: {}", retrieved_count);
         if retrieved_count == 0 {
@@ -812,14 +812,15 @@ impl Benchmarker {
         let valmap_indexes_set = self.get_indexes_for_keywords(&valmap_keywords, self.valmap_m);
         let mut valmap_indexes: Vec<usize> = valmap_indexes_set.into_iter().collect();
         let original_valmap_len = valmap_indexes.len();
+
         while valmap_indexes.len() % 8 != 0 {
             valmap_indexes.push(0);
         }
 
-        let retrieved_encrypted_paths: Vec<Vec<u8>> = valmap_indexes
+        let mut retrieved_buckets: Vec<Vec<u8>> = valmap_indexes
             .par_chunks(8)
             .flat_map(|chunk| {
-                let mut local_paths = Vec::new();
+                let mut local_buckets = Vec::new();
                 let mut qps = Vec::with_capacity(8);
                 let mut queries = Vec::with_capacity(8);
 
@@ -863,13 +864,6 @@ impl Benchmarker {
                 let width = val_shard.get_db().get_matrix_width_self();
 
                 for j in 0..8 {
-                    if chunk[j] == 0
-                        && !valmap_keywords.contains(&"0".to_string())
-                        && chunk[j] != valmap_indexes[original_valmap_len.saturating_sub(1)]
-                    {
-                        continue;
-                    }
-
                     let mut single_resp = Vec::with_capacity(width);
                     for w in 0..width {
                         single_resp.push(resp.results[w][j]);
@@ -878,85 +872,78 @@ impl Benchmarker {
                     let output = parsed_resp.parse_output_as_base64(&qps[j]);
 
                     if let Ok(decoded_bucket) = fs.decode_base64(&output) {
-                        for payload_chunk in decoded_bucket.chunks_exact(32) {
-                            local_paths.push(payload_chunk.to_vec());
-                        }
+                        local_buckets.push(decoded_bucket);
+                    } else {
+                        local_buckets.push(Vec::new());
                     }
                 }
-                local_paths
+                local_buckets
             })
             .collect();
 
-        info!(
-            "> Retrieved {} potential 32-byte encrypted payloads from ValMap.",
-            retrieved_encrypted_paths.len()
-        );
+        retrieved_buckets.truncate(original_valmap_len);
+        let retrieved_encrypted_paths: Vec<Vec<u8>> = retrieved_buckets
+            .into_iter()
+            .flat_map(|bucket| {
+                bucket
+                    .chunks_exact(32)
+                    .map(|c| c.to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         let stash = self.encrypted_fs.get_valmap_stash().unwrap_or_default();
-        info!(
-            "> Retrieved {} payloads from the ValMap Stash.",
-            stash.len()
-        );
-
-        let mut valid_payloads = Vec::new();
-        let mut valid_doc_ids = std::collections::HashSet::new();
-        let mut failed_decrypts = 0;
-
         let all_payloads: Vec<_> = retrieved_encrypted_paths
             .iter()
             .chain(stash.iter())
             .collect();
+
         let client_key = self
             .encrypted_fs
             .client_keys
             .get(target_keyword)
             .expect("Client key not found");
 
-        for payload in all_payloads {
-            if payload.len() != 32 {
-                failed_decrypts += 1;
-                continue;
-            }
-            let decrypted = self.encrypted_fs.decrypt_data_public(client_key, payload);
-            let file_id = u32::from_le_bytes(decrypted[..4].try_into().unwrap());
-
-            if let Some(expected_paths) = self
-                .encrypted_fs
-                .plaintext_encrypted_multimap
-                .get_vec(target_keyword)
-            {
-                if expected_paths.contains(payload) {
-                    valid_payloads.push(payload.clone());
-                    valid_doc_ids.insert(file_id);
-                } else {
-                    failed_decrypts += 1;
-                }
-            } else {
-                failed_decrypts += 1;
-            }
-        }
-
-        info!(
-            "> Attempting to decrypt {} payloads using client key...",
-            retrieved_encrypted_paths.len() + stash.len()
-        );
-        info!(
-            "> Decryption failed on {} payloads (belonged to other buckets/padding).",
-            failed_decrypts
-        );
-        info!(
-            "> Decryption succeeded on {} payloads! Retrieved Document IDs: {:?}",
-            valid_payloads.len(),
-            valid_doc_ids
-        );
+        let mut valid_payloads = Vec::new();
+        let mut valid_doc_ids = std::collections::HashSet::new();
+        let mut failed_decrypts = 0;
 
         if let Some(expected_paths) = self
             .encrypted_fs
             .plaintext_encrypted_multimap
             .get_vec(target_keyword)
         {
-            let total_matched = valid_payloads.len();
+            for payload in all_payloads {
+                if payload.len() != 32 {
+                    failed_decrypts += 1;
+                    continue;
+                }
+                let decrypted = self.encrypted_fs.decrypt_data_public(client_key, payload);
+                let file_id = u32::from_le_bytes(decrypted[..4].try_into().unwrap());
 
+                if expected_paths.contains(payload) {
+                    valid_payloads.push(payload.clone());
+                    valid_doc_ids.insert(file_id);
+                } else {
+                    failed_decrypts += 1;
+                }
+            }
+
+            info!(
+                "> Attempting to decrypt {} payloads using client key...",
+                retrieved_encrypted_paths.len() + stash.len()
+            );
+            info!(
+                "> Decryption failed on {} payloads (belonged to other buckets/padding).",
+                failed_decrypts
+            );
+            info!(
+                "> Decryption succeeded on {} payloads! Retrieved Document IDs: {:?}",
+                valid_payloads.len(),
+                valid_doc_ids
+            );
+
+            let total_matched = valid_payloads.len();
             if total_matched == expected_paths.len() {
                 info!(
                     "> Success! Verified {}/{} document payloads linked to '{}'.",
@@ -965,79 +952,35 @@ impl Benchmarker {
                     target_keyword
                 );
 
-                if self.run_ddr_test {
-                    info!("> Proceeding to DDR retrieval for the discovered documents...");
-                    use rand::rngs::StdRng;
-                    use rand::{Rng, SeedableRng};
+                let mut ordered_docs: Vec<u32> = valid_doc_ids.iter().copied().collect();
+                ordered_docs.sort_unstable();
+                let mut expected_file_chunks = Vec::new();
 
-                    let mut ddr_addresses = Vec::new();
+                for &doc_id in &ordered_docs {
+                    let chunks = *self
+                        .encrypted_fs
+                        .doc_chunk_counts
+                        .get(&doc_id)
+                        .unwrap_or(&1);
+                    let enc_path = format!("encrypted_docs/{}.enc", doc_id);
+                    let enc_content = std::fs::read(&enc_path).unwrap_or_default();
 
-                    let mut seed_val = 0u64;
-                    for (i, &b) in self.encrypted_fs.ddr_query_seed[..8].iter().enumerate() {
-                        seed_val |= (b as u64) << (8 * i);
-                    }
-                    for &b in target_keyword.as_bytes() {
-                        seed_val = seed_val.wrapping_add(b as u64);
-                    }
-
-                    let mut rng = StdRng::seed_from_u64(seed_val);
-
-                    let mut ordered_docs: Vec<u32> = valid_doc_ids.iter().copied().collect();
-                    ordered_docs.sort_unstable();
-
-                    let midpoint = rng.gen_range(0..=ordered_docs.len());
-                    let side = rng.gen_range(0..2);
-
-                    for (ii, &doc_id) in ordered_docs.iter().enumerate() {
-                        let chunks = *self
-                            .encrypted_fs
-                            .doc_chunk_counts
-                            .get(&doc_id)
-                            .unwrap_or(&1);
-
-                        let key_to_use =
-                            if (ii < midpoint && side == 0) || (ii >= midpoint && side == 1) {
-                                &self.encrypted_fs.ddr_doc_keys.0
-                            } else {
-                                &self.encrypted_fs.ddr_doc_keys.1
-                            };
-
-                        for chunk_idx in 0..chunks {
-                            let data_to_hash = format!("doc_{}_{}", doc_id, chunk_idx);
-                            let mut hasher = blake3::Hasher::new_keyed(key_to_use);
-                            hasher.update(data_to_hash.as_bytes());
-                            let addr = base64::engine::general_purpose::STANDARD
-                                .encode(hasher.finalize().as_bytes());
-                            ddr_addresses.push(addr);
+                    for i in 0..chunks {
+                        let start = i * 4096;
+                        let end = ((i + 1) * 4096).min(enc_content.len());
+                        let mut padded_chunk = vec![0u8; 4096];
+                        if start < enc_content.len() {
+                            padded_chunk[..end - start].copy_from_slice(&enc_content[start..end]);
                         }
+                        expected_file_chunks.push(padded_chunk);
                     }
-
-                    info!(
-                        "> Generating {} queries for DDR to fetch {} documents...",
-                        ddr_addresses.len(),
-                        valid_doc_ids.len()
-                    );
-
-                    let mut retrieved_doc_chunks = Vec::new();
-                    for addr in ddr_addresses {
-                        if let Some(chunk) = self.encrypted_fs.ddr_server_store.get(&addr) {
-                            retrieved_doc_chunks.push(chunk.clone());
-                        }
-                    }
-
-                    info!(
-                        "> Success! Retrieved {} 4KB document chunks from DDR.",
-                        retrieved_doc_chunks.len()
-                    );
-                    info!("> End-to-End Test Complete.");
                 }
 
                 if self.run_docmap_test {
                     info!("> Proceeding to DocMap retrieval for the discovered documents...");
 
                     let mut docmap_keywords = Vec::new();
-
-                    for &doc_id in &valid_doc_ids {
+                    for &doc_id in &ordered_docs {
                         let chunks = *self
                             .encrypted_fs
                             .doc_chunk_counts
@@ -1068,17 +1011,16 @@ impl Benchmarker {
                     let bp_doc = doc_shard.get_base_params();
                     let cp_doc = CommonParams::from(bp_doc);
 
-                    let mut docmap_indexes: Vec<usize> = docmap_keywords
-                        .iter()
-                        .filter_map(|kw| self.encrypted_fs.docmap_indices.get(kw).copied())
-                        .collect();
+                    let docmap_indexes_set =
+                        self.get_indexes_for_keywords(&docmap_keywords, self.docmap_m);
+                    let mut docmap_indexes: Vec<usize> = docmap_indexes_set.into_iter().collect();
                     let original_docmap_len = docmap_indexes.len();
 
                     while docmap_indexes.len() % 8 != 0 {
                         docmap_indexes.push(0);
                     }
 
-                    let retrieved_doc_chunks: Vec<Vec<u8>> = docmap_indexes
+                    let mut retrieved_doc_chunks: Vec<Vec<u8>> = docmap_indexes
                         .par_chunks(8)
                         .flat_map(|chunk| {
                             let mut local_chunks = Vec::new();
@@ -1126,14 +1068,6 @@ impl Benchmarker {
                             let width = doc_shard.get_db().get_matrix_width_self();
 
                             for j in 0..8 {
-                                if chunk[j] == 0
-                                    && !docmap_keywords.contains(&"0".to_string())
-                                    && chunk[j]
-                                        != docmap_indexes[original_docmap_len.saturating_sub(1)]
-                                {
-                                    continue;
-                                }
-
                                 let mut single_resp = Vec::with_capacity(width);
                                 for w in 0..width {
                                     single_resp.push(resp.results[w][j]);
@@ -1143,21 +1077,38 @@ impl Benchmarker {
 
                                 if let Ok(decoded_chunk) = fs.decode_base64(&output) {
                                     local_chunks.push(decoded_chunk);
+                                } else {
+                                    local_chunks.push(vec![0u8; 4096]);
                                 }
                             }
                             local_chunks
                         })
                         .collect();
 
-                    info!(
-                        "> Success! Retrieved {} 4KB document chunks from DocMap.",
-                        retrieved_doc_chunks.len()
-                    );
-                    info!("> End-to-End Test Complete.");
+                    retrieved_doc_chunks.truncate(original_docmap_len);
+
+                    let mut docmap_success = true;
+                    for (i, (retrieved, expected)) in retrieved_doc_chunks
+                        .iter()
+                        .zip(expected_file_chunks.iter())
+                        .enumerate()
+                    {
+                        if retrieved != expected {
+                            error!("> DocMap chunk mismatch at query index {}", i);
+                            docmap_success = false;
+                        }
+                    }
+
+                    if docmap_success {
+                        info!("> Success! All {} DocMap chunks exactly match the original encrypted file chunks on disk.", retrieved_doc_chunks.len());
+                    } else {
+                        error!("> DocMap chunk verification against disk failed!");
+                    }
+                    info!("> End-to-End DocMap Test Complete.");
                 }
             } else {
                 error!(
-                    "> Failed: Only verified {}/{} document payloads for '{}'.",
+                    "> Failed: Only found {}/{} document payloads for '{}'.",
                     total_matched,
                     expected_paths.len(),
                     target_keyword
