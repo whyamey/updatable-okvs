@@ -25,6 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut log_level = LevelFilter::Info;
     let mut use_bfs = false;
     let mut run_plaintext_retrieval = false;
+    let mut run_docmap_test = false;
+    let mut run_ddr_test = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -57,6 +59,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--run-plaintext-retrieval" => {
                 run_plaintext_retrieval = true;
+                i += 1;
+            }
+            "--run-docmap-test" => {
+                run_docmap_test = true;
+                i += 1;
+            }
+            "--run-ddr-test" => {
+                run_ddr_test = true;
                 i += 1;
             }
             _ => i += 1,
@@ -106,6 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_dir,
         use_bfs,
         run_plaintext_retrieval,
+        run_docmap_test,
+        run_ddr_test,
     )?;
 
     if let Err(e) = benchmarker.run_benchmarks() {

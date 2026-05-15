@@ -32,6 +32,13 @@ pub struct EncryptedFileSystem {
     original_multimap: MultiMap<String, u32>,
     encrypted_multimap: MultiMap<Vec<u8>, Vec<u8>>,
     pub plaintext_encrypted_multimap: MultiMap<String, Vec<u8>>,
+    pub single_string_array_docmap: Option<Vec<String>>,
+    pub doc_chunk_counts: HashMap<u32, usize>,
+    pub docmap_indices: HashMap<String, usize>,
+    pub client_keys: HashMap<String, [u8; 32]>,
+    pub ddr_server_store: HashMap<String, Vec<u8>>,
+    pub ddr_doc_keys: ([u8; 32], [u8; 32]),
+    pub ddr_query_seed: [u8; 32],
     iv: [u8; 16],
     encryption_keys: HashMap<Vec<u8>, [u8; 32]>,
     document_keys: HashMap<u32, [u8; 16]>,
@@ -69,6 +76,13 @@ impl EncryptedFileSystem {
             original_multimap,
             encrypted_multimap,
             plaintext_encrypted_multimap,
+            single_string_array_docmap: None,
+            doc_chunk_counts: HashMap::new(),
+            docmap_indices: HashMap::new(),
+            client_keys: HashMap::new(),
+            ddr_server_store: HashMap::new(),
+            ddr_doc_keys: (Self::generate_aes_key(), Self::generate_aes_key()),
+            ddr_query_seed: Self::generate_aes_key(),
             iv,
             encryption_keys,
             document_keys,
@@ -152,6 +166,10 @@ impl EncryptedFileSystem {
         let mut iv = [0u8; 16];
         rng.fill(&mut iv);
         iv
+    }
+
+    pub fn get_original_paths(&self, keyword: &str) -> Option<Vec<u32>> {
+        self.original_multimap.get_vec(keyword).cloned()
     }
 
     fn hash_keyword(keyword: &str) -> Vec<u8> {
@@ -271,18 +289,20 @@ impl EncryptedFileSystem {
         let keyword_value_map = DashMap::new();
         let keyword_count_map = DashMap::new();
         let shared_keyword_count = DashMap::new();
+        let keyword_client_keys = DashMap::new();
 
         let entries: Vec<(&String, &Vec<u32>)> = self.original_multimap.iter_all().collect();
 
         entries.par_iter().for_each(|&(keyword, file_paths)| {
             let hashed_keyword = Self::hash_keyword(keyword);
             let random_key = Self::generate_aes_key();
-            let encrypted_keyword = self.encrypt_data(&random_key, &hashed_keyword);
 
-            encryption_keys.insert(encrypted_keyword.clone(), random_key);
+            keyword_client_keys.insert(keyword.clone(), random_key);
+            encryption_keys.insert(self.encrypt_data(&random_key, &hashed_keyword), random_key);
             keyword_count_map.insert(keyword.clone(), file_paths.len());
 
-            for &file_path in file_paths {
+            // edge_index to guarantee absolute uniqueness for map keys
+            for (edge_index, &file_path) in file_paths.iter().enumerate() {
                 let document_key = self.document_keys.get(&file_path).unwrap();
                 let nonce = self.document_nonces.get(&file_path).unwrap();
 
@@ -293,10 +313,10 @@ impl EncryptedFileSystem {
 
                 let encrypted_file_path = self.encrypt_data(&random_key, &combined_path);
 
-                encrypted_multimap
-                    .lock()
-                    .unwrap()
-                    .insert(encrypted_keyword.clone(), encrypted_file_path.clone());
+                encrypted_multimap.lock().unwrap().insert(
+                    self.encrypt_data(&random_key, &hashed_keyword),
+                    encrypted_file_path.clone(),
+                );
                 plaintext_encrypted_multimap
                     .lock()
                     .unwrap()
@@ -316,7 +336,10 @@ impl EncryptedFileSystem {
                     mk
                 };
 
-                let combined_key = format!("{}||{:?}", modified_keyword, encrypted_file_path);
+                let combined_key = format!(
+                    "{}||{:?}||{}",
+                    modified_keyword, encrypted_file_path, edge_index
+                );
                 keyword_value_map.insert(combined_key, encrypted_file_path);
             }
         });
@@ -324,6 +347,7 @@ impl EncryptedFileSystem {
         self.encryption_keys.extend(encryption_keys.into_iter());
         self.keyword_value_map.extend(keyword_value_map.into_iter());
         self.keyword_count_map.extend(keyword_count_map.into_iter());
+        self.client_keys.extend(keyword_client_keys.into_iter());
         self.encrypted_multimap = encrypted_multimap.into_inner().unwrap();
         self.plaintext_encrypted_multimap = plaintext_encrypted_multimap.into_inner().unwrap();
 
@@ -454,6 +478,50 @@ impl EncryptedFileSystem {
         modified_map
     }
 
+    pub fn build_ddr_store(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let chunk_size = 4096;
+        let mut store = HashMap::new();
+
+        for entry in std::fs::read_dir("encrypted_docs")? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("enc") {
+                let file_stem = path.file_stem().unwrap().to_str().unwrap();
+                let file_id: u32 = file_stem.parse()?;
+
+                let content = std::fs::read(&path)?;
+                let mut chunks = content.chunks(chunk_size);
+                let mut chunk_idx = 0;
+
+                while let Some(chunk) = chunks.next() {
+                    let mut padded_chunk = vec![0u8; chunk_size];
+                    padded_chunk[..chunk.len()].copy_from_slice(chunk);
+
+                    let data_to_hash = format!("doc_{}_{}", file_id, chunk_idx);
+
+                    let mut hasher1 = blake3::Hasher::new_keyed(&self.ddr_doc_keys.0);
+                    hasher1.update(data_to_hash.as_bytes());
+                    let addr1 = base64::engine::general_purpose::STANDARD
+                        .encode(hasher1.finalize().as_bytes());
+
+                    let mut hasher2 = blake3::Hasher::new_keyed(&self.ddr_doc_keys.1);
+                    hasher2.update(data_to_hash.as_bytes());
+                    let addr2 = base64::engine::general_purpose::STANDARD
+                        .encode(hasher2.finalize().as_bytes());
+
+                    store.insert(addr1, padded_chunk.clone());
+                    store.insert(addr2, padded_chunk);
+
+                    chunk_idx += 1;
+                }
+                self.doc_chunk_counts.insert(file_id, chunk_idx);
+            }
+        }
+
+        self.ddr_server_store = store;
+        Ok(())
+    }
+
     pub fn apply_tethys_dip(
         &mut self,
         m: usize,
@@ -495,6 +563,53 @@ impl EncryptedFileSystem {
         Ok(())
     }
 
+    pub fn build_and_apply_docmap(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let chunk_size = 4096;
+        let mut flat_array = Vec::new();
+        let mut docmap_indices = HashMap::new();
+
+        for entry in std::fs::read_dir("encrypted_docs")? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("enc") {
+                let file_stem = path.file_stem().unwrap().to_str().unwrap();
+                let file_id: u32 = file_stem.parse()?;
+
+                let content = std::fs::read(&path)?;
+                let mut chunks = content.chunks(chunk_size);
+                let mut chunk_idx = 0;
+
+                while let Some(chunk) = chunks.next() {
+                    let mut padded_chunk = vec![0u8; chunk_size];
+                    padded_chunk[..chunk.len()].copy_from_slice(chunk);
+
+                    let mut key_str = format!("doc_{}_", file_id);
+                    key_str.push_str(&"1".repeat(chunk_idx));
+
+                    let current_index = flat_array.len();
+                    flat_array.push(padded_chunk);
+                    docmap_indices.insert(key_str, current_index);
+                    chunk_idx += 1;
+                }
+                self.doc_chunk_counts.insert(file_id, chunk_idx);
+            }
+        }
+
+        self.docmap_indices = docmap_indices;
+
+        let encoded_array: Vec<String> = flat_array
+            .into_par_iter()
+            .map(|chunk| base64::engine::general_purpose::STANDARD.encode(&chunk))
+            .collect();
+
+        self.single_string_array_docmap = Some(encoded_array);
+        Ok(())
+    }
+
+    pub fn decrypt_data_public(&self, key: &[u8; 32], encrypted_data: &[u8]) -> Vec<u8> {
+        self.decrypt_data(key, encrypted_data)
+    }
+
     pub fn get_tethys_dip_stats(&self) -> Option<(usize, usize, usize)> {
         self.tethys_dip_result.as_ref().map(|(buckets, stash)| {
             let total_buckets = buckets.len();
@@ -528,10 +643,9 @@ impl EncryptedFileSystem {
         }
     }
 
-    pub fn generate_single_string_array(&mut self) {
+    pub fn generate_single_string_array(&mut self, m: usize) {
         self.single_string_array = self.tethys_dip_result.as_ref().map(|(buckets, _)| {
-            let max_bucket_id = buckets.keys().max().unwrap_or(&0);
-            let mut single_array = vec![String::new(); max_bucket_id + 1];
+            let mut single_array = vec![String::new(); m];
 
             let target_size = 8192;
             let b64_len = (target_size * 4 / 3) + 4;
@@ -548,7 +662,9 @@ impl EncryptedFileSystem {
                 .collect();
 
             for (id, enc) in encoded_buckets {
-                single_array[id] = enc;
+                if id < m {
+                    single_array[id] = enc;
+                }
             }
             single_array
         });
@@ -556,6 +672,7 @@ impl EncryptedFileSystem {
 
     pub fn generate_single_string_array_from_volmap(
         &mut self,
+        m: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (buckets, _) = self
             .tethys_dip_result_volmap
@@ -571,7 +688,7 @@ impl EncryptedFileSystem {
             if let Some(pairs) = v.first() {
                 if let Some((keyword, count)) = pairs.first() {
                     let keyword_bytes = keyword.as_bytes();
-                    let write_len = keyword_bytes.len().min(251); // Max 251 bytes
+                    let write_len = keyword_bytes.len().min(251);
 
                     buffer[pos] = write_len as u8;
                     pos += 1;
@@ -582,22 +699,18 @@ impl EncryptedFileSystem {
                     buffer[pos..pos + 4].copy_from_slice(&(*count as u32).to_le_bytes());
                 }
             }
-
             general_purpose::STANDARD.encode(&buffer)
         };
 
-        let max_bucket_index = buckets.keys().max().unwrap_or(&0);
-        let encoded_buckets: Vec<String> = (0..=*max_bucket_index)
-            .map(|i| {
-                buckets.get(&i).map_or(
-                    general_purpose::STANDARD.encode(&vec![0u8; elem_size]),
-                    |b| encode_vec(b),
-                )
-            })
-            .collect();
+        let mut single_array = vec![general_purpose::STANDARD.encode(&vec![0u8; elem_size]); m];
 
-        self.single_string_array_volmap = Some(encoded_buckets);
+        for (bucket_id, bucket) in buckets {
+            if *bucket_id < m {
+                single_array[*bucket_id] = encode_vec(bucket);
+            }
+        }
 
+        self.single_string_array_volmap = Some(single_array);
         Ok(())
     }
 
