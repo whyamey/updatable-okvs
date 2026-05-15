@@ -697,22 +697,22 @@ impl Benchmarker {
         let mut vol_indices: Vec<usize> = volmap_indexes_set.into_iter().collect();
         let original_volmap_len = vol_indices.len();
 
-        while vol_indices.len() % 8 != 0 {
+        while vol_indices.len() % 64 != 0 {
             vol_indices.push(0);
         }
 
         let fs = &self.encrypted_fs;
 
         let mut retrieved_counts: Vec<u32> = vol_indices
-            .par_chunks(8)
+            .par_chunks(64)
             .flat_map(|chunk| {
                 let mut local_counts = Vec::new();
-                let mut qps = Vec::with_capacity(8);
-                let mut queries = Vec::with_capacity(8);
+                let mut qps = Vec::with_capacity(64);
+                let mut queries = Vec::with_capacity(64);
 
-                let mut batched_qps = BatchedQueryParams8::new(&cp_vol, bp_vol).unwrap();
+                let mut batched_qps = BatchedQueryParams64::new(&cp_vol, bp_vol).unwrap();
 
-                for i in 0..8 {
+                for i in 0..64 {
                     let mut success = false;
                     let mut qp = batched_qps.extract_query_params(i).unwrap();
 
@@ -734,22 +734,22 @@ impl Benchmarker {
                     }
                 }
 
-                let interleaved: Vec<[u32; 8]> = (0..m_vol)
+                let interleaved: Vec<[u32; 64]> = (0..m_vol)
                     .map(|row| {
-                        let mut vals = [0u32; 8];
-                        for j in 0..8 {
+                        let mut vals = [0u32; 64];
+                        for j in 0..64 {
                             vals[j] = queries[j].as_slice()[row];
                         }
                         vals
                     })
                     .collect();
 
-                let bq = BatchedQuery8 { interleaved };
-                let d_resp = vol_shard.respond_batched_8(&bq).unwrap();
-                let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+                let bq = BatchedQuery64 { interleaved };
+                let d_resp = vol_shard.respond_batched_64(&bq).unwrap();
+                let resp: BatchedResponse64 = bincode::deserialize(&d_resp).unwrap();
                 let width = vol_shard.get_db().get_matrix_width_self();
 
-                for j in 0..8 {
+                for j in 0..64 {
                     let mut single_resp = Vec::with_capacity(width);
                     for w in 0..width {
                         single_resp.push(resp.results[w][j]);
@@ -814,20 +814,20 @@ impl Benchmarker {
         let mut valmap_indexes: Vec<usize> = valmap_indexes_set.into_iter().collect();
         let original_valmap_len = valmap_indexes.len();
 
-        while valmap_indexes.len() % 8 != 0 {
+        while valmap_indexes.len() % 64 != 0 {
             valmap_indexes.push(0);
         }
 
         let mut retrieved_buckets: Vec<Vec<u8>> = valmap_indexes
-            .par_chunks(8)
+            .par_chunks(64)
             .flat_map(|chunk| {
                 let mut local_buckets = Vec::new();
-                let mut qps = Vec::with_capacity(8);
-                let mut queries = Vec::with_capacity(8);
+                let mut qps = Vec::with_capacity(64);
+                let mut queries = Vec::with_capacity(64);
 
-                let mut batched_qps = BatchedQueryParams8::new(&cp_val, bp_val).unwrap();
+                let mut batched_qps = BatchedQueryParams64::new(&cp_val, bp_val).unwrap();
 
-                for i in 0..8 {
+                for i in 0..64 {
                     let mut success = false;
                     let mut qp = batched_qps.extract_query_params(i).unwrap();
 
@@ -849,22 +849,22 @@ impl Benchmarker {
                     }
                 }
 
-                let interleaved: Vec<[u32; 8]> = (0..m_val)
+                let interleaved: Vec<[u32; 64]> = (0..m_val)
                     .map(|row| {
-                        let mut vals = [0u32; 8];
-                        for j in 0..8 {
+                        let mut vals = [0u32; 64];
+                        for j in 0..64 {
                             vals[j] = queries[j].as_slice()[row];
                         }
                         vals
                     })
                     .collect();
 
-                let bq = BatchedQuery8 { interleaved };
-                let d_resp = val_shard.respond_batched_8(&bq).unwrap();
-                let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+                let bq = BatchedQuery64 { interleaved };
+                let d_resp = val_shard.respond_batched_64(&bq).unwrap();
+                let resp: BatchedResponse64 = bincode::deserialize(&d_resp).unwrap();
                 let width = val_shard.get_db().get_matrix_width_self();
 
-                for j in 0..8 {
+                for j in 0..64 {
                     let mut single_resp = Vec::with_capacity(width);
                     for w in 0..width {
                         single_resp.push(resp.results[w][j]);
@@ -1019,20 +1019,22 @@ impl Benchmarker {
 
                     let original_docmap_len = docmap_indexes.len();
 
-                    while docmap_indexes.len() % 8 != 0 {
+                    // Pad to 64
+                    while docmap_indexes.len() % 64 != 0 {
                         docmap_indexes.push(0);
                     }
 
+                    // Chunk by 64
                     let mut retrieved_doc_chunks: Vec<Vec<u8>> = docmap_indexes
-                        .par_chunks(8)
+                        .par_chunks(64)
                         .flat_map(|chunk| {
                             let mut local_chunks = Vec::new();
-                            let mut qps = Vec::with_capacity(8);
-                            let mut queries = Vec::with_capacity(8);
+                            let mut qps = Vec::with_capacity(64);
+                            let mut queries = Vec::with_capacity(64);
                             let mut batched_qps =
-                                BatchedQueryParams8::new(&cp_doc, bp_doc).unwrap();
+                                BatchedQueryParams64::new(&cp_doc, bp_doc).unwrap();
 
-                            for i in 0..8 {
+                            for i in 0..64 {
                                 let mut success = false;
                                 let mut qp = batched_qps.extract_query_params(i).unwrap();
 
@@ -1055,22 +1057,22 @@ impl Benchmarker {
                                 }
                             }
 
-                            let interleaved: Vec<[u32; 8]> = (0..m_doc)
+                            let interleaved: Vec<[u32; 64]> = (0..m_doc)
                                 .map(|row| {
-                                    let mut vals = [0u32; 8];
-                                    for j in 0..8 {
+                                    let mut vals = [0u32; 64];
+                                    for j in 0..64 {
                                         vals[j] = queries[j].as_slice()[row];
                                     }
                                     vals
                                 })
                                 .collect();
 
-                            let bq = BatchedQuery8 { interleaved };
-                            let d_resp = doc_shard.respond_batched_8(&bq).unwrap();
-                            let resp: BatchedResponse8 = bincode::deserialize(&d_resp).unwrap();
+                            let bq = BatchedQuery64 { interleaved };
+                            let d_resp = doc_shard.respond_batched_64(&bq).unwrap();
+                            let resp: BatchedResponse64 = bincode::deserialize(&d_resp).unwrap();
                             let width = doc_shard.get_db().get_matrix_width_self();
 
-                            for j in 0..8 {
+                            for j in 0..64 {
                                 let mut single_resp = Vec::with_capacity(width);
                                 for w in 0..width {
                                     single_resp.push(resp.results[w][j]);
