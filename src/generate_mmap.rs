@@ -479,7 +479,7 @@ impl EncryptedFileSystem {
     }
 
     pub fn build_ddr_store(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let chunk_size = 4096;
+        let chunk_size = 1024;
         let mut store = HashMap::new();
 
         for entry in std::fs::read_dir("encrypted_docs")? {
@@ -564,7 +564,7 @@ impl EncryptedFileSystem {
     }
 
     pub fn build_and_apply_docmap(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let chunk_size = 4096;
+        let chunk_size = 1024;
         let mut flat_array = Vec::new();
         let mut docmap_indices = HashMap::new();
 

@@ -270,7 +270,6 @@ impl Benchmarker {
     fn get_indexes_for_keywords(&self, keywords: &[String], m: usize) -> HashSet<usize> {
         let mut indexes = HashSet::new();
         let dip_hasher = HashDIP::<4>::new(m, 1);
-
         for keyword in keywords {
             let hashes = dip_hasher.get_hashes(keyword);
             for h in hashes {
@@ -577,7 +576,7 @@ impl Benchmarker {
             .as_ref()
             .unwrap();
         let m = db_array.len();
-        let elem_size = 2u32.pow(15) as usize;
+        let elem_size = 2u32.pow(13) as usize;
         let plaintext_bits = 9usize;
         let lwe_dim = 1288;
         let shard =
@@ -967,9 +966,9 @@ impl Benchmarker {
                     let enc_content = std::fs::read(&enc_path).unwrap_or_default();
 
                     for i in 0..chunks {
-                        let start = i * 4096;
-                        let end = ((i + 1) * 4096).min(enc_content.len());
-                        let mut padded_chunk = vec![0u8; 4096];
+                        let start = i * 1024;
+                        let end = ((i + 1) * 1024).min(enc_content.len());
+                        let mut padded_chunk = vec![0u8; 1024];
                         if start < enc_content.len() {
                             padded_chunk[..end - start].copy_from_slice(&enc_content[start..end]);
                         }
@@ -1007,8 +1006,7 @@ impl Benchmarker {
                         .expect("DocMap not initialized");
                     let m_doc = docmap_db_array.len() as usize;
                     let doc_shard =
-                        Shard::from_base64_strings(&docmap_db_array, 1288, m_doc, 32768, 9)
-                            .unwrap();
+                        Shard::from_base64_strings(&docmap_db_array, 1288, m_doc, 8192, 9).unwrap();
                     let bp_doc = doc_shard.get_base_params();
                     let cp_doc = CommonParams::from(bp_doc);
 
@@ -1083,7 +1081,7 @@ impl Benchmarker {
                                 if let Ok(decoded_chunk) = fs.decode_base64(&output) {
                                     local_chunks.push(decoded_chunk);
                                 } else {
-                                    local_chunks.push(vec![0u8; 4096]);
+                                    local_chunks.push(vec![0u8; 1024]);
                                 }
                             }
                             local_chunks
