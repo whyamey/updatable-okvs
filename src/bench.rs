@@ -35,6 +35,8 @@ pub struct Benchmarker {
     docmap_setup_time: Duration,
     docmap_query_time: Duration,
     run_ddr_test: bool,
+    run_insert_test: bool,
+    insert_split: f64,
     ddr_setup_time: Duration,
     ddr_query_time: Duration,
 }
@@ -50,6 +52,8 @@ impl Benchmarker {
         run_plaintext_retrieval: bool,
         run_docmap_test: bool,
         run_ddr_test: bool,
+        run_insert_test: bool,
+        insert_split: f64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let encrypted_fs = EncryptedFileSystem::new(p, data_dir.clone(), use_bfs)?;
         Ok(Benchmarker {
@@ -75,13 +79,52 @@ impl Benchmarker {
             run_ddr_test,
             ddr_setup_time: Duration::new(0, 0),
             ddr_query_time: Duration::new(0, 0),
+            run_insert_test,
+            insert_split,
         })
     }
 
     pub fn run_benchmarks(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let total_start = Instant::now();
 
-        self.setup()?;
+        if self.run_insert_test {
+            log::info!(
+                "--- Running Incremental Insert Benchmark (Split: {}) ---",
+                self.insert_split
+            );
+            self.encrypted_fs.encrypt_files()?;
+
+            let insert_data = self.encrypted_fs.extract_insert_dataset(self.insert_split);
+            log::info!(
+                "Initial Build Dataset: {}, Insert Dataset: {}",
+                self.encrypted_fs.get_keyword_value_map_size(),
+                insert_data.len()
+            );
+
+            let n = self.encrypted_fs.get_keyword_value_map_size() + insert_data.len();
+            let p = self.encrypted_fs.get_p();
+            self.valmap_m = ((1.8 + self.epsilon) * n as f64 / p as f64).ceil() as usize;
+
+            let num_inserts = insert_data.len();
+            self.encrypted_fs.build_masked_valmap(self.valmap_m, p)?;
+
+            let insert_time =
+                self.encrypted_fs
+                    .run_incremental_inserts(self.valmap_m, p, insert_data);
+            let avg_insert_time = insert_time.div_f64(num_inserts as f64);
+
+            log::info!(
+                "Total Time for {} Oblivious Inserts: {:?}",
+                num_inserts,
+                insert_time
+            );
+            log::info!("Average Time per Insert: {:?}", avg_insert_time);
+
+            return Ok(());
+        } else {
+            self.setup()?;
+        }
+
         self.select_random_keywords()?;
         self.run_volmap_benchmark()?;
         self.run_valmap_benchmark()?;

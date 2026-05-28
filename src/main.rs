@@ -27,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut run_plaintext_retrieval = false;
     let mut run_docmap_test = false;
     let mut run_ddr_test = false;
+    let mut run_insert_test = false;
+    let mut insert_split = 0.8;
 
     let mut i = 1;
     while i < args.len() {
@@ -68,6 +70,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--run-ddr-test" => {
                 run_ddr_test = true;
                 i += 1;
+            }
+            "--run-insert-test" => {
+                run_insert_test = true;
+                i += 1;
+            }
+            "--insert-split" => {
+                if i + 1 < args.len() {
+                    insert_split = args[i + 1].parse().unwrap_or(0.8);
+                    i += 2;
+                }
             }
             _ => i += 1,
         }
@@ -118,6 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_plaintext_retrieval,
         run_docmap_test,
         run_ddr_test,
+        run_insert_test,
+        insert_split,
     )?;
 
     if let Err(e) = benchmarker.run_benchmarks() {
