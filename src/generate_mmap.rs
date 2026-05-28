@@ -279,10 +279,10 @@ impl EncryptedFileSystem {
         let mut stash = self.masked_valmap_stash.take().unwrap_or_default();
         let mut rng = rand::thread_rng();
 
-        let pir_dim = 128;
-        let elem_size = 2048;
-        let p_bits = 8;
-        let mock_pir_m = 100_000;
+        let pir_dim = 1288;
+        let elem_size = 65536;
+        let p_bits = 9;
+        let mock_pir_m = m;
 
         let dummy_elements = vec![
             base64::engine::general_purpose::STANDARD
@@ -334,7 +334,9 @@ impl EncryptedFileSystem {
                 }
 
                 if serialized_bucket.len() < elem_size {
+                    let current_len = serialized_bucket.len();
                     serialized_bucket.resize(elem_size, 0u8);
+                    rng.fill(&mut serialized_bucket[current_len..]);
                 } else if serialized_bucket.len() > elem_size {
                     serialized_bucket.truncate(elem_size);
                 }

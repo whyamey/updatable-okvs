@@ -291,125 +291,88 @@ impl<const N: usize> HashDIP<N> {
         stash: &mut Vec<MaskedItem<Vec<u8>>>,
         rng: &mut impl rand::Rng,
     ) -> Vec<usize> {
-        let mut to_place_item = MaskedItem::new(Arc::new(keyword.to_string()), val);
+        let mut current_item = MaskedItem::new(Arc::new(keyword.to_string()), val);
         let mut success = false;
-        let initial_hashes = self.get_hashes(keyword);
         let mut touched_buckets = Vec::new();
 
-        for (i, &h) in initial_hashes.iter().enumerate() {
-            let bucket = buckets
-                .entry(h)
-                .or_insert_with(|| Vec::with_capacity(self.p));
-            if bucket.len() < self.p {
-                to_place_item.mask[i] = true;
-                bucket.push(to_place_item.clone());
-                success = true;
-                touched_buckets.push(h);
-                break;
-            }
-        }
-
-        type BfsPath = Vec<((usize, usize), MaskedItem<Vec<u8>>, MaskedItem<Vec<u8>>)>;
-        let mut queue: VecDeque<((usize, usize), MaskedItem<Vec<u8>>, BfsPath, usize)> =
-            VecDeque::new();
-        let mut visited = HashSet::new();
-
-        if !success {
-            for (i, &h) in initial_hashes.iter().enumerate() {
-                queue.push_back(((h, i), to_place_item.clone(), Vec::new(), 0));
-                visited.insert(h);
-            }
-        }
-
-        let mut nodes_expanded = 0;
-
-        while nodes_expanded < MAX_BFS_NODES {
-            nodes_expanded += 1;
-
+        for _step in 0..MAX_EVICTIONS {
             if !success {
-                if let Some(((curr_b, hash_idx_of_item), item_to_insert, path, cur_depth)) =
-                    queue.pop_front()
-                {
-                    let current_bucket_items = buckets.get(&curr_b).cloned().unwrap_or_default();
+                let hashes = self.get_hashes(&current_item.key);
+                let mut placed = false;
 
-                    'item_loop: for (i, bk_item) in current_bucket_items.iter().enumerate() {
-                        let item_hashes = self.get_hashes(&bk_item.key);
+                for (i, &h) in hashes.iter().enumerate() {
+                    let bucket = buckets
+                        .entry(h)
+                        .or_insert_with(|| Vec::with_capacity(self.p));
 
-                        for (alt_idx, &alt_b) in item_hashes.iter().enumerate() {
-                            if alt_b == curr_b || bk_item.mask[alt_idx] {
-                                continue;
-                            }
+                    if bucket.len() < self.p {
+                        current_item.mask = [false; 4];
+                        current_item.mask[i] = true;
+                        bucket.push(current_item.clone());
 
-                            let alt_bucket = buckets
-                                .entry(alt_b)
-                                .or_insert_with(|| Vec::with_capacity(self.p));
-
-                            if alt_bucket.len() < self.p {
-                                alt_bucket.push(bk_item.clone());
-                                touched_buckets.push(alt_b);
-
-                                let cb = buckets.get_mut(&curr_b).unwrap();
-                                cb.remove(i);
-                                cb.push(item_to_insert.clone());
-                                touched_buckets.push(curr_b);
-
-                                let mut updated_bk = bk_item.clone();
-                                updated_bk.mask[alt_idx] = true;
-
-                                for ((b, _), v_in, v_out) in path.iter().rev() {
-                                    let bb = buckets.get_mut(b).unwrap();
-                                    if let Some(pos) =
-                                        bb.iter().position(|x| Arc::ptr_eq(&x.val, &v_out.val))
-                                    {
-                                        bb.remove(pos);
-                                    }
-                                    bb.push(v_in.clone());
-                                    touched_buckets.push(*b);
-                                }
-                                success = true;
-                                break 'item_loop;
-                            }
-
-                            if cur_depth < 5 && !visited.contains(&alt_b) {
-                                visited.insert(alt_b);
-                                let mut new_path = path.clone();
-                                new_path.push((
-                                    (curr_b, hash_idx_of_item),
-                                    item_to_insert.clone(),
-                                    bk_item.clone(),
-                                ));
-                                queue.push_back((
-                                    (alt_b, alt_idx),
-                                    bk_item.clone(),
-                                    new_path,
-                                    cur_depth + 1,
-                                ));
-                            }
-                        }
+                        success = true;
+                        placed = true;
+                        touched_buckets.push(h);
+                        break;
                     }
+                }
+
+                if !placed {
+                    let target_idx = rng.gen_range(0..N);
+                    let target_hash = hashes[target_idx];
+                    let bucket = buckets
+                        .entry(target_hash)
+                        .or_insert_with(|| Vec::with_capacity(self.p));
+
+                    let evict_idx = rng.gen_range(0..bucket.len());
+                    let evicted = bucket.swap_remove(evict_idx);
+
+                    current_item.mask = [false; 4];
+                    current_item.mask[target_idx] = true;
+                    bucket.push(current_item.clone());
+
+                    touched_buckets.push(target_hash);
+
+                    current_item = evicted;
                 }
             } else {
-                if !queue.is_empty() {
-                    queue.pop_front();
-                }
-
                 let dummy_hash = rng.gen_range(0..self.m);
-                if let Some(bucket) = buckets.get_mut(&dummy_hash) {
-                    if !bucket.is_empty() {
-                        let dummy = bucket.swap_remove(0);
-                        bucket.push(dummy);
-                    }
+                let bucket = buckets
+                    .entry(dummy_hash)
+                    .or_insert_with(|| Vec::with_capacity(self.p));
+
+                if !bucket.is_empty() {
+                    let dummy = bucket.swap_remove(0);
+                    bucket.push(dummy);
                 }
                 touched_buckets.push(dummy_hash);
             }
         }
 
         if !success {
-            stash.push(to_place_item);
+            stash.push(current_item);
         }
 
         touched_buckets.sort_unstable();
         touched_buckets.dedup();
+
+        const EXACT_TOUCHES: usize = MAX_EVICTIONS + 2;
+
+        while touched_buckets.len() < EXACT_TOUCHES {
+            let dummy_hash = rng.gen_range(0..self.m);
+            if !touched_buckets.contains(&dummy_hash) {
+                let bucket = buckets
+                    .entry(dummy_hash)
+                    .or_insert_with(|| Vec::with_capacity(self.p));
+
+                if !bucket.is_empty() {
+                    let dummy = bucket.swap_remove(0);
+                    bucket.push(dummy);
+                }
+                touched_buckets.push(dummy_hash);
+            }
+        }
+
         touched_buckets
     }
 
@@ -966,6 +929,29 @@ impl<const N: usize> BfsDIP<N> {
 
         touched_buckets.sort_unstable();
         touched_buckets.dedup();
+
+        touched_buckets.sort_unstable();
+        touched_buckets.dedup();
+
+        const EXACT_TOUCHES: usize = MAX_BFS_NODES + 6;
+
+        while touched_buckets.len() < EXACT_TOUCHES {
+            let dummy_hash = rng.gen_range(0..self.m);
+
+            if !touched_buckets.contains(&dummy_hash) {
+                let bucket = buckets
+                    .entry(dummy_hash)
+                    .or_insert_with(|| Vec::with_capacity(self.p));
+
+                if !bucket.is_empty() {
+                    let dummy = bucket.swap_remove(0);
+                    bucket.push(dummy);
+                }
+
+                touched_buckets.push(dummy_hash);
+            }
+        }
+
         touched_buckets
     }
 

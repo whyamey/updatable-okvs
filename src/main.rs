@@ -138,5 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Error running benchmarks: {}", e);
     }
 
+    log::logger().flush();
+
     Ok(())
 }
