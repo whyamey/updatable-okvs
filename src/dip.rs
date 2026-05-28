@@ -4,8 +4,9 @@ use blake3;
 use rand::Rng;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const MAX_EVICTIONS: usize = 5;
-const MAX_BFS_NODES: usize = 10;
+const MAX_EVICTIONS: usize = 10;
+const MAX_BFS_NODES: usize = 20;
+const MAX_DEPTH: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct MaskedItem<T> {
@@ -356,7 +357,7 @@ impl<const N: usize> HashDIP<N> {
         touched_buckets.sort_unstable();
         touched_buckets.dedup();
 
-        const EXACT_TOUCHES: usize = MAX_EVICTIONS + 2;
+        const EXACT_TOUCHES: usize = MAX_EVICTIONS;
 
         while touched_buckets.len() < EXACT_TOUCHES {
             let dummy_hash = rng.gen_range(0..self.m);
@@ -845,15 +846,33 @@ impl<const N: usize> BfsDIP<N> {
             nodes_expanded += 1;
 
             if !success {
+                // Randomized beam search because 256*4*depth is too much.
                 if let Some(((curr_b, hash_idx_of_item), item_to_insert, path, cur_depth)) =
                     queue.pop_front()
                 {
                     let current_bucket_items = buckets.get(&curr_b).cloned().unwrap_or_default();
 
-                    'item_loop: for (i, bk_item) in current_bucket_items.iter().enumerate() {
+                    use rand::seq::SliceRandom;
+                    let mut indices: Vec<usize> = (0..current_bucket_items.len()).collect();
+                    indices.shuffle(rng);
+
+                    let mut branches_explored = 0;
+                    const MAX_BRANCHES_PER_NODE: usize = 2;
+
+                    'item_loop: for &i in &indices {
+                        if branches_explored >= MAX_BRANCHES_PER_NODE {
+                            break;
+                        }
+
+                        let bk_item = &current_bucket_items[i];
                         let item_hashes = self.get_hashes(&bk_item.key);
 
-                        for (alt_idx, &alt_b) in item_hashes.iter().enumerate() {
+                        let mut alt_indices: Vec<usize> = (0..item_hashes.len()).collect();
+                        alt_indices.shuffle(rng);
+
+                        for &alt_idx in &alt_indices {
+                            let alt_b = item_hashes[alt_idx];
+
                             if alt_b == curr_b || bk_item.mask[alt_idx] {
                                 continue;
                             }
@@ -874,7 +893,6 @@ impl<const N: usize> BfsDIP<N> {
                                 let mut updated_bk = bk_item.clone();
                                 updated_bk.mask[alt_idx] = true;
 
-                                // Reverse shift
                                 for ((b, _), v_in, v_out) in path.iter().rev() {
                                     let bb = buckets.get_mut(b).unwrap();
                                     if let Some(pos) =
@@ -889,7 +907,7 @@ impl<const N: usize> BfsDIP<N> {
                                 break 'item_loop;
                             }
 
-                            if cur_depth < 5 && !visited.contains(&alt_b) {
+                            if cur_depth < MAX_DEPTH && !visited.contains(&alt_b) {
                                 visited.insert(alt_b);
                                 let mut new_path = path.clone();
                                 new_path.push((
@@ -903,6 +921,8 @@ impl<const N: usize> BfsDIP<N> {
                                     new_path,
                                     cur_depth + 1,
                                 ));
+                                branches_explored += 1;
+                                break;
                             }
                         }
                     }
@@ -933,7 +953,7 @@ impl<const N: usize> BfsDIP<N> {
         touched_buckets.sort_unstable();
         touched_buckets.dedup();
 
-        const EXACT_TOUCHES: usize = MAX_BFS_NODES + 6;
+        const EXACT_TOUCHES: usize = MAX_BFS_NODES + MAX_DEPTH + 2;
 
         while touched_buckets.len() < EXACT_TOUCHES {
             let dummy_hash = rng.gen_range(0..self.m);
