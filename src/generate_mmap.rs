@@ -319,6 +319,9 @@ impl EncryptedFileSystem {
             };
 
             let pir_start = std::time::Instant::now();
+            let db_update_start = std::time::Instant::now();
+            let mut pending_hint_updates = Vec::new();
+
             for &bucket_id in &touched_buckets {
                 let pir_row_idx = bucket_id % mock_pir_m;
 
@@ -341,14 +344,26 @@ impl EncryptedFileSystem {
                     serialized_bucket.truncate(elem_size);
                 }
 
-                let new_b64 = base64::engine::general_purpose::STANDARD.encode(&serialized_bucket);
-
-                let old_row = pir_db.update_row(pir_row_idx, &new_b64).unwrap();
+                let old_row = pir_db.update_row_from_bytes(pir_row_idx, &serialized_bucket);
                 let new_row = pir_db.get_row(pir_row_idx);
-                pir_hint.update_hint_for_row(pir_row_idx, &old_row, &new_row);
+
+                pending_hint_updates.push((pir_row_idx, old_row, new_row));
 
                 last_touched_bucket = pir_row_idx;
             }
+
+            let db_update_time = db_update_start.elapsed();
+
+            let math_start = std::time::Instant::now();
+            pir_hint.update_hints_batched(&pending_hint_updates);
+            let math_time = math_start.elapsed();
+
+            log::trace!(
+                "DB Allocations/Base64 took: {:?}, Math took: {:?}",
+                db_update_time,
+                math_time
+            );
+
             total_pir_update_time += pir_start.elapsed();
         }
 

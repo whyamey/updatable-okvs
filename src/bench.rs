@@ -94,7 +94,8 @@ impl Benchmarker {
             );
             self.encrypted_fs.encrypt_files()?;
 
-            let insert_data = self.encrypted_fs.extract_insert_dataset(self.insert_split);
+            let mut insert_data = self.encrypted_fs.extract_insert_dataset(self.insert_split);
+            insert_data.truncate(1000);
             log::info!(
                 "Initial Build Dataset: {}, Insert Dataset: {}",
                 self.encrypted_fs.get_keyword_value_map_size(),
