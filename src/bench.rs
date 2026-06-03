@@ -204,41 +204,41 @@ impl Benchmarker {
         let volmap_n = self.encrypted_fs.get_keyword_count_map_size();
         self.volmap_m = 5 * volmap_n;
 
-        info!("TethysDIP Parameters:");
+        info!("DIP Parameters:");
         info!("p (bucket capacity): {}", p);
         info!("n (keyword value map size): {}", n);
         info!("m (number of nodes): {}", self.valmap_m);
         info!("epsilon: {}", self.epsilon);
 
         self.encrypted_fs
-            .apply_tethys_dip_on_volmap(self.volmap_m, 1)?;
-        self.encrypted_fs.print_volmap_tethys_dip_distribution();
+            .apply_dip_on_volmap(self.volmap_m, 1)?;
+        self.encrypted_fs.print_volmap_dip_distribution();
         self.encrypted_fs
             .generate_single_string_array_from_volmap(self.volmap_m)?;
         self.encrypted_fs.fill_empty_index_volmap()?;
         self.encrypted_fs.print_single_string_array_volmap();
 
-        self.encrypted_fs.apply_tethys_dip(self.valmap_m, p)?;
+        self.encrypted_fs.apply_dip(self.valmap_m, p)?;
 
         if let Some((total_buckets, non_empty_buckets, stash_size)) =
-            self.encrypted_fs.get_tethys_dip_stats_volmap()
+            self.encrypted_fs.get_dip_stats_volmap()
         {
-            info!("\nTethysDIP Statistics for VolMap:");
+            info!("\nDIP Statistics for VolMap:");
             info!("Total buckets built: {}", total_buckets);
             info!("Non-empty buckets: {}", non_empty_buckets);
             info!("Stash size: {}", stash_size);
         }
 
         if let Some((total_buckets, non_empty_buckets, stash_size)) =
-            self.encrypted_fs.get_tethys_dip_stats()
+            self.encrypted_fs.get_dip_stats()
         {
-            info!("\nTethysDIP Statistics for ValMap:");
+            info!("\nDIP Statistics for ValMap:");
             info!("Total buckets built: {}", total_buckets);
             info!("Non-empty buckets: {}", non_empty_buckets);
             info!("Stash size: {}", stash_size);
         }
 
-        self.encrypted_fs.print_tethys_dip_distribution();
+        self.encrypted_fs.print_dip_distribution();
         self.encrypted_fs.add_padding_to_buckets();
         self.encrypted_fs
             .generate_single_string_array(self.valmap_m);

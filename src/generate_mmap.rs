@@ -49,8 +49,8 @@ pub struct EncryptedFileSystem {
     document_nonces: HashMap<u32, [u8; 12]>,
     keyword_count_map: HashMap<String, usize>,
     keyword_value_map: HashMap<String, Vec<u8>>,
-    tethys_dip_result: Option<(HashMap<usize, Vec<Vec<u8>>>, Vec<Vec<u8>>)>,
-    tethys_dip_result_volmap: Option<(
+    dip_result: Option<(HashMap<usize, Vec<Vec<u8>>>, Vec<Vec<u8>>)>,
+    dip_result_volmap: Option<(
         HashMap<usize, Vec<Vec<(String, usize)>>>,
         Vec<Vec<(String, usize)>>,
     )>,
@@ -95,8 +95,8 @@ impl EncryptedFileSystem {
             document_nonces,
             keyword_count_map: HashMap::new(),
             keyword_value_map: HashMap::new(),
-            tethys_dip_result: None,
-            tethys_dip_result_volmap: None,
+            dip_result: None,
+            dip_result_volmap: None,
             single_string_array: None,
             single_string_array_volmap: None,
             masked_valmap_buckets: None,
@@ -703,7 +703,7 @@ impl EncryptedFileSystem {
         Ok(())
     }
 
-    pub fn apply_tethys_dip(
+    pub fn apply_dip(
         &mut self,
         m: usize,
         p: usize,
@@ -717,11 +717,11 @@ impl EncryptedFileSystem {
             dip.build_valmap(&modified_keyword_count_map, &self.keyword_value_map)
         };
 
-        self.tethys_dip_result = Some(result);
+        self.dip_result = Some(result);
         Ok(())
     }
 
-    pub fn apply_tethys_dip_on_volmap(
+    pub fn apply_dip_on_volmap(
         &mut self,
         m: usize,
         p: usize,
@@ -740,7 +740,7 @@ impl EncryptedFileSystem {
             dip.build_volmap(&self.keyword_count_map, &keyword_count_as_value_map)
         };
 
-        self.tethys_dip_result_volmap = Some(result);
+        self.dip_result_volmap = Some(result);
         Ok(())
     }
 
@@ -791,8 +791,8 @@ impl EncryptedFileSystem {
         self.decrypt_data(key, encrypted_data)
     }
 
-    pub fn get_tethys_dip_stats(&self) -> Option<(usize, usize, usize)> {
-        self.tethys_dip_result.as_ref().map(|(buckets, stash)| {
+    pub fn get_dip_stats(&self) -> Option<(usize, usize, usize)> {
+        self.dip_result.as_ref().map(|(buckets, stash)| {
             let total_buckets = buckets.len();
             let non_empty_buckets = buckets.values().filter(|b| !b.is_empty()).count();
             let stash_size = stash.len();
@@ -800,8 +800,8 @@ impl EncryptedFileSystem {
         })
     }
 
-    pub fn get_tethys_dip_stats_volmap(&self) -> Option<(usize, usize, usize)> {
-        self.tethys_dip_result_volmap
+    pub fn get_dip_stats_volmap(&self) -> Option<(usize, usize, usize)> {
+        self.dip_result_volmap
             .as_ref()
             .map(|(buckets, stash)| {
                 let total_buckets = buckets.len();
@@ -812,7 +812,7 @@ impl EncryptedFileSystem {
     }
 
     pub fn add_padding_to_buckets(&mut self) {
-        if let Some((buckets, _)) = self.tethys_dip_result.as_mut() {
+        if let Some((buckets, _)) = self.dip_result.as_mut() {
             let target_size = 8192;
             for bucket in buckets.values_mut() {
                 let current_size: usize = bucket.iter().map(|item| item.len()).sum();
@@ -825,7 +825,7 @@ impl EncryptedFileSystem {
     }
 
     pub fn generate_single_string_array(&mut self, m: usize) {
-        self.single_string_array = self.tethys_dip_result.as_ref().map(|(buckets, _)| {
+        self.single_string_array = self.dip_result.as_ref().map(|(buckets, _)| {
             let mut single_array = vec![String::new(); m];
 
             let target_size = 8192;
@@ -856,9 +856,9 @@ impl EncryptedFileSystem {
         m: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (buckets, _) = self
-            .tethys_dip_result_volmap
+            .dip_result_volmap
             .as_ref()
-            .ok_or("TethysDIP has not been applied")?;
+            .ok_or("DIP has not been applied")?;
 
         let elem_size = 256;
 
@@ -896,7 +896,7 @@ impl EncryptedFileSystem {
     }
 
     pub fn get_valmap_stash(&self) -> Option<Vec<Vec<u8>>> {
-        self.tethys_dip_result
+        self.dip_result
             .as_ref()
             .map(|(_, stash)| stash.clone())
     }
@@ -905,27 +905,27 @@ impl EncryptedFileSystem {
         self.single_string_array_volmap.as_ref()
     }
 
-    pub fn print_tethys_dip_distribution(&self) {
-        if let Some((buckets, stash)) = &self.tethys_dip_result {
-            trace!("\nTethysDIP Distribution:");
+    pub fn print_dip_distribution(&self) {
+        if let Some((buckets, stash)) = &self.dip_result {
+            trace!("\nDIP Distribution:");
             for (bucket_id, values) in buckets {
                 trace!("Bucket {}: {} items", bucket_id, values.len());
             }
             trace!("Stash: {} items", stash.len());
         } else {
-            trace!("TethysDIP has not been applied yet.");
+            trace!("DIP has not been applied yet.");
         }
     }
 
-    pub fn print_volmap_tethys_dip_distribution(&self) {
-        if let Some((buckets, stash)) = &self.tethys_dip_result_volmap {
-            trace!("\nTethysDIP Distribution:");
+    pub fn print_volmap_dip_distribution(&self) {
+        if let Some((buckets, stash)) = &self.dip_result_volmap {
+            trace!("\nDIP Distribution:");
             for (bucket_id, values) in buckets {
                 trace!("Bucket {}: {} items", bucket_id, values.len());
             }
             trace!("Stash: {} items", stash.len());
         } else {
-            trace!("TethysDIP has not been applied yet.");
+            trace!("DIP has not been applied yet.");
         }
     }
 
