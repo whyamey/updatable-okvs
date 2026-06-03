@@ -6,7 +6,7 @@ import statistics
 import brotli
 from tqdm import tqdm
 
-META_FILES = {'keywords.txt', 'keyword_file_map.json', 'files.txt'}
+META_FILES = {"keywords.txt", "keyword_file_map.json", "files.txt"}
 
 
 def get_target_files(input_dir):
@@ -25,13 +25,13 @@ def compress_single_file(args):
     output_path = os.path.join(output_dir, filename)
 
     try:
-        with open(input_path, 'rb') as f_in:
+        with open(input_path, "rb") as f_in:
             data = f_in.read()
 
         compressed_data = brotli.compress(data, quality=9)
         compressed_size = len(compressed_data)
 
-        with open(output_path, 'wb') as f_out:
+        with open(output_path, "wb") as f_out:
             f_out.write(compressed_data)
 
         return (True, compressed_size)
@@ -88,7 +88,7 @@ def main():
         for result in tqdm(
             pool.imap_unordered(compress_single_file, process_args, chunksize=50),
             total=total_files,
-            desc="Compressing"
+            desc="Compressing",
         ):
             success, val = result
             if success:
@@ -106,8 +106,12 @@ def main():
         avg_size = statistics.mean(compressed_sizes)
         med_size = statistics.median(compressed_sizes)
         print("-" * 50)
-        print(f"Average Compressed Size : {avg_size:.2f} bytes ({format_bytes(avg_size)})")
-        print(f"Median Compressed Size  : {med_size:.2f} bytes ({format_bytes(med_size)})")
+        print(
+            f"Average Compressed Size : {avg_size:.2f} bytes ({format_bytes(avg_size)})"
+        )
+        print(
+            f"Median Compressed Size  : {med_size:.2f} bytes ({format_bytes(med_size)})"
+        )
         print("-" * 50)
 
     if failed_files:
