@@ -61,20 +61,10 @@ impl<const N: usize> HashDIP<N> {
         (hash_value as usize) % self.m
     }
 
-    /// Tabulation Hashing is just (hash(kwd) + hash(counter)) mod m
     pub fn get_hashes(&self, keyword: &str) -> [usize; N] {
-        let (base_keyword, num_ones) = Self::parse_keyword(keyword);
         let mut hashes = [0; N];
-
-        if num_ones == 0 {
-            for i in 0..N {
-                hashes[i] = self.hash(i, base_keyword);
-            }
-        } else {
-            let counter_str = num_ones.to_string();
-            for i in 0..N {
-                hashes[i] = (self.hash(i, base_keyword) + self.hash(i, &counter_str)) % self.m;
-            }
+        for i in 0..N {
+            hashes[i] = self.hash(i, keyword);
         }
         hashes
     }
@@ -376,20 +366,6 @@ impl<const N: usize> HashDIP<N> {
 
         touched_buckets
     }
-
-    pub fn parse_keyword(keyword: &str) -> (&str, usize) {
-        let mut count = 0;
-        let mut base_keyword = keyword;
-
-        while base_keyword.ends_with('1') {
-            if base_keyword.len() <= 1 {
-                break;
-            }
-            base_keyword = &base_keyword[..base_keyword.len() - 1];
-            count += 1;
-        }
-        (base_keyword, count)
-    }
 }
 
 pub struct BfsDIP<const N: usize = 2> {
@@ -428,18 +404,9 @@ impl<const N: usize> BfsDIP<N> {
     }
 
     pub fn get_hashes(&self, keyword: &str) -> [usize; N] {
-        let (base_keyword, num_ones) = Self::parse_keyword(keyword);
         let mut hashes = [0; N];
-
-        if num_ones == 0 {
-            for i in 0..N {
-                hashes[i] = self.hash(i, base_keyword);
-            }
-        } else {
-            let counter_str = num_ones.to_string();
-            for i in 0..N {
-                hashes[i] = (self.hash(i, base_keyword) + self.hash(i, &counter_str)) % self.m;
-            }
+        for i in 0..N {
+            hashes[i] = self.hash(i, keyword);
         }
         hashes
     }
@@ -973,19 +940,5 @@ impl<const N: usize> BfsDIP<N> {
         }
 
         touched_buckets
-    }
-
-    pub fn parse_keyword(keyword: &str) -> (&str, usize) {
-        let mut count = 0;
-        let mut base_keyword = keyword;
-
-        while base_keyword.ends_with('1') {
-            if base_keyword.len() <= 1 {
-                break;
-            }
-            base_keyword = &base_keyword[..base_keyword.len() - 1];
-            count += 1;
-        }
-        (base_keyword, count)
     }
 }
