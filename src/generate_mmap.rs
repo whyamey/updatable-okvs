@@ -907,25 +907,25 @@ impl EncryptedFileSystem {
 
     pub fn print_dip_distribution(&self) {
         if let Some((buckets, stash)) = &self.dip_result {
-            trace!("\nTethysDIP Distribution:");
+            trace!("\nDIP Distribution:");
             for (bucket_id, values) in buckets {
                 trace!("Bucket {}: {} items", bucket_id, values.len());
             }
             trace!("Stash: {} items", stash.len());
         } else {
-            trace!("TethysDIP has not been applied yet.");
+            trace!("DIP has not been applied yet.");
         }
     }
 
     pub fn print_volmap_dip_distribution(&self) {
         if let Some((buckets, stash)) = &self.dip_result_volmap {
-            trace!("\nTethysDIP Distribution:");
+            trace!("\nDIP Distribution:");
             for (bucket_id, values) in buckets {
                 trace!("Bucket {}: {} items", bucket_id, values.len());
             }
             trace!("Stash: {} items", stash.len());
         } else {
-            trace!("TethysDIP has not been applied yet.");
+            trace!("DIP has not been applied yet.");
         }
     }
 
