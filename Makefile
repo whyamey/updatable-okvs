@@ -1,4 +1,4 @@
-.PHONY: all clean sharding subsets test-subset-100 test-subset-500 test-subset-1000 generate_keyword_files sharding-with-keywords test-2-shards-keywords test-4-shards-keywords test-8-shards-keywords test-16-shards-keywords test-no-shard-keywords
+.PHONY: all clean sharding subsets test-subset-100 test-subset-500 test-subset-1000 generate_keyword_files sharding-with-keywords test-2-shards-keywords test-4-shards-keywords test-8-shards-keywords test-16-shards-keywords test-no-shard-keywords test-docmap test-inserts
 
 RUSTFLAGS = '-C target-cpu=native'
 DATA_DIR ?= data
@@ -7,6 +7,7 @@ SCRIPTS_DIR ?= data
 OUTPUT_DIR = output
 LOGS_DIR = $(OUTPUT_DIR)/logs
 SHARDS_DIR = $(OUTPUT_DIR)/shards
+INSERT_SPLIT ?= 0.8
 
 all: sharding sharding-with-keywords subsets
 sharding: setup-dirs target/release/mkse test-2-shards test-4-shards test-8-shards test-16-shards test-no-shard
@@ -15,29 +16,27 @@ sharding-with-keywords: setup-dirs target/release/mkse generate_shard_keywords t
 
 setup-dirs:
 	mkdir -p $(OUTPUT_DIR)
-	mkdir -p $(LOGS_DIR)
+	mkdir -p $(LOGS_DIR)/hash
+	mkdir -p $(LOGS_DIR)/bfs
 	mkdir -p $(SHARDS_DIR)
 
 target/release/mkse:
 	RUSTFLAGS=$(RUSTFLAGS) cargo build --release
 
 generate_data: setup-dirs
-	@if [ "$(USE_EXISTING)" = "false" ]; then \
-		echo "Generating new data..."; \
+	@if [ "$(USE_EXISTING)" = "false" ]; \
+	then \
 		python $(SCRIPTS_DIR)/generate_power.py; \
-	else \
-		echo "Using existing data..."; \
 	fi
 
 generate_initial_shard: target/release/mkse generate_data
 	mkdir -p $(SHARDS_DIR)/shard_2
 	python $(SCRIPTS_DIR)/create_shards.py $(DATA_DIR)/keyword_file_map.json $(SHARDS_DIR)/shard_2 2
 	cp $(SHARDS_DIR)/shard_2/keywords_to_query $(OUTPUT_DIR)/keywords_to_query
-	# Verify the file exists
-	@test -f $(OUTPUT_DIR)/keywords_to_query || (echo "Failed to create keywords_to_query file" && exit 1)
+	@test -f $(OUTPUT_DIR)/keywords_to_query || (exit 1)
 
 test-2-shards: generate_initial_shard
-	@test -f $(OUTPUT_DIR)/keywords_to_query || (echo "keywords_to_query file missing" && exit 1)
+	@test -f $(OUTPUT_DIR)/keywords_to_query || (exit 1)
 	for i in 0 1; do \
 		mkdir -p $(SHARDS_DIR)/shard_2/data_$$i; \
 		rsync -a $(DATA_DIR)/ $(SHARDS_DIR)/shard_2/data_$$i/; \
@@ -45,7 +44,10 @@ test-2-shards: generate_initial_shard
 		cp $(SHARDS_DIR)/shard_2/keywords_$$i.txt $(SHARDS_DIR)/shard_2/data_$$i/keywords.txt; \
 		cp $(SHARDS_DIR)/shard_2/shard_$$i.json $(SHARDS_DIR)/shard_2/data_$$i/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query $(SHARDS_DIR)/shard_2/data_$$i/; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/shard_2/data_$$i --read-keywords $(SHARDS_DIR)/shard_2/data_$$i/keywords_to_query > $(LOGS_DIR)/output_2_$$i.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_2/data_$$i --read-keywords $(SHARDS_DIR)/shard_2/data_$$i/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_2_$$i.txt 2>&1; \
+		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_2
 
@@ -59,7 +61,10 @@ test-4-shards: generate_initial_shard
 		cp $(SHARDS_DIR)/shard_4/keywords_$$i.txt $(SHARDS_DIR)/shard_4/data_$$i/keywords.txt; \
 		cp $(SHARDS_DIR)/shard_4/shard_$$i.json $(SHARDS_DIR)/shard_4/data_$$i/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query $(SHARDS_DIR)/shard_4/data_$$i/; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/shard_4/data_$$i --read-keywords $(SHARDS_DIR)/shard_4/data_$$i/keywords_to_query > $(LOGS_DIR)/output_4_$$i.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_4/data_$$i --read-keywords $(SHARDS_DIR)/shard_4/data_$$i/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_4_$$i.txt 2>&1; \
+		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_4
 
@@ -73,7 +78,10 @@ test-8-shards: generate_initial_shard
 		cp $(SHARDS_DIR)/shard_8/keywords_$$i.txt $(SHARDS_DIR)/shard_8/data_$$i/keywords.txt; \
 		cp $(SHARDS_DIR)/shard_8/shard_$$i.json $(SHARDS_DIR)/shard_8/data_$$i/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query $(SHARDS_DIR)/shard_8/data_$$i/; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/shard_8/data_$$i --read-keywords $(SHARDS_DIR)/shard_8/data_$$i/keywords_to_query > $(LOGS_DIR)/output_8_$$i.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_8/data_$$i --read-keywords $(SHARDS_DIR)/shard_8/data_$$i/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_8_$$i.txt 2>&1; \
+		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_8
 
@@ -87,12 +95,18 @@ test-16-shards: generate_initial_shard
 		cp $(SHARDS_DIR)/shard_16/keywords_$$i.txt $(SHARDS_DIR)/shard_16/data_$$i/keywords.txt; \
 		cp $(SHARDS_DIR)/shard_16/shard_$$i.json $(SHARDS_DIR)/shard_16/data_$$i/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query $(SHARDS_DIR)/shard_16/data_$$i/; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/shard_16/data_$$i --read-keywords $(SHARDS_DIR)/shard_16/data_$$i/keywords_to_query > $(LOGS_DIR)/output_16_$$i.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_16/data_$$i --read-keywords $(SHARDS_DIR)/shard_16/data_$$i/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_16_$$i.txt 2>&1; \
+		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_16
 
 test-no-shard: generate_initial_shard
-	./target/release/mkse --data-dir $(DATA_DIR) --read-keywords $(OUTPUT_DIR)/keywords_to_query > $(LOGS_DIR)/output_no_shard.txt 2>&1
+	for mode in "hash" "bfs"; do \
+		if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+		./target/release/mkse --data-dir $(DATA_DIR) --read-keywords $(OUTPUT_DIR)/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_no_shard.txt 2>&1; \
+	done
 
 generate_shard_keywords: setup-dirs generate_data
 	python $(SCRIPTS_DIR)/parse_subset.py $(DATA_DIR)/keyword_file_map.json --generate-keywords 100 1 --keywords-output $(OUTPUT_DIR)/shard_keywords_100
@@ -110,9 +124,12 @@ test-2-shards-keywords:
 		cp $(SHARDS_DIR)/shard_2/shard_$${i}.json $(SHARDS_DIR)/shard_2/data_$${i}/keyword_file_map.json; \
 		for freq in 100 500 1000; do \
 			cp $(OUTPUT_DIR)/shard_keywords_$${freq} $(SHARDS_DIR)/shard_2/data_$${i}/keywords_to_query; \
-			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_2/data_$${i} \
-				--read-keywords $(SHARDS_DIR)/shard_2/data_$${i}/keywords_to_query \
-				> $(LOGS_DIR)/output_2_$${i}_freq_$${freq}.txt 2>&1; \
+			for mode in "hash" "bfs"; do \
+				if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+				./target/release/mkse --data-dir $(SHARDS_DIR)/shard_2/data_$${i} \
+					--read-keywords $(SHARDS_DIR)/shard_2/data_$${i}/keywords_to_query $$BFS_FLAG \
+					> $(LOGS_DIR)/$$mode/output_2_$${i}_freq_$${freq}.txt 2>&1; \
+			done; \
 		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_2
@@ -128,9 +145,12 @@ test-4-shards-keywords:
 		cp $(SHARDS_DIR)/shard_4/shard_$${i}.json $(SHARDS_DIR)/shard_4/data_$${i}/keyword_file_map.json; \
 		for freq in 100 500 1000; do \
 			cp $(OUTPUT_DIR)/shard_keywords_$${freq} $(SHARDS_DIR)/shard_4/data_$${i}/keywords_to_query; \
-			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_4/data_$${i} \
-				--read-keywords $(SHARDS_DIR)/shard_4/data_$${i}/keywords_to_query \
-				> $(LOGS_DIR)/output_4_$${i}_freq_$${freq}.txt 2>&1; \
+			for mode in "hash" "bfs"; do \
+				if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+				./target/release/mkse --data-dir $(SHARDS_DIR)/shard_4/data_$${i} \
+					--read-keywords $(SHARDS_DIR)/shard_4/data_$${i}/keywords_to_query $$BFS_FLAG \
+					> $(LOGS_DIR)/$$mode/output_4_$${i}_freq_$${freq}.txt 2>&1; \
+			done; \
 		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_4
@@ -146,9 +166,12 @@ test-8-shards-keywords:
 		cp $(SHARDS_DIR)/shard_8/shard_$${i}.json $(SHARDS_DIR)/shard_8/data_$${i}/keyword_file_map.json; \
 		for freq in 100 500 1000; do \
 			cp $(OUTPUT_DIR)/shard_keywords_$${freq} $(SHARDS_DIR)/shard_8/data_$${i}/keywords_to_query; \
-			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_8/data_$${i} \
-				--read-keywords $(SHARDS_DIR)/shard_8/data_$${i}/keywords_to_query \
-				> $(LOGS_DIR)/output_8_$${i}_freq_$${freq}.txt 2>&1; \
+			for mode in "hash" "bfs"; do \
+				if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+				./target/release/mkse --data-dir $(SHARDS_DIR)/shard_8/data_$${i} \
+					--read-keywords $(SHARDS_DIR)/shard_8/data_$${i}/keywords_to_query $$BFS_FLAG \
+					> $(LOGS_DIR)/$$mode/output_8_$${i}_freq_$${freq}.txt 2>&1; \
+			done; \
 		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_8
@@ -164,9 +187,12 @@ test-16-shards-keywords:
 		cp $(SHARDS_DIR)/shard_16/shard_$${i}.json $(SHARDS_DIR)/shard_16/data_$${i}/keyword_file_map.json; \
 		for freq in 100 500 1000; do \
 			cp $(OUTPUT_DIR)/shard_keywords_$${freq} $(SHARDS_DIR)/shard_16/data_$${i}/keywords_to_query; \
-			./target/release/mkse --data-dir $(SHARDS_DIR)/shard_16/data_$${i} \
-				--read-keywords $(SHARDS_DIR)/shard_16/data_$${i}/keywords_to_query \
-				> $(LOGS_DIR)/output_16_$${i}_freq_$${freq}.txt 2>&1; \
+			for mode in "hash" "bfs"; do \
+				if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+				./target/release/mkse --data-dir $(SHARDS_DIR)/shard_16/data_$${i} \
+					--read-keywords $(SHARDS_DIR)/shard_16/data_$${i}/keywords_to_query $$BFS_FLAG \
+					> $(LOGS_DIR)/$$mode/output_16_$${i}_freq_$${freq}.txt 2>&1; \
+			done; \
 		done; \
 	done
 	rm -rf $(SHARDS_DIR)/shard_16
@@ -174,9 +200,12 @@ test-16-shards-keywords:
 test-no-shard-keywords: generate_shard_keywords
 	for freq in 100 500 1000; do \
 		cp $(OUTPUT_DIR)/shard_keywords_$${freq} $(DATA_DIR)/keywords_to_query; \
-		./target/release/mkse --data-dir $(DATA_DIR) \
-			--read-keywords $(DATA_DIR)/keywords_to_query \
-			> $(LOGS_DIR)/output_no_shard_freq_$${freq}.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(DATA_DIR) \
+				--read-keywords $(DATA_DIR)/keywords_to_query $$BFS_FLAG \
+				> $(LOGS_DIR)/$$mode/output_no_shard_freq_$${freq}.txt 2>&1; \
+		done; \
 	done
 
 generate_keyword_files: setup-dirs generate_data
@@ -193,15 +222,21 @@ test-subset-100: target/release/mkse generate_keyword_files
 			--target-size 2\^$$size \
 			--output-file $(SHARDS_DIR)/subset_100_2\^$$size/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query_100 $(SHARDS_DIR)/subset_100_2\^$$size/keywords_to_query; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/subset_100_2\^$$size \
-			--read-keywords $(SHARDS_DIR)/subset_100_2\^$$size/keywords_to_query > $(LOGS_DIR)/output_subset_100_2\^$$size.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/subset_100_2\^$$size \
+				--read-keywords $(SHARDS_DIR)/subset_100_2\^$$size/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_subset_100_2\^$$size.txt 2>&1; \
+		done; \
 		rm -rf $(SHARDS_DIR)/subset_100_2\^$$size; \
 	done; \
 	mkdir -p $(SHARDS_DIR)/subset_100_full; \
 	rsync -a $(DATA_DIR)/ $(SHARDS_DIR)/subset_100_full/; \
 	cp $(OUTPUT_DIR)/keywords_to_query_100 $(SHARDS_DIR)/subset_100_full/keywords_to_query; \
-	./target/release/mkse --data-dir $(SHARDS_DIR)/subset_100_full \
-		--read-keywords $(SHARDS_DIR)/subset_100_full/keywords_to_query > $(LOGS_DIR)/output_subset_100_full.txt 2>&1; \
+	for mode in "hash" "bfs"; do \
+		if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+		./target/release/mkse --data-dir $(SHARDS_DIR)/subset_100_full \
+			--read-keywords $(SHARDS_DIR)/subset_100_full/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_subset_100_full.txt 2>&1; \
+	done; \
 	rm -rf $(SHARDS_DIR)/subset_100_full
 
 test-subset-500: target/release/mkse generate_keyword_files
@@ -213,15 +248,21 @@ test-subset-500: target/release/mkse generate_keyword_files
 			--target-size 2\^$$size \
 			--output-file $(SHARDS_DIR)/subset_500_2\^$$size/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query_500 $(SHARDS_DIR)/subset_500_2\^$$size/keywords_to_query; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/subset_500_2\^$$size \
-			--read-keywords $(SHARDS_DIR)/subset_500_2\^$$size/keywords_to_query > $(LOGS_DIR)/output_subset_500_2\^$$size.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/subset_500_2\^$$size \
+				--read-keywords $(SHARDS_DIR)/subset_500_2\^$$size/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_subset_500_2\^$$size.txt 2>&1; \
+		done; \
 		rm -rf $(SHARDS_DIR)/subset_500_2\^$$size; \
 	done; \
 	mkdir -p $(SHARDS_DIR)/subset_500_full; \
 	rsync -a $(DATA_DIR)/ $(SHARDS_DIR)/subset_500_full/; \
 	cp $(OUTPUT_DIR)/keywords_to_query_500 $(SHARDS_DIR)/subset_500_full/keywords_to_query; \
-	./target/release/mkse --data-dir $(SHARDS_DIR)/subset_500_full \
-		--read-keywords $(SHARDS_DIR)/subset_500_full/keywords_to_query > $(LOGS_DIR)/output_subset_500_full.txt 2>&1; \
+	for mode in "hash" "bfs"; do \
+		if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+		./target/release/mkse --data-dir $(SHARDS_DIR)/subset_500_full \
+			--read-keywords $(SHARDS_DIR)/subset_500_full/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_subset_500_full.txt 2>&1; \
+	done; \
 	rm -rf $(SHARDS_DIR)/subset_500_full
 
 test-subset-1000: target/release/mkse generate_keyword_files
@@ -233,16 +274,42 @@ test-subset-1000: target/release/mkse generate_keyword_files
 			--target-size 2\^$$size \
 			--output-file $(SHARDS_DIR)/subset_1000_2\^$$size/keyword_file_map.json; \
 		cp $(OUTPUT_DIR)/keywords_to_query_1000 $(SHARDS_DIR)/subset_1000_2\^$$size/keywords_to_query; \
-		./target/release/mkse --data-dir $(SHARDS_DIR)/subset_1000_2\^$$size \
-			--read-keywords $(SHARDS_DIR)/subset_1000_2\^$$size/keywords_to_query > $(LOGS_DIR)/output_subset_1000_2\^$$size.txt 2>&1; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/subset_1000_2\^$$size \
+				--read-keywords $(SHARDS_DIR)/subset_1000_2\^$$size/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_subset_1000_2\^$$size.txt 2>&1; \
+		done; \
 		rm -rf $(SHARDS_DIR)/subset_1000_2\^$$size; \
 	done; \
 	mkdir -p $(SHARDS_DIR)/subset_1000_full; \
 	rsync -a $(DATA_DIR)/ $(SHARDS_DIR)/subset_1000_full/; \
 	cp $(OUTPUT_DIR)/keywords_to_query_1000 $(SHARDS_DIR)/subset_1000_full/keywords_to_query; \
-	./target/release/mkse --data-dir $(SHARDS_DIR)/subset_1000_full \
-		--read-keywords $(SHARDS_DIR)/subset_1000_full/keywords_to_query > $(LOGS_DIR)/output_subset_1000_full.txt 2>&1; \
+	for mode in "hash" "bfs"; do \
+		if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+		./target/release/mkse --data-dir $(SHARDS_DIR)/subset_1000_full \
+			--read-keywords $(SHARDS_DIR)/subset_1000_full/keywords_to_query $$BFS_FLAG > $(LOGS_DIR)/$$mode/output_subset_1000_full.txt 2>&1; \
+	done; \
 	rm -rf $(SHARDS_DIR)/subset_1000_full
+
+test-docmap: setup-dirs target/release/mkse generate_shard_keywords
+	for freq in 100 500 1000; do \
+		cp $(OUTPUT_DIR)/shard_keywords_$$freq $(DATA_DIR)/keywords_to_query; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(DATA_DIR) \
+				--read-keywords $(DATA_DIR)/keywords_to_query \
+				--run-docmap-test $$BFS_FLAG \
+				> $(LOGS_DIR)/$$mode/output_docmap_freq_$$freq.txt 2>&1; \
+		done; \
+	done
+
+test-inserts: setup-dirs target/release/mkse
+	for mode in "hash" "bfs"; do \
+		if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+		./target/release/mkse --data-dir $(DATA_DIR) \
+			--run-insert-test --insert-split $(INSERT_SPLIT) $$BFS_FLAG \
+			> $(LOGS_DIR)/$$mode/output_inserts.txt 2>&1; \
+	done
 
 clean:
 	rm -rf $(OUTPUT_DIR)
