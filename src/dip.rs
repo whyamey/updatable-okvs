@@ -849,25 +849,29 @@ impl<const N: usize> BfsDIP<N> {
                                 .or_insert_with(|| Vec::with_capacity(self.p));
 
                             if alt_bucket.len() < self.p {
-                                alt_bucket.push(bk_item.clone());
+                                let mut updated_bk = bk_item.clone();
+                                updated_bk.mask[alt_idx] = true;
+                                alt_bucket.push(updated_bk);
                                 touched_buckets.push(alt_b);
 
                                 let cb = buckets.get_mut(&curr_b).unwrap();
                                 cb.remove(i);
-                                cb.push(item_to_insert.clone());
+
+                                let mut new_item_to_insert = item_to_insert.clone();
+                                new_item_to_insert.mask[hash_idx_of_item] = true;
+                                cb.push(new_item_to_insert);
                                 touched_buckets.push(curr_b);
 
-                                let mut updated_bk = bk_item.clone();
-                                updated_bk.mask[alt_idx] = true;
-
-                                for ((b, _), v_in, v_out) in path.iter().rev() {
+                                for ((b, hash_idx), v_in, v_out) in path.iter().rev() {
                                     let bb = buckets.get_mut(b).unwrap();
                                     if let Some(pos) =
                                         bb.iter().position(|x| Arc::ptr_eq(&x.val, &v_out.val))
                                     {
                                         bb.remove(pos);
                                     }
-                                    bb.push(v_in.clone());
+                                    let mut new_v_in = v_in.clone();
+                                    new_v_in.mask[*hash_idx] = true;
+                                    bb.push(new_v_in);
                                     touched_buckets.push(*b);
                                 }
                                 success = true;
@@ -913,9 +917,6 @@ impl<const N: usize> BfsDIP<N> {
         if !success {
             stash.push(to_place_item);
         }
-
-        touched_buckets.sort_unstable();
-        touched_buckets.dedup();
 
         touched_buckets.sort_unstable();
         touched_buckets.dedup();
