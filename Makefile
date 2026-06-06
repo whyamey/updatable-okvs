@@ -311,6 +311,31 @@ test-inserts: setup-dirs target/release/mkse
 			> $(LOGS_DIR)/$$mode/output_inserts.txt 2>&1; \
 	done
 
+test-inserts-subsets: setup-dirs target/release/mkse
+	for size in 16 17 18 19 20 21 22 23 24; do \
+		mkdir -p $(SHARDS_DIR)/inserts_subset_2\^$$size; \
+		rsync -a $(DATA_DIR)/ $(SHARDS_DIR)/inserts_subset_2\^$$size/; \
+		python $(SCRIPTS_DIR)/parse_subset.py $(DATA_DIR)/keyword_file_map.json \
+			--target-size 2\^$$size \
+			--output-file $(SHARDS_DIR)/inserts_subset_2\^$$size/keyword_file_map.json; \
+		for mode in "hash" "bfs"; do \
+			if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+			./target/release/mkse --data-dir $(SHARDS_DIR)/inserts_subset_2\^$$size \
+				--run-insert-test --insert-split $(INSERT_SPLIT) $$BFS_FLAG \
+				> $(LOGS_DIR)/$$mode/output_inserts_2\^$$size.txt 2>&1; \
+		done; \
+		rm -rf $(SHARDS_DIR)/inserts_subset_2\^$$size; \
+	done; \
+	mkdir -p $(SHARDS_DIR)/inserts_subset_full; \
+	rsync -a $(DATA_DIR)/ $(SHARDS_DIR)/inserts_subset_full/; \
+	for mode in "hash" "bfs"; do \
+		if [ "$$mode" = "bfs" ]; then BFS_FLAG="--use-bfs"; else BFS_FLAG=""; fi; \
+		./target/release/mkse --data-dir $(SHARDS_DIR)/inserts_subset_full \
+			--run-insert-test --insert-split $(INSERT_SPLIT) $$BFS_FLAG \
+			> $(LOGS_DIR)/$$mode/output_inserts_full.txt 2>&1; \
+	done; \
+	rm -rf $(SHARDS_DIR)/inserts_subset_full
+
 clean:
 	rm -rf $(OUTPUT_DIR)
 	cargo clean
