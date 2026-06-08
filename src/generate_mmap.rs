@@ -289,12 +289,11 @@ impl EncryptedFileSystem {
                 .encode(vec![0u8; elem_size]);
             mock_pir_m
         ];
+
         let mut pir_db = Database::new(&dummy_elements, mock_pir_m, elem_size, p_bits).unwrap();
         let mut pir_hint = BaseParams::new(&pir_db, pir_dim);
 
         let mut total_pir_update_time = std::time::Duration::new(0, 0);
-        let mut last_touched_bucket = 0;
-
         let start_time = std::time::Instant::now();
 
         for (kw, val) in insert_data.iter() {
@@ -319,13 +318,12 @@ impl EncryptedFileSystem {
             };
 
             let pir_start = std::time::Instant::now();
-            let db_update_start = std::time::Instant::now();
-            let mut pending_hint_updates = Vec::new();
+            let mut pending_hint_updates = Vec::with_capacity(touched_buckets.len());
 
             for &bucket_id in &touched_buckets {
                 let pir_row_idx = bucket_id % mock_pir_m;
-
                 let mut serialized_bucket = Vec::new();
+
                 if let Some(bucket) = buckets.get(&bucket_id) {
                     for item in bucket {
                         serialized_bucket.extend_from_slice(item.key.as_bytes());
@@ -348,56 +346,60 @@ impl EncryptedFileSystem {
                 let new_row = pir_db.get_row(pir_row_idx);
 
                 pending_hint_updates.push((pir_row_idx, old_row, new_row));
-
-                last_touched_bucket = pir_row_idx;
             }
 
-            let db_update_time = db_update_start.elapsed();
-
-            let math_start = std::time::Instant::now();
             pir_hint.update_hints_batched(&pending_hint_updates);
-            let math_time = math_start.elapsed();
-
-            log::trace!(
-                "DB Allocations/Base64 took: {:?}, Math took: {:?}",
-                db_update_time,
-                math_time
-            );
-
             total_pir_update_time += pir_start.elapsed();
         }
 
         let elapsed = start_time.elapsed();
 
         let common_params = CommonParams::from(&pir_hint);
-        let s: Vec<u32> = (0..pir_dim).map(|_| rng.gen()).collect();
-        let mut query = common_params.mult_left(&s).unwrap();
-
         let q_factor = get_rounding_factor(p_bits);
-        query[last_touched_bucket] = query[last_touched_bucket].wrapping_add(q_factor);
-
-        let ans = pir_db.eval_single(&query);
-
-        let hint_s = pir_hint.mult_right(&s).unwrap();
-        let mut decrypted_row = Vec::with_capacity(ans.len());
         let p_size = get_plaintext_size(p_bits);
 
-        for i in 0..ans.len() {
-            let val = ans[i].wrapping_sub(hint_s[i]);
-            let rounded = val.wrapping_add(q_factor / 2) / q_factor;
-            decrypted_row.push(rounded % p_size);
+        let mut all_success = true;
+        let mut test_count = 0;
+        let buckets_to_test: Vec<usize> = buckets.keys().copied().take(20).collect();
+
+        for bucket_id in buckets_to_test {
+            let test_row_idx = bucket_id % mock_pir_m;
+            let s: Vec<u32> = (0..pir_dim).map(|_| rng.gen()).collect();
+
+            let mut query = common_params.mult_left(&s).unwrap();
+            query[test_row_idx] = query[test_row_idx].wrapping_add(q_factor);
+
+            let ans = pir_db.eval_single(&query);
+            let hint_s = pir_hint.mult_right(&s).unwrap();
+
+            let mut decrypted_row = Vec::with_capacity(ans.len());
+            for i in 0..ans.len() {
+                let val = ans[i].wrapping_sub(hint_s[i]);
+                let rounded = val.wrapping_add(q_factor / 2) / q_factor;
+                decrypted_row.push(rounded % p_size);
+            }
+
+            if decrypted_row != pir_db.get_row(test_row_idx) {
+                log::error!("PIR Validation Failed on bucket {}", test_row_idx);
+                all_success = false;
+            }
+            test_count += 1;
         }
 
-        if decrypted_row == pir_db.get_row(last_touched_bucket) {
-            log::info!("PIR Validation Success.");
-        } else {
-            log::error!("PIR Validation Failed.");
+        if all_success && test_count > 0 {
+            log::info!(
+                "PIR Validation Success for {} random updated rows.",
+                test_count
+            );
+        } else if !all_success {
+            log::error!("PIR Validation Failed for one or more rows.");
         }
 
         let mut volmap_stash_additions = 0;
         for (kw, _) in insert_data.iter() {
             let keyword_part = kw.split("||").next().unwrap();
             let base_keyword = keyword_part.trim_end_matches('1');
+
             if !self.keyword_count_map.contains_key(base_keyword)
                 && !self.keyword_count_map.contains_key(keyword_part)
             {
@@ -703,11 +705,7 @@ impl EncryptedFileSystem {
         Ok(())
     }
 
-    pub fn apply_dip(
-        &mut self,
-        m: usize,
-        p: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn apply_dip(&mut self, m: usize, p: usize) -> Result<(), Box<dyn std::error::Error>> {
         let modified_keyword_count_map = self.create_modified_keyword_count_map();
         let result = if self.use_bfs {
             let dip = BfsDIP::<4>::new(m, p);
@@ -801,14 +799,12 @@ impl EncryptedFileSystem {
     }
 
     pub fn get_dip_stats_volmap(&self) -> Option<(usize, usize, usize)> {
-        self.dip_result_volmap
-            .as_ref()
-            .map(|(buckets, stash)| {
-                let total_buckets = buckets.len();
-                let non_empty_buckets = buckets.values().filter(|b| !b.is_empty()).count();
-                let stash_size = stash.len();
-                (total_buckets, non_empty_buckets, stash_size)
-            })
+        self.dip_result_volmap.as_ref().map(|(buckets, stash)| {
+            let total_buckets = buckets.len();
+            let non_empty_buckets = buckets.values().filter(|b| !b.is_empty()).count();
+            let stash_size = stash.len();
+            (total_buckets, non_empty_buckets, stash_size)
+        })
     }
 
     pub fn add_padding_to_buckets(&mut self) {
@@ -896,9 +892,7 @@ impl EncryptedFileSystem {
     }
 
     pub fn get_valmap_stash(&self) -> Option<Vec<Vec<u8>>> {
-        self.dip_result
-            .as_ref()
-            .map(|(_, stash)| stash.clone())
+        self.dip_result.as_ref().map(|(_, stash)| stash.clone())
     }
 
     pub fn get_single_string_array_volmap(&self) -> Option<&Vec<String>> {
