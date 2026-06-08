@@ -284,6 +284,8 @@ impl EncryptedFileSystem {
         let p_bits = 9;
         let mock_pir_m = m;
 
+        let target_bytes = elem_size / 8;
+
         let dummy_elements = vec![
             base64::engine::general_purpose::STANDARD
                 .encode(vec![0u8; elem_size]);
@@ -334,12 +336,12 @@ impl EncryptedFileSystem {
                     }
                 }
 
-                if serialized_bucket.len() < elem_size {
+                if serialized_bucket.len() < target_bytes {
                     let current_len = serialized_bucket.len();
-                    serialized_bucket.resize(elem_size, 0u8);
+                    serialized_bucket.resize(target_bytes, 0u8);
                     rng.fill(&mut serialized_bucket[current_len..]);
-                } else if serialized_bucket.len() > elem_size {
-                    serialized_bucket.truncate(elem_size);
+                } else if serialized_bucket.len() > target_bytes {
+                    serialized_bucket.truncate(target_bytes);
                 }
 
                 let old_row = pir_db.update_row_from_bytes(pir_row_idx, &serialized_bucket);

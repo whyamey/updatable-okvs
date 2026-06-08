@@ -910,7 +910,6 @@ impl<const N: usize> BfsDIP<N> {
                         bucket.push(dummy);
                     }
                 }
-                touched_buckets.push(dummy_hash);
             }
         }
 
@@ -921,7 +920,7 @@ impl<const N: usize> BfsDIP<N> {
         touched_buckets.sort_unstable();
         touched_buckets.dedup();
 
-        const EXACT_TOUCHES: usize = MAX_BFS_NODES + MAX_DEPTH + 2;
+        const EXACT_TOUCHES: usize = MAX_BFS_NODES;
 
         while touched_buckets.len() < EXACT_TOUCHES {
             let dummy_hash = rng.gen_range(0..self.m);
