@@ -1,6 +1,6 @@
-# MARS - Multi Adversarial Owner and Reader Replication-free Searchable Encryption
+# UOKVS - Updatable Oblivious Key-Value Stores
 
-MARS is a system for multi-key searchable encryption that allows multiple data owners to store and share encrypted multimaps with clients while maintaining security against arbitrary collusion. It uses unkeyed PIR augmented with flexible-sharing mechanisms for efficient searching without data replication.
+UOKVS is an Updatable Oblivious Key-Value Store for building secure multi-key searchable encryption. It allows data owners to share encrypted multimaps with multiple clients while supporting dynamic insertions and strong privacy guarantees without the need for data replication.
 
 ## Warning
 
@@ -13,9 +13,10 @@ If you plan to do searchable encryption in a production environment, you should 
 ## Features
 
 - Unkeyed PIR with flexible-sharing mechanisms.
+- Oblivious Cuckoo hashing for secure, updatable storage.
 - Support for large-scale multimaps (tested up to 24M entries).
-- Query time of ~1s for keywords matching 100 documents. Scales linearly with the number of shards.
-- Storage overhead factor of ~6x.
+- Query time of ~0.6s for keywords matching 100 documents. Scales linearly with the number of shards.
+- Storage overhead factor of ~3x.
 
 ## Requirements
 
@@ -51,12 +52,14 @@ If you plan to do searchable encryption in a production environment, you should 
    cd data
    python generate_power.py  # For power-law distributed synthetic data
    # OR
-   python parse_enron.py    # For processing Enron dataset
+   python parse_enron.py     # For processing Enron dataset
+   python compress.py data   # Compressing the enron dataset
    ```
 
 2. Build and run:
    ```bash
-   cargo build --release
+   rustup override set nightly
+   RUSTFLAGS="-C target-cpu=native" cargo build --release
    ./target/release/mkse --data-dir data
    ```
 
@@ -76,6 +79,12 @@ DATA_DIR=<data> USE_EXISTING=true make subsets
 
 # Run sharding tests with keywords linked to $|$Docs_w$|$ documents
 DATA_DIR=<data> USE_EXISTING=true make sharding-with-keywords
+
+# Run documentation mapping tests
+DATA_DIR=<data> USE_EXISTING=true make test-docmap
+
+# Run insertion logic tests
+DATA_DIR=<data> USE_EXISTING=true make test-inserts
 ```
 
 ## Configuration
