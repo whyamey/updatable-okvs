@@ -13,7 +13,7 @@ If you plan to do searchable encryption in a production environment, you should 
 ## Features
 
 - Unkeyed PIR with flexible-sharing mechanisms.
-- Oblivious Cuckoo hashing for secure, updatable storage.
+- Oblivious Cuckoo hashing with random walk and BFS for secure, updatable storage.
 - Support for large-scale multimaps (tested up to 24M entries).
 - Query time of ~0.6s for keywords matching 100 documents. Scales linearly with the number of shards.
 - Storage overhead factor of ~3x.
