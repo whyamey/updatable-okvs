@@ -139,6 +139,7 @@ design --data DIR | --synthetic K,D,PER  --policy batched|perop|rebuild
        --evict bfs --alpha 10 --mu-factor 2.0 --sigma 16 --clients 100,1000,10000,100000
        --build-frac 0.8 --del-frac 0.02 --upd-frac 0.02 --docdel-frac 0.002
        --pir --no-doc-pir --pir-width 32 --pir-search 2 --search-every 5000 --search-sample 10
+       --max-appends 0 (replay only a prefix) --stateless --val-pir frodo|spiral --doc-pir frodo|spiral
        --label NAME --out-prefix results/design/NAME --summary results/design_summary.csv
 report --dir results [--out results/REPORT.md]
 selftest
@@ -1270,9 +1271,15 @@ fn design(a: &Args) {
     snap(&m, &mut ws);
     do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
     let t_replay = Instant::now();
-    for &d in &wl.docs[wl.nb..] {
+    // --max-appends N: stop the replay after N log appends (a prefix of the workload)
+    let max_appends = a.u("max-appends", 0);
+    'replay: for &d in &wl.docs[wl.nb..] {
         let len = wl.lens.get(&d).copied().unwrap_or(wl.default_len);
         for w in wl.doc_kw[&d].clone() {
+            if max_appends > 0 && m.total_appends >= max_appends {
+                live_docs.push(d);
+                break 'replay;
+            }
             let t = Instant::now();
             let act = m.insert(&w, d, len, &mut rng);
             let ms = t.elapsed().as_secs_f64() * 1e3;

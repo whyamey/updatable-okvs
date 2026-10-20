@@ -23,6 +23,13 @@ DATA=/home/bfuller/MKSE/okvs_python/data/data ./scripts/eval_all.sh          # e
 QUICK=1 ./scripts/eval_all.sh                                                # synthetic data, small sizes
 ```
 
+Knobs (environment variables):
+- `STASH_JOBS`: stash runs at once. The default is min(cores, RAM / 10 GB).
+- `PIR_APPENDS`: the real-PIR replays (stages `writepir` and `paired`) stop after this many appends; the default is 200000, and 0 replays everything.
+- `UPSTREAM_REBUILD_ALL=1`: also time upstream FrodoPIR's full rebuilds at the larger sizes in `compare`. By default they are timed only at the smallest size.
+- `DOC_PIR`, `DOC_SPIRAL`: see the stages below.
+- `design --max-appends N` replays only a prefix of the workload.
+
 frodo-pir uses `portable_simd`; the script sets `RUSTC_BOOTSTRAP=1` (or use nightly) and `-C target-cpu=native`. Results go to `$OUT` (default `results/`): one CSV set per run, `design_summary.csv`, `design_summary_clients.csv`, and `REPORT.md` (all tables, written by `uokvs_bench report`). Logs are in `$OUT/logs/`. Stash runs that already have output are skipped, so the script can be restarted.
 
 | Stage | What it measures | Paper / review item |
