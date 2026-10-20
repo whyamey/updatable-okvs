@@ -23,3 +23,6 @@ tikv-jemallocator = "0.6.0"
 dashmap = "6.1.0"
 rayon = "1.12.0"
 blake3 = { version = "1.8.5", features = ["rayon"] }
+# hintless PIR for the paired evaluation: our faster Spiral server and the Blyss client
+spiral_fast = { path = "spiral_fast" }
+spiral-rs = { git = "https://github.com/blyssprivacy/sdk", rev = "fdb7206517c249603b0c91b65f1f29f95272107c", features = ["server"] }

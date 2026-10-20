@@ -1,0 +1,17 @@
+[package]
+name = "spiral_fast"
+version = "0.1.0"
+edition = "2021"
+description = "Faster Spiral PIR server for the UOKVS tables: dense database, row updates, batched and parallel first-dimension pass"
+
+[dependencies]
+# the Blyss Spiral implementation (client, parameters, and the reference server)
+spiral-rs = { git = "https://github.com/blyssprivacy/sdk", rev = "fdb7206517c249603b0c91b65f1f29f95272107c", features = ["server"] }
+spiral-server = { git = "https://github.com/blyssprivacy/sdk", rev = "fdb7206517c249603b0c91b65f1f29f95272107c" }
+rayon = "1.6.1"
+rand = "0.8.5"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1
