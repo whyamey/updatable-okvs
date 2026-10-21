@@ -12,7 +12,8 @@ All new code sits next to the original benchmark (`src/main.rs`, `dip.rs`, `benc
 | `pir_compare/` | Our FrodoPIR fork vs. upstream FrodoPIR (the commit the fork branched from) |
 | `spiral_fast/` | Faster Spiral server (dense database, batched AVX-512 first dimension, parallel, row updates) and `spiral_bench` (check against the Blyss server, benchmarks) |
 | `scripts/eval_all.sh` | **The whole evaluation plan in one script** |
-| `scripts/run_ypir.sh` | YPIR+SP through its own Rust CLI (called by `eval_all.sh`) |
+| `ypir_fast/` | Faster YPIR+SP server (several records per row, row updates, batched and parallel online pass, packing prepared before the query, packing keys shared over public seeds) and `ypir_bench` (check against the reference code paths, benchmarks) |
+| `scripts/run_ypir.sh` | YPIR+SP: the reference CLI and `ypir_fast` at the ValMap and DocMap shapes (called by `eval_all.sh`) |
 | `scripts/run_experiments.sh` | The earlier script for the old design (superseded) |
 
 ## Run
@@ -40,7 +41,7 @@ frodo-pir uses `portable_simd`; the script sets `RUSTC_BOOTSTRAP=1` (or use nigh
 | `writepir` | The main variants with the PIR databases maintained: per-batch row + hint updates with the fork, FrodoPIR setup at each rebuild, measured PIR searches at width 32 (`DOC_PIR=1` also keeps DocMap in PIR) | E2, E3 |
 | `pir` | Fork microbenchmarks at ValMap shape (8 KB rows) and DocMap shape (1059-byte rows): setup, hint size, update of 11–420 rows, query batches at widths 8–64 | E2c, DocMap speed |
 | `compare` | Fork vs upstream FrodoPIR: setup, hint refresh after k changed rows (upstream must rebuild), batched answers, client preparation | our FrodoPIR improvements |
-| `ypir` | YPIR+SP on the same shapes | PIR requirements table |
+| `ypir` | YPIR+SP: the reference CLI, and `ypir_fast` vs the reference code paths at the ValMap (8 KB) and DocMap (1 KB) shapes: records per row, batches 1–256, prepared packing, updates of 1–10^4 records, shared packing keys (`YPIR_SEEDS`, default 8) | PIR requirements table; hintless PIR with low server time for the keyword lookup |
 | `spiral` | Spiral: Blyss server vs our `spiral_fast` server (byte-identical responses checked first), ValMap and DocMap shapes, batches 1–128 | hintless PIR for the paired evaluation; our Spiral improvements |
 | `paired` | Log and stateless clients × {FrodoPIR, Spiral} per map: download per search and per append at every search interval, plus real-PIR runs for server time (Spiral ValMap + FrodoPIR DocMap, FrodoPIR for both; `DOC_SPIRAL=1` adds Spiral for both) | direct updates, PIR choice |
 | `report` | `REPORT.md` with every table | |
@@ -114,9 +115,32 @@ Server time per query, 2-core VM (Blyss "concurrent" = its best throughput, with
 - Memory: a query in flight holds ≈ 85 MB (8 KB records, nu1 = 9), so batch size is limited by RAM; batch 32 at 64K records did not fit in the 7 GB VM.
 - Client: 16 KB query, 21.5 KB response (8 KB records), 1.7 MB public parameters once, no hint.
 
+### YPIR+SP: reference code vs `ypir_fast`
+
+YPIR+SP (Menon–Wu, USENIX Security 2024) is SimplePIR with the hint kept by the server: the query is an RLWE encoding of a one-hot vector over the rows (7 bytes per row), the server multiplies it with the database and ring-packs the resulting LWE ciphertexts, and the hint-dependent part of the packing is precomputed offline. The reference code (`menonsamir/ypir`, a73e550) is single-threaded, answers one query per pass, stores one record per row and has no update path (an update is the offline rebuild). `ypir_fast/` builds on its kernels and client:
+
+- **Records per row.** With no client hint the row width is free. Wider rows shrink the query (7 B per row) and grow the response (12,288 B per 3,584 B of row); `--per-row auto` minimizes the sum. ValMap (316K × 8 KB): 10 records per row, 32,768 rows, 23 outputs, query 229 KB + response 283 KB, against 3.7 MB + 37 KB with one record per row (524,288 rows after padding). DocMap (2.3M × 1059 B): 71 per row, query 229 KB + response 258 KB.
+- **Row updates.** The hint is linear in the database, so an update adds `a_ρ · Δ` for the touched 2048-row blocks only (checked against a full recomputation). The packing precomputation is not linear (gadget decomposition) and is redone for every output, in parallel across outputs and across the independent merges of each level (checked equal to the reference `precompute_pack`). Precomputed values are stored compactly (half the reference's memory) and the automorphism tables once rather than per output.
+- **Batched, parallel online pass.** All queries of a batch share the database pass (the reference AVX-512 kernel on column tiles, 8 queries per pass), and packing runs in parallel over (query, output).
+- **Prepared packing.** The expensive part of online packing depends only on the client's packing keys and the precomputation, not on the query. A client can send its keys ahead (e.g. right after its previous search); the server prepares, and the online answer is the database pass plus adding the LWE bodies (`prepare_many` + `answer_prepared`; valid until the next update).
+- **Shared packing keys.** Two queries under one client key and the same public matrix leak the difference of their selection vectors, so the reference needs fresh keys (473 KB) per query. With `--seeds S` the server keeps S public matrices (S hints and precomputations) and up to S queries of a search share one key.
+
+2-core VM, QUICK shapes (rerun on the server):
+
+| shape | reference: 1 query | ours: batch 16, per query | ours: prepared, online, batch 16 | update (1 / 1000 records): reference rebuild | ours |
+|---|---|---|---|---|---|
+| 20K × 8 KB, 3 per row (8192 rows, 7 outputs) | 276 ms | 160 ms | 8.6 ms | 8.8 s | 4.1 / 5.4 s |
+| 20K × 8 KB, 1 per row (32768 rows, 3 outputs) | — | 72 ms | 15 ms | — | 1.5 / 3.0 s |
+| 100K × 1 KB, 13 per row (8192 rows, 4 outputs) | — | 74 ms (batch 64) | 4.7 ms (batch 64) | — | 1.9 / 2.9 s |
+
+- On 2 cores the parallel gains are at most 2×; packing (≈ 30 ms of CPU per query and output) dominates, and the database pass is small. Prepared packing removes it from the online path.
+- An update costs one packing precomputation per output (≈ 0.9 s of CPU each), independent of how many records changed, so updates should be batched (one per flush); the hint delta grows with the touched blocks.
+- State per seed: hint plus precomputation, ≈ 0.94 GB for the 7-output shape; at the ValMap shape about 3 GB, so `--seeds 8` needs ≈ 25 GB.
+- Cost model (`PirKind::Ypir`): per query `rows × 7 + outputs × 12,288` bytes for the auto shape of the table, plus 473 KB of packing keys per `YPIR_SEEDS` queries (1 by default, i.e. per query); no join download and no hint refresh. Pairings costed: YPIR ValMap with Spiral DocMap, and YPIR for both.
+
 ## Paired evaluation (stage `paired`)
 
-Two client models, each costed for all four pairings (ValMap PIR, DocMap PIR) ∈ {FrodoPIR, Spiral}² from one replay:
+Two client models, each costed for six pairings (ValMap PIR, DocMap PIR) from one replay: {FrodoPIR, Spiral}², plus YPIR+SP for ValMap with Spiral for DocMap, and YPIR+SP for both:
 - **log clients** copy the append-only log. This covers the rebuild schedules and batched flushes above.
 - **stateless clients** (`--stateless`) keep no log. A search downloads the stash-only VolMap (one record per keyword, refreshed by the owner after each batch) and the pending stash (padded to 2B).
   - Every insertion reaches ValMap through the eviction walk, in batches of B with θ = 1: everything pending is committed in each batch, using K = B + B/8 operations.
@@ -129,10 +153,17 @@ Per search, a client pays:
 - the queries and responses of the search, per PIR:
   - FrodoPIR: query = 4 bytes × rows; response = 4 × width;
   - Spiral: query 16,416 B; response 21,504 B for 8 KB rows, 8,192 B for 2 KB rows; no hint, and 1.7 MB of public parameters once.
+  - YPIR+SP: query 7 B × rows and response 12,288 B × outputs for the auto shape; 473 KB of packing keys per client key (per query unless the server keeps several seeds); no hint.
 
 `--pir --val-pir frodo|spiral --doc-pir frodo|spiral` runs real databases: Spiral through `spiral_fast` with row updates, FrodoPIR through the fork. The sampled searches then record measured server time. `selftest` checks retrieval through both PIRs before and after an update, and the stateless design against the reference multimap.
 
-The report has a table of download per search and per append for every run × pairing × search interval, the cheapest configuration per interval, query counts, and the one-time cost of joining.
+The report splits each search into two parts:
+- **the keyword lookup**: sync, ValMap stash, ValMap hint refresh, and ValMap queries. This is the part compared with prior MKSE.
+- **document retrieval**: DocMap stash, DocMap hint refresh, and DocMap queries.
+
+Document retrieval is reported per document fetched, and capped at `--max-docs-fetched` (default 100) per search. Full retrieval of every matching document is shown for reference only, since Enron keywords match up to 10^5 documents. Medians are shown next to means.
+
+The report also has the cheapest configuration per search interval, query counts, and the one-time cost of joining. `design_summary*.csv` files with an older column layout are moved aside automatically.
 
 First small run (synthetic, 1K keywords, 5K documents, 17K appends; client searching every 1,000 appends):
 

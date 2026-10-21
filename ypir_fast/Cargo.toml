@@ -1,0 +1,18 @@
+[package]
+name = "ypir_fast"
+version = "0.1.0"
+edition = "2021"
+description = "Faster YPIR+SP server for the UOKVS tables: several records per row, row updates, batched and parallel online pass"
+
+# YPIR needs `#![feature(stdarch_x86_avx512)]`: build with RUSTC_BOOTSTRAP=1 (see scripts/run_ypir.sh)
+[dependencies]
+ypir = { git = "https://github.com/menonsamir/ypir", rev = "a73e550a469605c2fa23945a4d96c20fb2f4a839" }
+spiral-rs = { git = "https://github.com/menonsamir/spiral-rs.git", rev = "6929441" }
+rayon = "1.8"
+rand = { version = "0.8.5", features = ["small_rng"] }
+rand_chacha = "0.3.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1

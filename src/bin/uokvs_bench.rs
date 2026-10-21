@@ -10,7 +10,7 @@
 //! Run `uokvs_bench <cmd> --help` for options. Outputs are CSV files.
 
 use mkse::mkse_dyn::{Mkse, MkseCfg, MkseOp, OpKind};
-use mkse::mkse_log::{pir_name, Action, DocLayout, LogCfg, MkseLog, Policy, Profile, PIR_COMBOS};
+use mkse::mkse_log::{median, pir_name, Action, DocLayout, LogCfg, MkseLog, Policy, Profile, PIR_COMBOS};
 use mkse::pir_backend::{random_rows, FrodoPir, Pir, SpiralPir};
 use mkse::uokvs::{derive, Discipline, Evict, Key, OwnerKeys, Params, Table, UpdateMode};
 use rand::rngs::StdRng;
@@ -140,6 +140,7 @@ design --data DIR | --synthetic K,D,PER  --policy batched|perop|rebuild
        --build-frac 0.8 --del-frac 0.02 --upd-frac 0.02 --docdel-frac 0.002
        --pir --no-doc-pir --pir-width 32 --pir-search 2 --search-every 5000 --search-sample 10
        --max-appends 0 (replay only a prefix) --stateless --val-pir frodo|spiral --doc-pir frodo|spiral
+       --max-docs-fetched 100 (capped document retrieval in the client costs)
        --label NAME --out-prefix results/design/NAME --summary results/design_summary.csv
 report --dir results [--out results/REPORT.md]
 selftest
@@ -1016,6 +1017,14 @@ fn policy_cols(p: &Policy) -> String {
 }
 
 fn append_csv(path: &str, header: &str) -> BufWriter<File> {
+    // an existing file with another column layout (an older version) is moved aside
+    if let Ok(old) = std::fs::read_to_string(path) {
+        if old.lines().next().map_or(false, |l| l != header) {
+            let aside = format!("{path}.old-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+            std::fs::rename(path, &aside).ok();
+            println!("note: {path} had an older column layout; moved to {aside}");
+        }
+    }
     let exists = Path::new(path).exists();
     if let Some(dir) = Path::new(path).parent() {
         std::fs::create_dir_all(dir).ok();
@@ -1098,7 +1107,9 @@ fn design(a: &Args) {
     let mut we = csv(&format!("{pre}_events.csv"), "appends,event,ms,bytes");
 
     let intervals = a.list("clients", "100,1000,10000,100000");
-    let mut profiles: Vec<Profile> = intervals.iter().map(|&i| Profile::new(i)).collect();
+    // a search fetches at most this many documents in the capped cost (all of them in the full cost)
+    let doc_cap = a.u("max-docs-fetched", 100);
+    let mut profiles: Vec<Profile> = intervals.iter().map(|&i| Profile::new(i, doc_cap)).collect();
 
     let del_frac = a.f("del-frac", 0.02);
     let upd_frac = a.f("upd-frac", 0.02);
@@ -1216,7 +1227,7 @@ fn design(a: &Args) {
                 // the client's search: a uniformly random keyword
                 let w = &all_kw[rng.gen_range(0..all_kw.len())];
                 let sr = m.search(w);
-                p.sync(m, sr.val_queries.len(), sr.doc_queries.len());
+                p.sync(m, &sr);
             }
         }
     };
@@ -1340,7 +1351,7 @@ fn design(a: &Args) {
     let summary_path = a.s("summary", "results/design_summary.csv");
     let mut sw = append_csv(
         &summary_path,
-        "label,policy,b,k,theta,age,r,major_every,client_model,val_pir,doc_pir,pend_pad_overflow,doc_layout,evict,alpha,mu_factor,keywords,docs_setup,docs_total,appends,batches,k_overflow_batches,deferred_total,pend_peak,max_pending_age,log_peak_bytes,compacted_log_bytes,val_stash_peak,val_overflow,val_load,val_stale,doc_load,doc_compactions,log_compactions,rebuilds,rebuild_ms_mean,setup_ms,replay_s,owner_ms_per_append,owner_upload_per_append,val_rows_per_append,doc_rows_per_append,pir_hint_ms_per_batch,val_hint_bytes,doc_hint_bytes,val_delta_packed,join_bytes",
+        "label,policy,b,k,theta,age,r,major_every,client_model,val_pir,doc_pir,pend_pad_overflow,val_rows,doc_rows,doc_cap,doc_layout,evict,alpha,mu_factor,keywords,docs_setup,docs_total,appends,batches,k_overflow_batches,deferred_total,pend_peak,max_pending_age,log_peak_bytes,compacted_log_bytes,val_stash_peak,val_overflow,val_load,val_stale,doc_load,doc_compactions,log_compactions,rebuilds,rebuild_ms_mean,setup_ms,replay_s,owner_ms_per_append,owner_upload_per_append,val_rows_per_append,doc_rows_per_append,pir_hint_ms_per_batch,val_hint_bytes,doc_hint_bytes,val_delta_packed,join_bytes",
     );
     writeln!(
         sw,
@@ -1353,6 +1364,9 @@ fn design(a: &Args) {
             (if use_pir { val_kind.clone() } else { "-".to_string() }),
             (if doc_pir { doc_kind.clone() } else { "-".to_string() }),
             m.pend_pad_overflow.to_string(),
+            m.val.prm.mu.to_string(),
+            m.doc_mu().to_string(),
+            doc_cap.to_string(),
             format!("{:?}", cfg.doc_layout),
             format!("{:?}", cfg.val.evict),
             cfg.val.alpha.to_string(),
@@ -1395,25 +1409,25 @@ fn design(a: &Args) {
     let cpath = summary_path.replace(".csv", "_clients.csv");
     let mut cw = append_csv(
         &cpath,
-        "label,client_model,val_pir,doc_pir,interval,searches,mean_bytes_per_search,median_bytes_per_search,max_bytes_per_search,bytes_per_append,mean_val_queries,mean_doc_queries,sync_share,stash_share,val_hint_share,doc_hint_share,query_share,join_bytes,full_val_hint_refreshes",
+        "label,client_model,val_pir,doc_pir,interval,searches,doc_cap,lookup_mean,lookup_median,lookup_max,lookup_per_append,lookup_sync_share,lookup_stash_share,lookup_hint_share,lookup_query_share,capped_docs_mean,lookup_plus_capped_mean,lookup_plus_capped_median,per_doc_bytes,all_docs_mean,mean_val_queries,mean_docs,mean_doc_queries_per_doc,join_bytes,full_val_hint_refreshes",
     );
     let model = if cfg.stateless { "stateless" } else { "log" };
     for p in profiles.iter() {
+        let n = p.searches.max(1) as f64;
         for (c, &(kv, kd)) in PIR_COMBOS.iter().enumerate() {
-            let mut h = p.hist[c].clone();
-            h.sort_unstable();
-            let total = p.total[c];
-            let tot = total.max(1) as f64;
-            let hv = if kv == mkse::mkse_log::PirKind::Frodo { p.hint_val } else { 0 };
-            let hd = if kd == mkse::mkse_log::PirKind::Frodo { p.hint_doc } else { 0 };
-            let q = total.saturating_sub(p.sync + p.stash + hv + hd);
+            let look = p.lookup[c] as f64;
+            let lt = look.max(1.0);
+            let hv = if kv == mkse::mkse_log::PirKind::Frodo { p.hint_val } else { 0 } as f64;
+            let q = look - p.sync as f64 - p.stash_val as f64 - hv;
             writeln!(
                 cw,
-                "{label},{model},{},{},{},{},{:.0},{},{},{:.1},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
-                pir_name(kv), pir_name(kd), p.interval, p.searches, total as f64 / p.searches.max(1) as f64,
-                h.get(h.len() / 2).copied().unwrap_or(0), p.max[c], total as f64 / appends as f64,
-                p.val_queries as f64 / p.searches.max(1) as f64, p.doc_queries as f64 / p.searches.max(1) as f64,
-                p.sync as f64 / tot, p.stash as f64 / tot, hv as f64 / tot, hd as f64 / tot, q as f64 / tot,
+                "{label},{model},{},{},{},{},{},{:.0},{},{},{:.1},{:.3},{:.3},{:.3},{:.3},{:.0},{:.0},{},{:.0},{:.0},{:.2},{:.1},{:.2},{},{}",
+                pir_name(kv), pir_name(kd), p.interval, p.searches, p.doc_cap,
+                look / n, median(&p.lookup_hist[c]), p.lookup_max[c], look / appends as f64,
+                p.sync as f64 / lt, p.stash_val as f64 / lt, hv / lt, q / lt,
+                p.docs_capped_bytes[c] as f64 / n, (look + p.docs_capped_bytes[c] as f64) / n, median(&p.capped_hist[c]),
+                p.docs_all[c] as f64 / p.docs.max(1) as f64, p.docs_all[c] as f64 / n,
+                p.val_queries as f64 / n, p.docs as f64 / n, p.doc_queries as f64 / p.docs.max(1) as f64,
                 m.join_bytes(kv, kd), p.full_hint_refreshes
             )
             .unwrap();
@@ -1425,10 +1439,13 @@ fn design(a: &Args) {
         m.val.stash_peak, m.val.load(), rebuild_ms.len(), compactions, doc_compactions
     );
     for p in profiles.iter() {
-        let per = |c: usize| p.total[c] as f64 / p.searches.max(1) as f64;
+        let mb = |x: usize| x as f64 / 1e6;
+        let n = p.searches.max(1);
         println!(
-            "[{label}]   client every {:>7} appends: {:>5} searches; per search frodo/frodo {:>11.0} B, spiral/frodo {:>11.0} B, spiral/spiral {:>11.0} B",
-            p.interval, p.searches, per(0), per(1), per(3)
+            "[{label}]   client every {:>7} appends: {:>5} searches; keyword lookup median MB frodo {:.2} / spiral {:.2}; lookup + up to {} docs median MB ff {:.1} sf {:.1} ss {:.1}; full retrieval mean MB ff {:.1} ss {:.1}",
+            p.interval, p.searches, mb(median(&p.lookup_hist[0])), mb(median(&p.lookup_hist[1])), p.doc_cap,
+            mb(median(&p.capped_hist[0])), mb(median(&p.capped_hist[1])), mb(median(&p.capped_hist[3])),
+            mb(p.lookup[0] + p.docs_all[0]) / n as f64, mb(p.lookup[3] + p.docs_all[3]) / n as f64
         );
     }
     if m.val.load() > 0.6 {
@@ -1598,7 +1615,7 @@ fn report(a: &Args) {
         md.push('\n');
     }
     let cp = Path::new(&dir).join("design_summary_clients.csv");
-    if let Some((h, rows)) = read_csv(&cp) {
+    if let Some((h, rows)) = read_csv(&cp).filter(|(h, _)| h.contains(&"lookup_mean".to_string())) {
         let mut intervals: Vec<usize> = rows.iter().map(|r| fnum(&r[col(&h, "interval")]) as usize).collect();
         intervals.sort_unstable();
         intervals.dedup();
@@ -1610,30 +1627,48 @@ fn report(a: &Args) {
                 keys.push(k);
             }
         }
+        let cap = rows.first().map(|r| r[col(&h, "doc_cap")].clone()).unwrap_or_default();
         let cell = |k: &(String, String, String, String), i: usize, colname: &str| -> f64 {
             rows.iter()
                 .find(|r| &key(r) == k && fnum(&r[col(&h, "interval")]) as usize == i && fnum(&r[col(&h, "searches")]) > 0.0)
                 .map(|r| fnum(&r[col(&h, colname)]))
                 .unwrap_or(f64::NAN)
         };
-        for (title, colname) in [
-            ("Client download per search (paired PIRs), mean", "mean_bytes_per_search"),
-            ("Client download per search (paired PIRs), median", "median_bytes_per_search"),
-            ("Client download per append (paired PIRs)", "bytes_per_append"),
-        ] {
-            md.push_str(&format!(
-                "## {title}\n\nA client searches every `interval` appends (a uniformly random keyword) and only then refreshes. The `run` label names the replay; the PIR columns are the pairing being costed (real PIR runs use the pairing in their label for server time). `log` clients copy the append-only log; `stateless` clients download VolMap and the pending stash. FrodoPIR adds hint deltas or a fresh hint (whichever is smaller); Spiral has no hint. Queries and responses of the search are included.\n\n| run | clients | ValMap PIR | DocMap PIR |"
-            ));
+        md.push_str(&format!(
+            "## Client costs (paired PIRs)\n\nA client searches every `interval` appends for a uniformly random keyword and only then refreshes. `log` clients copy the append-only log; `stateless` clients download VolMap and the pending stash. FrodoPIR adds hint deltas or a fresh hint, whichever is smaller; Spiral has no hint. The `run` label names the replay; the PIR columns give the pairing being costed (real-PIR runs measure server time for the pairing in their label).\n\n- **Keyword lookup** = sync + ValMap stash + ValMap hint refresh + ValMap queries and answers. This is the part compared with prior MKSE.\n- **Documents** = DocMap stash + DocMap hint refresh + DocMap queries and answers, for at most {cap} documents per search (the capped cost) or for all matching documents (the full cost).\n\n"
+        ));
+        let tables: [(&str, &str, bool); 6] = [
+            ("Keyword lookup per search, median", "lookup_median", false),
+            ("Keyword lookup per search, mean", "lookup_mean", false),
+            ("Keyword lookup per append (mean)", "lookup_per_append", false),
+            ("Lookup + documents (capped) per search, median", "lookup_plus_capped_median", true),
+            ("Lookup + documents (capped) per search, mean", "lookup_plus_capped_mean", true),
+            ("Document retrieval per document fetched (mean)", "per_doc_bytes", true),
+        ];
+        for (title, colname, docs) in tables {
+            md.push_str(&format!("### {title}\n\n| run | clients | ValMap PIR |{}", if docs { " DocMap PIR |" } else { "" }));
             for i in &intervals {
                 md.push_str(&format!(" every {i} |"));
             }
-            md.push_str("\n|---|---|---|---|");
+            md.push_str(if docs { "\n|---|---|---|---|" } else { "\n|---|---|---|" });
             for _ in &intervals {
                 md.push_str("---|");
             }
             md.push('\n');
+            let mut seen: Vec<(String, String, String)> = Vec::new();
             for k in &keys {
-                md.push_str(&format!("| {} | {} | {} | {} |", k.0, k.1, k.2, k.3));
+                // the lookup does not depend on the DocMap PIR: one row per ValMap PIR
+                if !docs {
+                    let kk = (k.0.clone(), k.1.clone(), k.2.clone());
+                    if seen.contains(&kk) {
+                        continue;
+                    }
+                    seen.push(kk);
+                }
+                md.push_str(&format!("| {} | {} | {} |", k.0, k.1, k.2));
+                if docs {
+                    md.push_str(&format!(" {} |", k.3));
+                }
                 for &i in &intervals {
                     md.push_str(&format!(" {} |", human(cell(k, i, colname))));
                 }
@@ -1641,30 +1676,53 @@ fn report(a: &Args) {
             }
             md.push('\n');
         }
-        // the cheapest configuration per search interval
-        md.push_str("## Cheapest configuration per search interval (download per search)\n\n| interval | run | clients | ValMap PIR | DocMap PIR | per search |\n|---|---|---|---|---|---|\n");
-        for &i in &intervals {
-            let best = keys
-                .iter()
-                .map(|k| (cell(k, i, "mean_bytes_per_search"), k))
-                .filter(|x| !x.0.is_nan())
-                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            if let Some((v, k)) = best {
-                md.push_str(&format!("| {i} | {} | {} | {} | {} | {} |\n", k.0, k.1, k.2, k.3, human(v)));
-            }
+        md.push_str("### Full retrieval (every matching document), mean per search\n\nFor reference only: Enron keywords match up to 10^5 documents.\n\n| run | clients | ValMap PIR | DocMap PIR |");
+        for i in &intervals {
+            md.push_str(&format!(" every {i} |"));
+        }
+        md.push_str("\n|---|---|---|---|");
+        for _ in &intervals {
+            md.push_str("---|");
         }
         md.push('\n');
-        md.push_str("Mean queries per search and join cost (one-time client download):\n\n| run | clients | ValMap PIR | DocMap PIR | ValMap queries | DocMap queries | join |\n|---|---|---|---|---|---|---|\n");
+        for k in &keys {
+            md.push_str(&format!("| {} | {} | {} | {} |", k.0, k.1, k.2, k.3));
+            for &i in &intervals {
+                md.push_str(&format!(" {} |", human(cell(k, i, "lookup_mean") + cell(k, i, "all_docs_mean"))));
+            }
+            md.push('\n');
+        }
+        md.push('\n');
+        for (title, colname) in [
+            ("Cheapest keyword lookup per search interval (median)", "lookup_median"),
+            ("Cheapest lookup + capped documents per search interval (median)", "lookup_plus_capped_median"),
+        ] {
+            md.push_str(&format!("### {title}\n\n| interval | run | clients | ValMap PIR | DocMap PIR | per search |\n|---|---|---|---|---|---|\n"));
+            for &i in &intervals {
+                let best = keys
+                    .iter()
+                    .map(|k| (cell(k, i, colname), k))
+                    .filter(|x| !x.0.is_nan())
+                    .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                if let Some((v, k)) = best {
+                    md.push_str(&format!("| {i} | {} | {} | {} | {} | {} |\n", k.0, k.1, k.2, k.3, human(v)));
+                }
+            }
+            md.push('\n');
+        }
+        md.push_str("### Queries per search and join cost (one-time client download)\n\n| run | clients | ValMap PIR | DocMap PIR | ValMap queries | documents matched | DocMap queries per document | join |\n|---|---|---|---|---|---|---|---|\n");
         for k in &keys {
             if let Some(r) = rows.iter().find(|r| &key(r) == k && fnum(&r[col(&h, "searches")]) > 0.0) {
                 md.push_str(&format!(
-                    "| {} | {} | {} | {} | {:.1} | {:.1} | {} |\n",
-                    k.0, k.1, k.2, k.3, fnum(&r[col(&h, "mean_val_queries")]), fnum(&r[col(&h, "mean_doc_queries")]),
-                    human(fnum(&r[col(&h, "join_bytes")]))
+                    "| {} | {} | {} | {} | {:.1} | {:.1} | {:.2} | {} |\n",
+                    k.0, k.1, k.2, k.3, fnum(&r[col(&h, "mean_val_queries")]), fnum(&r[col(&h, "mean_docs")]),
+                    fnum(&r[col(&h, "mean_doc_queries_per_doc")]), human(fnum(&r[col(&h, "join_bytes")]))
                 ));
             }
         }
         md.push('\n');
+    } else if cp.exists() {
+        md.push_str("## Client costs\n\n`design_summary_clients.csv` has the old column layout (before the lookup / document split); rerun the `write` and `paired` stages to regenerate it.\n\n");
     }
 
     // search costs (queries per search) from the design runs

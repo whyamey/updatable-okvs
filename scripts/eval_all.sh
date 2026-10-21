@@ -5,7 +5,7 @@
 #   DATA=/home/bfuller/MKSE/okvs_python/data/data ./scripts/eval_all.sh            # everything
 #   ./scripts/eval_all.sh write pir report                                          # some stages
 #   QUICK=1 ./scripts/eval_all.sh                                                   # small sizes, minutes
-#   STASH_JOBS=16 PIR_APPENDS=200000 UPSTREAM_REBUILD_ALL=0                          # knobs (defaults shown/derived)
+#   STASH_JOBS=16 PIR_APPENDS=200000 UPSTREAM_REBUILD_ALL=0 PAIRED_PIR=1             # knobs (defaults shown/derived)
 #
 # Stages: selftest stash write writepir pir compare ypir spiral paired report   (default: all)
 # Outputs: $OUT/ (CSV per run, design_summary*.csv, REPORT.md). Logs: $OUT/logs/.
@@ -160,9 +160,10 @@ if want compare; then
   done
 fi
 
-# ---------------------------------------------------------------- 6. YPIR+SP on the same shapes (PIR requirements table)
+# ---------------------------------------------------------------- 6. YPIR+SP: reference code vs our faster server (ypir_fast)
+# ValMap and DocMap shapes: records per row, batched/prepared answers, row updates, shared keys
 if want ypir; then
-  log "ypir"; ./scripts/run_ypir.sh "$OUT/pir/ypir" 2>&1 | tail -20 | tee "$OUT/ypir.txt"
+  log "ypir"; QUICK=$QUICK ./scripts/run_ypir.sh "$OUT/pir/ypir" 2>&1 | grep -E "^(impl|ok|ypir_fast)" | tee "$OUT/ypir.txt"
 fi
 
 # ---------------------------------------------------------------- 6b. Spiral (hintless PIR): Blyss server vs our faster server
@@ -197,7 +198,8 @@ if want paired; then
     design paired_stateless_b$b --stateless --b $b --search-every 100000
   done
   DOCPIR=(--no-doc-pir); [[ ${DOC_PIR:-1} == 1 ]] && DOCPIR=()
-  for pv in spiral frodo; do
+  # PAIRED_PIR=0 skips the real-PIR runs (server time) and reruns only the cost model
+  [[ ${PAIRED_PIR:-1} == 1 ]] && for pv in spiral frodo; do
     design pir_stateless_${pv}_frodo --stateless --b 100 --pir --val-pir $pv --doc-pir frodo "${DOCPIR[@]}" \
        --pir-width 32 --pir-search 3 --search-every 50000 "${QPIR[@]}" "${PREFIX[@]}"
     design pir_log_${pv}_frodo --policy rebuild --r 100000 --pir --val-pir $pv --doc-pir frodo "${DOCPIR[@]}" \

@@ -214,7 +214,16 @@ pub struct SearchOut {
     pub chunks_queried: usize,
     pub val_queries: Vec<usize>,
     pub doc_queries: Vec<usize>,
+    /// DocMap queries of each returned document, in result order
+    pub doc_queries_per_doc: Vec<usize>,
     pub tag_probes: usize,
+}
+
+impl SearchOut {
+    /// DocMap queries needed to fetch only the first `cap` documents.
+    pub fn doc_queries_capped(&self, cap: usize) -> usize {
+        self.doc_queries_per_doc.iter().take(cap).sum()
+    }
 }
 
 pub struct MkseLog {
@@ -1020,6 +1029,7 @@ impl MkseLog {
         // 4. documents: latest version record from the log
         for &id in &out.ids {
             let d = &self.docs[&id];
+            let before = out.doc_queries.len();
             if self.cfg.doc_layout == DocLayout::Fixed {
                 // the chunk count comes with the posting; the newest copy wins
                 let t = self.doc_table.as_ref().unwrap();
@@ -1030,6 +1040,7 @@ impl MkseLog {
                     assert!(!tomb, "search returned a removed document");
                     out.doc_queries.extend(t.candidates(&lk));
                 }
+                out.doc_queries_per_doc.push(out.doc_queries.len() - before);
                 continue;
             }
             let mut latest: Option<(u32, u16, bool, Vec<u32>)> = None;
@@ -1077,6 +1088,7 @@ impl MkseLog {
                     }
                 }
             }
+            out.doc_queries_per_doc.push(out.doc_queries.len() - before);
         }
         out
     }
@@ -1163,20 +1175,52 @@ pub enum PirKind {
     Frodo,
     /// Spiral (our fast server): no hint; public parameters once
     Spiral,
+    /// YPIR+SP (our fast server, ypir_fast): no hint; packing keys per client key,
+    /// several records per row (`ypir_shape`)
+    Ypir,
 }
 
-pub const PIR_COMBOS: [(PirKind, PirKind); 4] = [
+pub const N_COMBOS: usize = 6;
+pub const PIR_COMBOS: [(PirKind, PirKind); N_COMBOS] = [
     (PirKind::Frodo, PirKind::Frodo),
     (PirKind::Spiral, PirKind::Frodo),
     (PirKind::Frodo, PirKind::Spiral),
     (PirKind::Spiral, PirKind::Spiral),
+    (PirKind::Ypir, PirKind::Spiral),
+    (PirKind::Ypir, PirKind::Ypir),
 ];
 
 pub fn pir_name(k: PirKind) -> &'static str {
     match k {
         PirKind::Frodo => "frodo",
         PirKind::Spiral => "spiral",
+        PirKind::Ypir => "ypir",
     }
+}
+
+/// YPIR+SP packing keys (11 x 3 polynomials x 2048 x 7 bytes), one set per client key.
+pub const YPIR_PP_BYTES: usize = 473_088;
+/// Queries that share one client key (the server keeps this many public seeds;
+/// ypir_fast `--seeds`). 1 = a fresh key, and packing keys, with every query.
+pub const YPIR_SEEDS: usize = 1;
+
+/// ypir_fast's `Shape::auto`: records per row minimizing query (7 B per row, rows a
+/// power of two >= 2048) plus response (12,288 B per 3,584 B of row). Returns
+/// (rows, instances).
+pub fn ypir_shape(records: usize, record_bytes: usize) -> (usize, usize) {
+    (1..=256usize)
+        .map(|k| {
+            let rows = ((records + k - 1) / k).next_power_of_two().max(2048);
+            let inst = (k * record_bytes * 8 + 2048 * 14 - 1) / (2048 * 14);
+            (rows, inst)
+        })
+        .min_by_key(|&(r, i)| r * 7 + i * 12_288)
+        .unwrap()
+}
+
+/// Packing-key bytes for `queries` YPIR queries of one search.
+pub fn ypir_pp_bytes(queries: usize) -> usize {
+    (queries + YPIR_SEEDS - 1) / YPIR_SEEDS * YPIR_PP_BYTES
 }
 
 /// Spiral query size (bytes): one seeded ciphertext, independent of the table
@@ -1201,6 +1245,8 @@ pub struct MapPir {
     pub frodo_response: usize,
     pub spiral_query: usize,
     pub spiral_response: usize,
+    pub ypir_query: usize,
+    pub ypir_response: usize,
 }
 
 impl MapPir {
@@ -1210,12 +1256,16 @@ impl MapPir {
             frodo_response: crate::pir_backend::frodo_width(row_bytes) * 4,
             spiral_query: SPIRAL_QUERY_BYTES,
             spiral_response: spiral_response_bytes(row_bytes),
+            ypir_query: ypir_shape(rows, row_bytes).0 * 7,
+            ypir_response: ypir_shape(rows, row_bytes).1 * 12_288,
         }
     }
     pub fn per_query(&self, k: PirKind) -> usize {
         match k {
             PirKind::Frodo => self.frodo_query + self.frodo_response,
             PirKind::Spiral => self.spiral_query + self.spiral_response,
+            // packing keys are added per search (ypir_pp_bytes)
+            PirKind::Ypir => self.ypir_query + self.ypir_response,
         }
     }
 }
@@ -1230,23 +1280,28 @@ impl MkseLog {
     /// Bytes a new client downloads before its first search, per PIR choice.
     pub fn join_bytes(&self, val: PirKind, doc: PirKind) -> usize {
         let state = if self.cfg.stateless { 0 } else { self.compacted_bytes() };
-        let h = |k: PirKind, hint: usize| if k == PirKind::Frodo { hint } else { SPIRAL_PP_BYTES };
+        let h = |k: PirKind, hint: usize| match k {
+            PirKind::Frodo => hint,
+            PirKind::Spiral => SPIRAL_PP_BYTES,
+            PirKind::Ypir => 0,
+        };
         state + h(val, self.val_hint_bytes()) + h(doc, self.doc_hint_bytes())
     }
 }
 
 /// A client that searches every `interval` appends and refreshes its state
-/// only then. Its download is split into components so that every pairing of
-/// PIRs (ValMap, DocMap) can be costed from one run:
-/// * sync: new log records (or the compacted log), or for stateless clients
-///   VolMap plus the pending stash (when a batch ran since the last search);
-/// * stash: the ValMap and DocMap stashes if they changed;
-/// * hints (FrodoPIR only): packed deltas of changed rows, or a fresh hint,
-///   whichever is smaller;
-/// * queries and responses of the search itself, per PIR.
+/// only then. Costs are kept in two parts so that every pairing of PIRs
+/// (ValMap, DocMap) can be costed from one run:
+/// * the **keyword lookup**: sync (new log records or the compacted log, or for
+///   stateless clients VolMap plus the pending stash), the ValMap stash, the
+///   ValMap hint refresh (FrodoPIR only), and the ValMap queries and answers;
+/// * **document retrieval**: the DocMap stash, the DocMap hint refresh
+///   (FrodoPIR only), and the DocMap queries and answers, both for fetching
+///   every matching document and for fetching at most `doc_cap` of them.
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub interval: usize,
+    pub doc_cap: usize,
     since: usize,
     val_rows: HashSet<u32>,
     val_full: bool,
@@ -1259,20 +1314,29 @@ pub struct Profile {
     pub hint_val: usize,
     pub hint_doc: usize,
     pub sync: usize,
-    pub stash: usize,
+    pub stash_val: usize,
+    pub stash_doc: usize,
     pub val_queries: usize,
     pub doc_queries: usize,
+    pub doc_queries_capped: usize,
+    pub docs: usize,
+    pub docs_capped: usize,
     pub full_hint_refreshes: usize,
-    /// per pairing in PIR_COMBOS order: total and max bytes per search
-    pub total: [usize; 4],
-    pub max: [usize; 4],
-    pub hist: [Vec<usize>; 4],
+    /// per pairing in PIR_COMBOS order (lookup depends on the ValMap PIR,
+    /// documents on the DocMap PIR, but both are kept per pairing for clarity)
+    pub lookup: [usize; N_COMBOS],
+    pub lookup_max: [usize; N_COMBOS],
+    pub lookup_hist: [Vec<usize>; N_COMBOS],
+    pub docs_all: [usize; N_COMBOS],
+    pub docs_capped_bytes: [usize; N_COMBOS],
+    pub capped_hist: [Vec<usize>; N_COMBOS],
 }
 
 impl Profile {
-    pub fn new(interval: usize) -> Self {
+    pub fn new(interval: usize, doc_cap: usize) -> Self {
         Self {
             interval,
+            doc_cap,
             since: 0,
             val_rows: HashSet::new(),
             val_full: false,
@@ -1285,13 +1349,20 @@ impl Profile {
             hint_val: 0,
             hint_doc: 0,
             sync: 0,
-            stash: 0,
+            stash_val: 0,
+            stash_doc: 0,
             val_queries: 0,
             doc_queries: 0,
+            doc_queries_capped: 0,
+            docs: 0,
+            docs_capped: 0,
             full_hint_refreshes: 0,
-            total: [0; 4],
-            max: [0; 4],
-            hist: [vec![], vec![], vec![], vec![]],
+            lookup: [0; N_COMBOS],
+            lookup_max: [0; N_COMBOS],
+            lookup_hist: Default::default(),
+            docs_all: [0; N_COMBOS],
+            docs_capped_bytes: [0; N_COMBOS],
+            capped_hist: Default::default(),
         }
     }
 
@@ -1350,15 +1421,17 @@ impl Profile {
         false
     }
 
-    /// The client refreshes and runs a search that sends `qv` ValMap and `qd`
-    /// DocMap queries. Returns the bytes for the pairing (Frodo, Frodo).
-    pub fn sync(&mut self, m: &MkseLog, qv: usize, qd: usize) -> usize {
+    /// The client refreshes and runs the search `sr`.
+    pub fn sync(&mut self, m: &MkseLog, sr: &SearchOut) {
+        let qv = sr.val_queries.len();
+        let qd = sr.doc_queries.len();
+        let qdc = sr.doc_queries_capped(self.doc_cap);
+        let nd = sr.ids.len();
+        let ndc = nd.min(self.doc_cap);
         let hv = if self.val_full { self.full_hint_refreshes += 1; m.val_hint_bytes() } else { self.val_rows.len() * m.val_delta_bytes(true) };
         let hd = if self.doc_full { m.doc_hint_bytes() } else { self.doc_rows.len() * m.doc_delta_bytes(true) };
-        let mut st = if self.dirty { m.val_stash_bytes() } else { 0 };
-        if self.doc_dirty && m.cfg.doc_layout != DocLayout::Rows {
-            st += m.cfg.doc.stash_bytes();
-        }
+        let sv = if self.dirty { m.val_stash_bytes() } else { 0 };
+        let sd = if self.doc_dirty && m.cfg.doc_layout != DocLayout::Rows { m.cfg.doc.stash_bytes() } else { 0 };
         let sync = if m.cfg.stateless {
             if self.dirty { m.cfg.volmap_bytes() + m.cfg.pending_stash_bytes() } else { 0 }
         } else {
@@ -1366,23 +1439,28 @@ impl Profile {
         };
         let (vp, dp) = (m.val_pir(), m.doc_pir());
         for (c, &(kv, kd)) in PIR_COMBOS.iter().enumerate() {
-            let mut b = sync + st + qv * vp.per_query(kv) + qd * dp.per_query(kd);
-            if kv == PirKind::Frodo {
-                b += hv;
-            }
-            if kd == PirKind::Frodo {
-                b += hd;
-            }
-            self.total[c] += b;
-            self.max[c] = self.max[c].max(b);
-            self.hist[c].push(b);
+            let pp = |k: PirKind, q: usize| if k == PirKind::Ypir { ypir_pp_bytes(q) } else { 0 };
+            let look = sync + sv + qv * vp.per_query(kv) + pp(kv, qv) + if kv == PirKind::Frodo { hv } else { 0 };
+            let dh = sd + if kd == PirKind::Frodo { hd } else { 0 };
+            let all = dh + qd * dp.per_query(kd) + pp(kd, qd);
+            let capped = dh + qdc * dp.per_query(kd) + pp(kd, qdc);
+            self.lookup[c] += look;
+            self.lookup_max[c] = self.lookup_max[c].max(look);
+            self.lookup_hist[c].push(look);
+            self.docs_all[c] += all;
+            self.docs_capped_bytes[c] += capped;
+            self.capped_hist[c].push(look + capped);
         }
         self.hint_val += hv;
         self.hint_doc += hd;
-        self.stash += st;
+        self.stash_val += sv;
+        self.stash_doc += sd;
         self.sync += sync;
         self.val_queries += qv;
         self.doc_queries += qd;
+        self.doc_queries_capped += qdc;
+        self.docs += nd;
+        self.docs_capped += ndc;
         self.searches += 1;
         self.val_rows.clear();
         self.doc_rows.clear();
@@ -1391,6 +1469,12 @@ impl Profile {
         self.log_bytes = 0;
         self.dirty = false;
         self.doc_dirty = false;
-        self.hist[0].last().copied().unwrap_or(0)
     }
+}
+
+/// Median of a list of byte counts.
+pub fn median(v: &[usize]) -> usize {
+    let mut h = v.to_vec();
+    h.sort_unstable();
+    h.get(h.len() / 2).copied().unwrap_or(0)
 }
