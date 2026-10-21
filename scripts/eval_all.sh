@@ -168,7 +168,8 @@ fi
 
 # ---------------------------------------------------------------- 6b. Spiral (hintless PIR): Blyss server vs our faster server
 # Byte-identical responses are checked first. Shapes: ValMap 8 KB records
-# (n = 2) at 2^14..2^17, DocMap 2 KB records (n = 1, two 1 KB chunks).
+# (n = 2) at 2^14..2^17, DocMap 2 KB records (n = 1, two 1 KB chunks), and the
+# full-size DocMap (SPIRAL_DOC=0 skips it).
 if want spiral; then
   ( cd spiral_fast && cargo build --release )
   SB=./spiral_fast/target/release/spiral_bench
@@ -179,6 +180,16 @@ if want spiral; then
     $SB bench $s --impl blyss --batches 1,8,32 --trials 2 | grep -E "^impl" | tee -a "$OUT/spiral.txt"
     $SB bench $s --impl fast  --batches 1,8,32,128 --trials 2 | grep -E "^impl" | tee -a "$OUT/spiral.txt"
   done
+  # DocMap at full size (2.3M rows of 1059 B): one row per 2 KB record (n = 1, 2^21 records after
+  # packing two rows per record) or seven rows per 8 KB record (n = 2, 2^19 records); ~34 GB each.
+  # Our server only (the Blyss server would take hours); answers are decoded and checked.
+  if [[ $QUICK != 1 && ${SPIRAL_DOC:-1} == 1 ]]; then
+    for s in 1,9,12 2,9,10; do
+      log "spiral docmap $s"
+      $SB bench $s --impl fast --batches 1,16,64 --trials 1 | grep -E "^impl" | sed 's/^impl=fast/impl=fast_docmap/' | tee -a "$OUT/spiral.txt" \
+        || echo "spiral docmap $s failed (see above)" | tee -a "$OUT/spiral.txt"
+    done
+  fi
 fi
 
 # ---------------------------------------------------------------- 6c. paired evaluation: client models x PIR per map

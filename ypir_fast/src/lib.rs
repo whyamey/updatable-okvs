@@ -372,38 +372,59 @@ impl YpirServer {
         let s = self.shape;
         let rows = s.rows;
         let cols = s.cols();
-        // old rows, new rows
-        let mut touched: std::collections::BTreeMap<usize, (Vec<u16>, Vec<u8>)> = Default::default();
+        // group the updates by row
+        let mut by_row: std::collections::BTreeMap<usize, Vec<(usize, &[u8])>> = Default::default();
         for (idx, bytes) in updates {
             assert!(*idx < s.records && bytes.len() == s.record_bytes);
-            let r = idx / s.per_row;
-            if !touched.contains_key(&r) {
-                let old = self.row_elems(r);
-                let el: Vec<u64> = old.iter().map(|&x| x as u64).collect();
-                let rb = elems_to_bytes(&el, s.row_bytes());
-                touched.insert(r, (old, rb));
-            }
-            let e = touched.get_mut(&r).unwrap();
-            let off = (idx % s.per_row) * s.record_bytes;
-            e.1[off..off + s.record_bytes].copy_from_slice(bytes);
+            by_row.entry(idx / s.per_row).or_default().push((idx % s.per_row, bytes.as_slice()));
         }
-        // write the new rows, keep (row, old, new) elements
-        let mut changes: Vec<(usize, Vec<u16>, Vec<u16>)> = Vec::with_capacity(touched.len());
+        let rs: Vec<usize> = by_row.keys().copied().collect();
+        let nr = rs.len();
+        // old elements, column-major (c * nr + k): one pass over each touched column
+        let mut old_t = vec![0u16; cols * nr];
         {
-            let db = self.server.db_mut();
-            for (r, (old, rb)) in touched {
+            let db = self.server.db();
+            old_t.par_chunks_mut(nr).enumerate().for_each(|(c, o)| {
+                let col = &db[c * rows..(c + 1) * rows];
+                for (k, &r) in rs.iter().enumerate() {
+                    o[k] = col[r];
+                }
+            });
+        }
+        // new rows: decode, apply the record writes, re-encode (parallel over rows)
+        let groups: Vec<&Vec<(usize, &[u8])>> = by_row.values().collect();
+        let new_rows: Vec<Vec<u16>> = (0..nr)
+            .into_par_iter()
+            .map(|k| {
+                let el: Vec<u64> = (0..cols).map(|c| old_t[c * nr + k] as u64).collect();
+                let mut rb = elems_to_bytes(&el, s.row_bytes());
+                for &(slot, bytes) in groups[k] {
+                    rb[slot * s.record_bytes..(slot + 1) * s.record_bytes].copy_from_slice(bytes);
+                }
                 let mut new = vec![0u16; cols];
                 bytes_to_elems(&rb, &mut new);
-                for c in 0..cols {
-                    db[c * rows + r] = new[c];
-                }
-                changes.push((r, old, new));
+                new
+            })
+            .collect();
+        let mut new_t = vec![0u16; cols * nr];
+        new_t.par_chunks_mut(nr).enumerate().for_each(|(c, o)| {
+            for k in 0..nr {
+                o[k] = new_rows[k][c];
             }
+        });
+        drop(new_rows);
+        {
+            let db = self.server.db_mut();
+            db.par_chunks_mut(rows).enumerate().for_each(|(c, col)| {
+                for (k, &r) in rs.iter().enumerate() {
+                    col[r] = new_t[c * nr + k];
+                }
+            });
         }
         let db_ms = ms(t0);
         // group by block of 2048 rows
         let mut blocks: Vec<(usize, Vec<usize>)> = Vec::new();
-        for (k, (r, _, _)) in changes.iter().enumerate() {
+        for (k, &r) in rs.iter().enumerate() {
             let b = r / POLY_LEN;
             match blocks.last_mut() {
                 Some((bb, v)) if *bb == b => v.push(k),
@@ -428,9 +449,9 @@ impl YpirServer {
                     raw.data.as_mut_slice().fill(0);
                     let mut any = false;
                     for &k in ks {
-                        let (r, old, new) = &changes[k];
-                        if old[c] != new[c] {
-                            raw.data[r % POLY_LEN] = (q + new[c] as u64 - old[c] as u64) % q;
+                        let (o, n) = (old_t[c * nr + k], new_t[c * nr + k]);
+                        if o != n {
+                            raw.data[rs[k] % POLY_LEN] = (q + n as u64 - o as u64) % q;
                             any = true;
                         }
                     }
@@ -459,7 +480,7 @@ impl YpirServer {
         }
         self.epoch += 1;
         UpdateTiming {
-            rows: changes.len(),
+            rows: nr,
             blocks: blocks.len(),
             db_ms,
             hint_ms,

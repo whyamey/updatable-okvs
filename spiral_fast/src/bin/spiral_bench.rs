@@ -1,6 +1,6 @@
 //! spiral_bench check            correctness: byte-identical responses vs the Blyss server
 //! spiral_bench bench N,NU1,NU2 [--impl blyss|fast] [--batches 1,8,32] [--threads T]
-use rand::{Rng, RngCore};
+use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use spiral_fast::*;
 use spiral_rs::{arith::*, client::*, params::*};
 use spiral_server::db::loading::update_item;
@@ -12,6 +12,11 @@ fn random_item(params: &Params, rng: &mut impl RngCore) -> Vec<u8> {
     let mut v = vec![0u8; params.instances * params.n * params.n * params.bytes_per_chunk()];
     rng.fill_bytes(&mut v);
     v
+}
+
+/// The record stored at `idx` in the fast benchmark (regenerated to check answers).
+fn item_for(params: &Params, idx: usize) -> Vec<u8> {
+    random_item(params, &mut StdRng::seed_from_u64(0x5eed_0000 ^ idx as u64))
 }
 
 fn check() {
@@ -108,21 +113,31 @@ fn bench(args: &[String]) {
     } else {
         let mut db = DenseDb::zero(&params);
         for idx in 0..items {
-            db.update_item(&params, idx, &random_item(&params, &mut rng));
+            db.update_item(&params, idx, &item_for(&params, idx));
         }
         let load_s = t.elapsed().as_secs_f64();
+        let mut bad = 0usize;
+        let mut checked = 0usize;
         for &b in &batches {
             for _ in 0..trials {
                 let targets: Vec<usize> = (0..b).map(|_| rng.gen_range(0..items)).collect();
                 let qs: Vec<Query> = targets.iter().map(|&t| client.generate_query(t)).collect();
                 let (resp, tm) = process_queries(&params, &pp, &qs, &db);
-                let _ = client.decode_response(&resp[0]);
+                // every answer must decode to the stored record (noise grows with nu2)
+                for (r, &t) in resp.iter().zip(&targets).take(8) {
+                    checked += 1;
+                    if client.decode_response(r)[..64] != item_for(&params, t)[..64] {
+                        bad += 1;
+                    }
+                }
                 println!(
                     "impl=fast,shape={shape},records={items},record_bytes={},threads={tt},batch={b},total_ms={:.1},per_query_ms={:.1},expand_ms={:.1},firstdim_ms={:.1},kernel_ms={:.1},fold_ms={:.1},pack_encode_ms={:.1},db_gb={:.2},load_s={load_s:.1}",
                     params.db_item_size, tm.total_ms, tm.total_ms / b as f64, tm.expand_ms, tm.firstdim_ms, tm.firstdim_kernel_ms, tm.fold_ms, tm.pack_encode_ms, db.bytes() as f64 / 1e9
                 );
             }
         }
+        println!("impl=fast,shape={shape},decoded_ok={},decoded_checked={checked}", checked - bad);
+        assert_eq!(bad, 0, "{bad} of {checked} answers decoded wrong at shape {shape}: the parameters are too noisy");
         let item = random_item(&params, &mut rng);
         let t = Instant::now();
         db.update_item(&params, 3, &item);
