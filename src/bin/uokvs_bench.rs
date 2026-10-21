@@ -111,6 +111,7 @@ fn main() {
     match cmd.as_str() {
         "selftest" => selftest(&a),
         "stash" => stash(&a),
+        "churn" => churn(&a),
         "ops" => ops(&a),
         "pir" => pir(&a),
         "design" => design(&a),
@@ -119,7 +120,15 @@ fn main() {
     }
 }
 
-const HELP: &str = r#"uokvs_bench <selftest|stash|ops|pir> [--options]
+const HELP: &str = r#"uokvs_bench <selftest|stash|churn|ops|pir|design|report> [--options]
+
+churn  --n 1000000 --mu-factor 1.5 --evict rw|bfs --alpha 10 --disc paper|legacy|noinv
+       --ops-factor 4 --mode update|replace --zipf 0 --rebuild-every 0 --checkpoints 40
+       fill to n live keys, then churn at constant load: `update` rewrites a key
+       through an invalidation-mode update (same key, a fresh state), `replace`
+       frees a key and inserts a new one (the versioned-key pattern of mkse_log);
+       targets are uniform (zipf 0) or Zipf(s) over n logical records; a rebuild
+       re-inserts every live key into a fresh table every R operations
 
 stash  --n 1000000 --mu-factor 2.0 --p 1 --s 4 --alpha 10 --evict rw|bfs
        --disc paper|legacy|noinv --joint-frac 0.0 --alpha-build 100
@@ -439,6 +448,125 @@ fn stash(a: &Args) {
         }
     }
     println!("{out}: n={n} load={:.3} stash={} ({:.2}s)", t.load(), t.stash_len(), t0.elapsed().as_secs_f64());
+}
+
+/// Stash under churn at constant load (not covered by the stash theorems,
+/// which bound insertions into an empty table).
+fn churn(a: &Args) {
+    let n = a.u("n", 1_000_000);
+    let prm = Params {
+        mu: (a.f("mu-factor", 1.5) * n as f64).ceil() as usize,
+        p: 1,
+        s: a.u("s", 4),
+        alpha: a.u("alpha", 10),
+        sigma: usize::MAX / 2,
+        evict: evict_of(&a.s("evict", "rw")),
+        disc: disc_of(&a.s("disc", "paper")),
+        bfs_max_branch: a.u("branch", 2),
+        bfs_max_depth: a.u("depth", 64),
+        val_len: 0,
+    };
+    let ops = (a.f("ops-factor", 4.0) * n as f64) as usize;
+    let mode = a.s("mode", "update");
+    assert!(mode == "update" || mode == "replace", "--mode update|replace");
+    let zipf = a.f("zipf", 0.0);
+    let rebuild_every = a.u("rebuild-every", 0);
+    let cps = a.u("checkpoints", 40).max(1);
+    let out = a.s("out", "results/churn.csv");
+    let mut rng = StdRng::seed_from_u64(a.u("seed", 1) as u64);
+    let mut keyrng = StdRng::seed_from_u64(a.u("seed", 1) as u64 ^ 0x5eed);
+    let mut w = csv(&out, "evict,disc,alpha,mu,n,mode,zipf,rebuild_every,ops,load,stash,stash_frac,stash_max,stale,rebuilds,secs");
+    // n logical records; slot i holds the current key of record i
+    let mut next_id = 0u64;
+    let mut fresh = |r: &mut StdRng| -> (Key, [u8; 32]) {
+        let mut lk = [0u8; 32];
+        r.fill(&mut lk);
+        next_id += 1;
+        (Key::flat(&next_id.to_le_bytes()), lk)
+    };
+    let mut slots: Vec<(Key, [u8; 32])> = (0..n).map(|_| fresh(&mut keyrng)).collect();
+    let mut t = Table::new(prm.clone(), &mut rng);
+    for (k, lk) in &slots {
+        t.insert(k, *lk, [0u8; 32], vec![], &mut rng);
+    }
+    // Zipf(zipf) over record ranks (a random permutation decouples rank from slot order)
+    let cdf: Vec<f64> = if zipf > 0.0 {
+        let mut c = Vec::with_capacity(n);
+        let mut acc = 0.0;
+        for i in 0..n {
+            acc += 1.0 / ((i + 1) as f64).powf(zipf);
+            c.push(acc);
+        }
+        let tot = acc;
+        c.iter_mut().for_each(|x| *x /= tot);
+        c
+    } else {
+        vec![]
+    };
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.shuffle(&mut rng);
+    let mut pick = |r: &mut StdRng| -> usize {
+        if cdf.is_empty() {
+            r.gen_range(0..n)
+        } else {
+            let u: f64 = r.gen();
+            perm[cdf.partition_point(|&x| x < u).min(n - 1)]
+        }
+    };
+    let tag = format!(
+        "{},{},{},{},{},{},{},{}",
+        a.s("evict", "rw"), a.s("disc", "paper"), prm.alpha, prm.mu, n, mode, zipf, rebuild_every
+    );
+    let t0 = Instant::now();
+    let mut smax = t.stash_len();
+    let mut rebuilds = 0usize;
+    let step = (ops / cps).max(1);
+    let line = |w: &mut BufWriter<File>, t: &Table, i: usize, smax: usize, rebuilds: usize| {
+        writeln!(
+            w,
+            "{tag},{i},{:.5},{},{:.3e},{smax},{},{rebuilds},{:.1}",
+            t.load(),
+            t.stash_len(),
+            t.stash_len() as f64 / n as f64,
+            t.stale_count,
+            t0.elapsed().as_secs_f64()
+        )
+        .unwrap();
+    };
+    line(&mut w, &t, 0, smax, 0);
+    for i in 0..ops {
+        let x = pick(&mut rng);
+        if mode == "update" {
+            let k = slots[x].0.clone();
+            t.update(&k, vec![], false, UpdateMode::Invalidation, &mut rng);
+        } else {
+            let old = slots[x].0.clone();
+            t.remove(&old);
+            let (k, lk) = fresh(&mut keyrng);
+            t.insert(&k, lk, [0u8; 32], vec![], &mut rng);
+            slots[x] = (k, lk);
+        }
+        smax = smax.max(t.stash_len());
+        if rebuild_every > 0 && (i + 1) % rebuild_every == 0 {
+            // a rebuild re-inserts the live keys into a fresh table: every key gets s fresh states
+            let mut nt = Table::new(prm.clone(), &mut rng);
+            for (k, lk) in &slots {
+                nt.insert(k, *lk, [0u8; 32], vec![], &mut rng);
+            }
+            t = nt;
+            rebuilds += 1;
+        }
+        if (i + 1) % step == 0 || i + 1 == ops {
+            line(&mut w, &t, i + 1, smax, rebuilds);
+            w.flush().unwrap();
+        }
+    }
+    println!(
+        "{out}: n={n} mode={mode} zipf={zipf} rebuild={rebuild_every} load={:.3} stash={} max={smax} ({:.1}s)",
+        t.load(),
+        t.stash_len(),
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 // ------------------------------------------------------------------ data
@@ -1568,6 +1696,17 @@ fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     Some((header, rows))
 }
 
+/// Keep the last row for each key (a rerun appends new rows for the same run).
+fn dedup_last(h: &[String], rows: Vec<Vec<String>>, keys: &[&str]) -> Vec<Vec<String>> {
+    let ix: Vec<usize> = keys.iter().filter_map(|k| h.iter().position(|x| x == k)).collect();
+    let key = |r: &Vec<String>| ix.iter().map(|&i| r[i].as_str()).collect::<Vec<_>>().join("\u{1}");
+    let mut last = std::collections::HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        last.insert(key(r), i);
+    }
+    rows.iter().enumerate().filter(|(i, r)| last[&key(r)] == *i).map(|(_, r)| r.clone()).collect()
+}
+
 fn col(h: &[String], name: &str) -> usize {
     h.iter().position(|x| x == name).unwrap_or_else(|| panic!("column {name} missing"))
 }
@@ -1600,6 +1739,7 @@ fn report(a: &Args) {
     // design comparison
     let sp = Path::new(&dir).join("design_summary.csv");
     if let Some((h, rows)) = read_csv(&sp) {
+        let rows = dedup_last(&h, rows, &["label"]);
         md.push_str("## Write path: schedules and DocMap layouts\n\n");
         md.push_str("| run | policy | b | k | θ | r | DocMap | α | appends | K-overflow batches | pending peak | log peak | ValMap rows / append | DocMap rows / append | owner upload / append | owner ms / append | hint update ms / batch | rebuilds (mean ms) | stash peak | ValMap load |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
         for r in &rows {
@@ -1616,6 +1756,7 @@ fn report(a: &Args) {
     }
     let cp = Path::new(&dir).join("design_summary_clients.csv");
     if let Some((h, rows)) = read_csv(&cp).filter(|(h, _)| h.contains(&"lookup_mean".to_string())) {
+        let rows = dedup_last(&h, rows, &["label", "client_model", "val_pir", "doc_pir", "interval", "doc_cap"]);
         let mut intervals: Vec<usize> = rows.iter().map(|r| fnum(&r[col(&h, "interval")]) as usize).collect();
         intervals.sort_unstable();
         intervals.dedup();
@@ -1768,6 +1909,31 @@ fn report(a: &Args) {
                         ));
                     }
                 }
+            }
+            md.push('\n');
+        }
+    }
+
+    // churn
+    let cdir = Path::new(&dir).join("churn");
+    if let Ok(rd) = std::fs::read_dir(&cdir) {
+        let mut files: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "csv")).collect();
+        files.sort();
+        if !files.is_empty() {
+            md.push_str("## Stash under churn (constant load, 4n operations after the fill)\n\n`replace` frees a key and inserts a new one (versioned keys, as in `mkse_log`); `update` rewrites the same key by an invalidation-mode update. Targets uniform (z0) or Zipf(1) (z1); `rebuild` = re-insert every live key into a fresh table every R operations (0 = never). Stash as a fraction of the n live keys.\n\n| run | evict | disc | α | load target | mode | zipf | rebuild | stash after fill | stash at n ops | stash at 4n ops | max stash | final load |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            for f in files {
+                let Some((h, rows)) = read_csv(&f) else { continue };
+                let (Some(first), Some(last)) = (rows.first(), rows.last()) else { continue };
+                let g = |r: &Vec<String>, n: &str| r[col(&h, n)].clone();
+                let nn = fnum(&g(last, "n")).max(1.0);
+                let frac = |x: &str| format!("{:.2e}", fnum(x) / nn);
+                let at_n = rows.iter().find(|r| fnum(&g(r, "ops")) >= nn).map(|r| frac(&g(r, "stash"))).unwrap_or_default();
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    f.file_stem().unwrap().to_string_lossy(), g(last, "evict"), g(last, "disc"), g(last, "alpha"),
+                    nn / fnum(&g(last, "mu")), g(last, "mode"), g(last, "zipf"), g(last, "rebuild_every"),
+                    frac(&g(first, "stash")), at_n, frac(&g(last, "stash")), frac(&g(last, "stash_max")), g(last, "load")
+                ));
             }
             md.push('\n');
         }

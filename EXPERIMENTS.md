@@ -37,6 +37,7 @@ frodo-pir uses `portable_simd`; the script sets `RUSTC_BOOTSTRAP=1` (or use nigh
 |---|---|---|
 | `selftest` | Every eviction variant against a reference map; fixed access counts; encryption + PIR round trip; the old and the new MKSE designs against a reference multimap under inserts, deletes, edits, removals; batches make exactly K(α+1) accesses and K flush records; compacted logs have the public size | correctness |
 | `stash` | Stash vs load, RW / BFS (α = 10, 20) × {paper discipline, legacy code, no invalidation} × {from scratch, 80% joint build}, n = 24M, plus the p = 256 layout | E5, Reviewer A (the current figures come from the Python simulations, which do not use the analyzed rule) |
+| `churn` | Stash under churn at constant load (no theorem covers it): fill to n = 10^6 live keys (`CHURN_N`), then 4n operations; `replace` (free a key, insert a new one: the versioned keys of `mkse_log`) or `update` (invalidation-mode update of the same key); uniform or Zipf(1) targets; rebuild never or every n operations; RW α=10 (discipline and original code) and BFS α=10/20, loads 0.5 and 0.67 | stash beyond the theorems; why BFS and versioned keys |
 | `write` | Enron: 80% setup, 20% replay with 2% posting deletes, 2% edits, 0.2% removals. Variants: log only (K = 0, no rebuild), rebuild every 10^5 / 3·10^5 / 10^6 appends, one operation per insertion (the original design), batched flushes over B × θ × α, RW, an age bound, DocMap rows vs Cuckoo, a 50% build | E1, E3, Reviewer B (insertions, deletions, updates) |
 | `writepir` | The main variants with the PIR databases maintained: per-batch row + hint updates with the fork, FrodoPIR setup at each rebuild, measured PIR searches at width 32 (`DOC_PIR=1` also keeps DocMap in PIR) | E2, E3 |
 | `pir` | Fork microbenchmarks at ValMap shape (8 KB rows) and DocMap shape (1059-byte rows): setup, hint size, update of 11–420 rows, query batches at widths 8–64 | E2c, DocMap speed |
@@ -85,6 +86,14 @@ n = 10^6, p = 1, s = 4; RW α = 10; BFS α = 20, branch 2, depth 64; built from 
 | 0.50 | 2.5e-2 | 2e-6 | 0 | 0 |
 | 0.75 | 7.5e-2 | 6.1e-4 | **1.7e-4** | 7.5e-4 |
 | 0.90 | 1.2e-1 | 1.4e-2 | **6.4e-3** | 1.5e-2 |
+
+### Stash under churn (QUICK, n = 10^5)
+
+Largest stash over 4n operations, as a fraction of n (replace, uniform / Zipf(1); no rebuild → rebuild every n):
+- BFS α=20, load 0.5: 4e-5 / 2e-5 → 1e-5 / 1e-5. Load 0.67: 1.5e-2 / 1.8e-2 → 1.5e-3 / 4.1e-4.
+- RW α=10 (discipline), load 0.5: 0.11 / 0.37 → 0.08 / 0.14. Load 0.67: 0.19 / 0.50 → 0.16 / 0.25 (already 2.4% / 5.4% after the fill).
+- RW α=10, original first-fit code without invalidation (secure for insertions only), load 0.67: 1.3e-3 / 2.1e-3 → 9.7e-4 / 1.1e-3.
+- `update` (same key): 75–86% of keys end in the stash for every disciplined variant (each update uses one of the key's s = 4 states); 18–41% at most between rebuilds every n; the original code stays near 1e-4.
 
 ### FrodoPIR fork
 

@@ -7,7 +7,11 @@
 #   QUICK=1 ./scripts/eval_all.sh                                                   # small sizes, minutes
 #   STASH_JOBS=16 PIR_APPENDS=200000 UPSTREAM_REBUILD_ALL=0 PAIRED_PIR=1             # knobs (defaults shown/derived)
 #
-# Stages: selftest stash write writepir pir compare ypir spiral paired report   (default: all)
+# Stages: selftest stash churn write writepir pir compare ypir spiral paired report   (default: all)
+# Restarting: with the default (all), finished work is skipped: design runs whose log
+# has its "done" line, stages that left $OUT/logs/stage_<name>.done, and stash runs
+# with output. Naming a stage reruns it; FORCE=1 reruns everything but the stash runs
+# (delete $OUT/stash/*.csv to redo those). Rerun design stages after changing the cost model.
 # Outputs: $OUT/ (CSV per run, design_summary*.csv, REPORT.md). Logs: $OUT/logs/.
 set -euo pipefail
 DATA=${DATA:-/home/bfuller/MKSE/okvs_python/data/data}
@@ -16,11 +20,23 @@ QUICK=${QUICK:-0}
 STAGES=${*:-all}
 export RUSTC_BOOTSTRAP=1                       # frodo-pir uses portable_simd (or use nightly)
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
-want() { [[ " $STAGES " == *" all "* || " $STAGES " == *" $1 "* ]]; }
+named() { [[ " $STAGES " == *" $1 "* ]]; }
+rerun() { [[ ${FORCE:-0} == 1 ]] || named "$1"; }
+# want STAGE: run it (and remember it as the current stage); with `all`, a stage
+# that finished before (marker file) is skipped unless FORCE=1
+want() {
+  CUR=$1
+  if named "$1"; then return 0; fi
+  [[ " $STAGES " == *" all "* ]] || return 1
+  if [[ ${FORCE:-0} != 1 && -f "$OUT/logs/stage_$1.done" ]]; then log "stage $1 done before, skipped"; return 1; fi
+  return 0
+}
+done_stage() { touch "$OUT/logs/stage_$1.done"; }
+CUR=""
+log() { echo "[$(date +%H:%M:%S)] $*"; }
 mkdir -p "$OUT/logs" "$OUT/design" "$OUT/stash" "$OUT/pir"
 cargo build --release --bin uokvs_bench
 B=./target/release/uokvs_bench
-log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 if [[ $QUICK == 1 ]]; then
   SRC=(--synthetic 3000,20000,40); N=1000000; MFS="2.0 1.333"; PIR_ROWS="16384"; DOC_ROWS="65536"; TRIALS=1
@@ -40,6 +56,9 @@ COMMON=(--build-frac 0.8 --order fileid --del-frac 0.02 --upd-frac 0.02 --docdel
         --summary "$OUT/design_summary.csv")
 design() { # label, extra args...
   local l=$1; shift
+  if ! rerun "$CUR" && grep -q "^\[$l\] done:" "$OUT/logs/design_$l.log" 2>/dev/null; then
+    log "design $l done before, skipped"; return 0
+  fi
   log "design $l"
   $B design "${SRC[@]}" "${COMMON[@]}" --label "$l" --out-prefix "$OUT/design/$l" "$@" > "$OUT/logs/design_$l.log" 2>&1
   tail -7 "$OUT/logs/design_$l.log"
@@ -48,6 +67,7 @@ design() { # label, extra args...
 # ---------------------------------------------------------------- 0. correctness
 if want selftest; then
   log "selftest"; $B selftest | tee "$OUT/logs/selftest.log" | tail -3
+  done_stage selftest
 fi
 
 # ---------------------------------------------------------------- 1. stash vs load (E5, Reviewer A)
@@ -81,6 +101,32 @@ if want stash; then
   log "stash: $(wc -l < "$JOBS") runs, $STASH_JOBS at a time"
   # a run writes its CSV incrementally; remove partial files of failed runs so a restart redoes them
   xargs -P "$STASH_JOBS" -I{} bash -c '{} > /dev/null || { echo "FAILED: {}"; f=$(echo "{}" | sed "s/.*--out //"); rm -f "$f"; }' < "$JOBS"
+  done_stage stash
+fi
+
+# ---------------------------------------------------------------- 1b. stash under churn (no theorem covers this)
+# Fill to n live keys, then 4n operations at constant load. `replace` frees a key
+# and inserts a new one (the versioned-key pattern of mkse_log); `update` rewrites
+# the same key with an invalidation-mode update (a fresh state of that key each
+# time). Targets uniform or Zipf(1); rebuild never or every n operations.
+if want churn; then
+  mkdir -p "$OUT/churn"
+  if [[ $QUICK == 1 ]]; then CN=100000; else CN=${CHURN_N:-1000000}; fi
+  JOBS="$OUT/logs/churn_jobs.txt"; : > "$JOBS"
+  for mf in 2.0 1.5; do
+    for ev in "rw 10 paper" "rw 10 legacy" "bfs 20 paper" "bfs 10 paper"; do set -- $ev
+      for cfg in "replace 0 0" "replace 0 $CN" "replace 1 0" "replace 1 $CN" "update 0 0" "update 0 $CN"; do
+        set -- $1 $2 $3 $cfg
+        f="$OUT/churn/${1}a${2}_${3}_mf${mf}_${4}_z${5}_rb${6}.csv"
+        [[ -s $f ]] && continue
+        echo "$B churn --n $CN --mu-factor $mf --evict $1 --alpha $2 --disc $3 --mode $4 --zipf $5 --rebuild-every $6 --ops-factor 4 --checkpoints 40 --out $f" >> "$JOBS"
+      done
+    done
+  done
+  NJ=${STASH_JOBS:-$(nproc)}
+  log "churn: $(wc -l < "$JOBS") runs, $NJ at a time"
+  xargs -P "$NJ" -I{} bash -c '{} > /dev/null || { echo "FAILED: {}"; f=$(echo "{}" | sed "s/.*--out //"); rm -f "$f"; }' < "$JOBS"
+  done_stage churn
 fi
 
 # ---------------------------------------------------------------- 2. write path, accounting only (E1, E3, Reviewer B)
@@ -114,6 +160,7 @@ if want write; then
   # half-built corpus
   design logonly_bf05   --policy rebuild --r 0 --build-frac 0.5
   design main_bf05      --policy batched --build-frac 0.5
+  done_stage write
 fi
 
 # ---------------------------------------------------------------- 3. write path with real FrodoPIR (E2, E3)
@@ -126,6 +173,7 @@ if want writepir; then
   design pir_main       --policy batched --pir "${DOCPIR[@]}" --pir-width 32 --pir-search 3 --search-every 50000 "${PREFIX[@]}"
   design pir_rebuild    --policy rebuild --r 100000 --pir "${DOCPIR[@]}" --pir-width 32 --pir-search 3 --search-every 50000 "${PREFIX[@]}"
   design pir_logonly    --policy rebuild --r 0 --pir "${DOCPIR[@]}" --pir-width 32 --pir-search 3 --search-every 50000 "${PREFIX[@]}"
+  done_stage writepir
 fi
 
 # ---------------------------------------------------------------- 4. FrodoPIR fork microbenchmarks (E2c)
@@ -143,11 +191,13 @@ if want pir; then
     $B pir --rows $rows --elem-bytes 1059 --batches 25,100,400 --widths 8,32,64 \
        --update-rows 4,16 --trials $TRIALS --out "$OUT/pir/frodo_doc_${rows}.csv"
   done
+  done_stage pir
 fi
 
 # ---------------------------------------------------------------- 5. fork vs upstream FrodoPIR (our FrodoPIR improvements)
 if want compare; then
   ( cd pir_compare && cargo build --release )
+  : > "$OUT/pir_compare.txt"
   # upstream FrodoPIR has no hint update, so every update size is a full
   # rebuild (~35 min at 524K rows if single-threaded); measure the rebuilds
   # only at the smallest size and reuse its setup time above it
@@ -158,12 +208,14 @@ if want compare; then
     ./pir_compare/target/release/pir_compare --rows $rows --elem-bytes 8192 --update-rows 11,110,210 \
        --batches 4,16,64,256 "${SKIP[@]}" --out "$OUT/pir/fork_vs_upstream_${rows}.csv" | tee -a "$OUT/pir_compare.txt"
   done
+  done_stage compare
 fi
 
 # ---------------------------------------------------------------- 6. YPIR+SP: reference code vs our faster server (ypir_fast)
 # ValMap and DocMap shapes: records per row, batched/prepared answers, row updates, shared keys
 if want ypir; then
   log "ypir"; QUICK=$QUICK ./scripts/run_ypir.sh "$OUT/pir/ypir" 2>&1 | grep -E "^(impl|ok|ypir_fast)" | tee "$OUT/ypir.txt"
+  done_stage ypir
 fi
 
 # ---------------------------------------------------------------- 6b. Spiral (hintless PIR): Blyss server vs our faster server
@@ -190,6 +242,7 @@ if want spiral; then
         || echo "spiral docmap $s failed (see above)" | tee -a "$OUT/spiral.txt"
     done
   fi
+  done_stage spiral
 fi
 
 # ---------------------------------------------------------------- 6c. paired evaluation: client models x PIR per map
@@ -220,6 +273,7 @@ if want paired; then
     design pir_stateless_spiral_spiral --stateless --b 100 --pir --val-pir spiral --doc-pir spiral \
        --pir-width 32 --pir-search 3 --search-every 50000 "${QPIR[@]}" "${PREFIX[@]}"
   fi
+  done_stage paired
 fi
 
 # ---------------------------------------------------------------- 7. one report
