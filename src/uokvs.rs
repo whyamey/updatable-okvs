@@ -194,6 +194,9 @@ struct Item {
     stale: bool,
     alive: bool,
     at: At,
+    /// stash slot in `0..sigma` while the item is in the stash (`PutStash`
+    /// picks a uniformly random dummy slot; the item keeps it until it leaves)
+    slot: usize,
 }
 
 /// What the server sees for one operation, plus owner-side counters.
@@ -218,7 +221,13 @@ pub struct Table {
     items: Vec<Item>,
     free: Vec<u32>,
     index: HashMap<Vec<u8>, u32>,
+    /// occupied stash slots (owner state)
+    stash_occ: HashSet<usize>,
+    /// insertions that found no dummy stash slot (each one halts the structure)
     pub overflow: usize,
+    /// set by the first overflow: the structure has output a public failure
+    /// and halts (the encrypted stash never grows beyond sigma)
+    pub halted: bool,
     pub stash_peak: usize,
     pub stale_count: usize,
     /// set by `encode_joint` (initial entries outside Lemma `lem:fresh`)
@@ -251,7 +260,9 @@ impl Table {
             items: Vec::new(),
             free: Vec::new(),
             index: HashMap::new(),
+            stash_occ: HashSet::new(),
             overflow: 0,
+            halted: false,
             stash_peak: 0,
             stale_count: 0,
             joint_built: false,
@@ -334,22 +345,44 @@ impl Table {
         it.cur = j;
     }
 
-    fn put_stash(&mut self, h: u32, out: &mut OpOut) {
+    /// `PutStash`: the item takes a uniformly random dummy slot of the
+    /// sigma-slot stash. If none is left (an overflow), the operation outputs
+    /// a public failure and the structure halts: `halted` is set, the
+    /// overflow is counted, and `encrypt_stash` refuses to run. The item is
+    /// still recorded (without a slot) so that the owner state stays
+    /// consistent for diagnostics; callers must stop using the structure.
+    fn put_stash<R: Rng>(&mut self, h: u32, rng: &mut R, out: &mut OpOut) {
         out.to_stash = true;
-        if self.stash.len() >= self.prm.sigma {
+        let slot = if self.stash.len() >= self.prm.sigma {
             out.overflow = true;
             self.overflow += 1;
+            self.halted = true;
+            usize::MAX
+        } else {
+            // rejection sampling: a uniformly random slot among the dummies
+            loop {
+                let r = rng.gen_range(0..self.prm.sigma);
+                if !self.stash_occ.contains(&r) {
+                    break r;
+                }
+            }
+        };
+        if slot != usize::MAX {
+            self.stash_occ.insert(slot);
         }
         self.stash.push(h);
         let it = &mut self.items[h as usize];
         it.at = At::Stash;
         it.cur = NOCUR;
+        it.slot = slot;
         self.stash_peak = self.stash_peak.max(self.stash.len());
     }
 
     fn remove_from_stash(&mut self, h: u32) {
         if let Some(i) = self.stash.iter().position(|&x| x == h) {
             self.stash.swap_remove(i);
+            let sl = self.items[h as usize].slot;
+            self.stash_occ.remove(&sl);
         }
     }
 
@@ -400,6 +433,7 @@ impl Table {
             stale: false,
             alive: true,
             at: At::Nowhere,
+            slot: usize::MAX,
         }
     }
 
@@ -576,7 +610,7 @@ impl Table {
 
     fn place_new<R: Rng>(&mut self, h: u32, record: bool, rng: &mut R, out: &mut OpOut) {
         if self.prm.mu == 0 {
-            self.put_stash(h, out);
+            self.put_stash(h, rng, out);
             return;
         }
         match (self.prm.evict, self.prm.disc) {
@@ -601,7 +635,7 @@ impl Table {
         let inval = self.prm.disc == Discipline::Paper;
         for i in 0..a {
             if inval && self.items[h as usize].used & (1 << j) != 0 {
-                self.put_stash(h, out);
+                self.put_stash(h, rng, out);
                 return;
             }
             self.items[h as usize].used |= 1 << j;
@@ -622,7 +656,7 @@ impl Table {
             out.moves += 1;
             self.items[victim as usize].at = At::Nowhere;
             if i == a - 1 {
-                self.put_stash(victim, out);
+                self.put_stash(victim, rng, out);
                 return;
             }
             let vc = self.items[victim as usize].cur;
@@ -661,7 +695,7 @@ impl Table {
             self.items[victim as usize].at = At::Nowhere;
             h = victim;
         }
-        self.put_stash(h, out);
+        self.put_stash(h, rng, out);
     }
 
     // ------------------------------------------------------------ BFS
@@ -780,7 +814,7 @@ impl Table {
         }
 
         match found {
-            None => self.put_stash(root, out),
+            None => self.put_stash(root, rng, out),
             Some(m) => {
                 let mut tpos = nodes[m].pos;
                 let mut tslot = self.peek_free(tpos).unwrap();
@@ -883,18 +917,51 @@ impl Table {
         out
     }
 
-    /// Fresh ciphertext of the whole stash, padded to capacity.
+    /// Owner view of the sigma stash slots: the item handle in each slot
+    /// (`None` = dummy). With buckets (mu > 0) every item keeps the slot
+    /// `PutStash` gave it; a stash-only map (mu = 0) is stored in a fresh
+    /// uniformly random order at every refresh.
+    fn stash_layout<R: Rng>(&self, rng: &mut R) -> Vec<Option<u32>> {
+        assert!(
+            !self.halted && self.stash.len() <= self.prm.sigma,
+            "stash overflow: more than sigma = {} items; the structure has halted (public failure)",
+            self.prm.sigma
+        );
+        let mut slots: Vec<Option<u32>> = vec![None; self.prm.sigma];
+        if self.prm.mu == 0 {
+            let pos = rand::seq::index::sample(rng, self.prm.sigma, self.stash.len());
+            for (k, p) in pos.into_iter().enumerate() {
+                slots[p] = Some(self.stash[k]);
+            }
+        } else {
+            for &h in &self.stash {
+                let sl = self.items[h as usize].slot;
+                debug_assert!(slots[sl].is_none());
+                slots[sl] = Some(h);
+            }
+        }
+        slots
+    }
+
+    /// Slot index of each stash item, in slot order (tests and diagnostics).
+    pub fn stash_slots<R: Rng>(&self, rng: &mut R) -> Vec<Option<Vec<u8>>> {
+        self.stash_layout(rng).into_iter().map(|x| x.map(|h| self.items[h as usize].key.clone())).collect()
+    }
+
+    /// Fresh ciphertext of the whole stash: exactly sigma slots (items in
+    /// their slots, dummies elsewhere). Panics if the structure has halted.
     pub fn encrypt_stash<R: Rng>(&self, rng: &mut R) -> Vec<u8> {
         let sb = self.prm.slot_bytes();
-        let n = self.prm.sigma.max(self.stash.len());
-        let mut out = Vec::with_capacity(n * sb);
-        for k in 0..n {
-            if k < self.stash.len() {
-                self.enc_slot(&self.items[self.stash[k] as usize], rng, &mut out);
-            } else {
-                let start = out.len();
-                out.resize(start + sb, 0);
-                rng.fill(&mut out[start..]);
+        let layout = self.stash_layout(rng);
+        let mut out = Vec::with_capacity(layout.len() * sb);
+        for x in layout {
+            match x {
+                Some(h) => self.enc_slot(&self.items[h as usize], rng, &mut out),
+                None => {
+                    let start = out.len();
+                    out.resize(start + sb, 0);
+                    rng.fill(&mut out[start..]);
+                }
             }
         }
         out
@@ -947,5 +1014,87 @@ impl Table {
             assert!(it.alive && !it.stale);
             assert!(matches!(it.at, At::Bucket(..) | At::Stash));
         }
+        if !self.halted {
+            assert!(self.stash.len() <= self.prm.sigma, "stash beyond sigma without a halt");
+            let slots: HashSet<usize> = self.stash.iter().map(|&h| self.items[h as usize].slot).collect();
+            assert_eq!(slots.len(), self.stash.len(), "two stash items share a slot");
+            assert!(slots.iter().all(|&x| x < self.prm.sigma));
+            assert_eq!(slots, self.stash_occ, "stash slot bookkeeping");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn prm(mu: usize, sigma: usize) -> Params {
+        Params { mu, p: 1, s: 4, alpha: 2, sigma, evict: Evict::Bfs, disc: Discipline::Paper, bfs_max_branch: 2, bfs_max_depth: 64, val_len: 8 }
+    }
+    fn ins(t: &mut Table, i: u64, rng: &mut StdRng) -> OpOut {
+        let mut lk = [0u8; 32];
+        rng.fill(&mut lk);
+        t.insert(&Key::sub(b"k", i), lk, [1u8; 32], vec![i as u8], rng)
+    }
+
+    #[test]
+    fn stash_items_keep_random_slots() {
+        let mut rng = StdRng::seed_from_u64(1);
+        // a tiny table so that insertions reach the stash
+        let mut t = Table::new(prm(6, 24), &mut rng);
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut first_slots = HashSet::new();
+        for i in 0..20 {
+            let o = ins(&mut t, i, &mut rng);
+            assert!(!o.overflow);
+            t.check_invariants();
+            let slots = t.stash_slots(&mut rng);
+            assert_eq!(slots.len(), 24);
+            for (p, k) in slots.iter().enumerate() {
+                if let Some(k) = k {
+                    let e = *seen.entry(k.clone()).or_insert(p);
+                    assert_eq!(e, p, "a stash item changed its slot");
+                }
+            }
+            assert_eq!(t.encrypt_stash(&mut rng).len(), 24 * t.prm.slot_bytes());
+        }
+        for (_, &p) in &seen {
+            first_slots.insert(p);
+        }
+        assert!(t.stash_len() >= 8);
+        // not simply the first slots
+        assert!(first_slots.iter().any(|&p| p >= t.stash_len()));
+    }
+
+    #[test]
+    fn stash_only_map_is_reshuffled() {
+        let mut rng = StdRng::seed_from_u64(2);
+        let mut t = Table::new(prm(0, 16), &mut rng);
+        for i in 0..3 {
+            ins(&mut t, i, &mut rng);
+        }
+        let mut layouts = HashSet::new();
+        for _ in 0..40 {
+            let l: Vec<bool> = t.stash_slots(&mut rng).iter().map(|x| x.is_some()).collect();
+            assert_eq!(l.iter().filter(|x| **x).count(), 3);
+            layouts.insert(l);
+        }
+        assert!(layouts.len() > 10, "a stash-only map must be stored in a fresh random order");
+    }
+
+    #[test]
+    fn overflow_halts() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut t = Table::new(prm(0, 3), &mut rng);
+        for i in 0..3 {
+            assert!(!ins(&mut t, i, &mut rng).overflow);
+        }
+        assert!(!t.halted);
+        let o = ins(&mut t, 3, &mut rng);
+        assert!(o.overflow && t.halted && t.overflow == 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.encrypt_stash(&mut rng)));
+        assert!(r.is_err(), "a halted stash must not be sent (it would exceed sigma)");
     }
 }

@@ -19,8 +19,9 @@
 //!
 //! Schedules (all public; they depend only on the number of log appends):
 //! * `Policy::Batched{b, k, theta, age}`: every `b` appends the owner runs
-//!   exactly `k` ValMap operations (dummies pad) and appends exactly `k` flush
-//!   records (dummies pad). Keyword w is due once it has `theta` pending
+//!   exactly `k` ValMap operations (dummies pad), executed in a uniformly
+//!   random order, and appends exactly `k` flush records (dummies pad), also
+//!   in a uniformly random order. Keyword w is due once it has `theta` pending
 //!   postings or its oldest pending posting is `age` batches old; due keywords
 //!   are served first-due-first. Whether w is due depends only on w's own
 //!   history; serving more than `k` operations in one batch is a K-overflow
@@ -28,15 +29,29 @@
 //!   `b = 1, k = 1` is the old one-operation-per-insertion design.
 //! * `Policy::Rebuild{r}`: no flushes; a major compaction every `r` appends
 //!   (the static-PIR-plus-rebuild baseline).
-//! * Major compaction every `major_every` appends (and whenever the DocMap
-//!   runs out of never-used rows): ValMap is rebuilt from all postings with
-//!   tombstones applied (sequential disciplined Encode), and the log restarts
-//!   in a new epoch with one flush record per keyword (padded to `kw_pad`)
-//!   and the current version of every document. Nothing is pending after a
-//!   major compaction, so the compacted log has a public size.
+//! * Major compaction (a rebuild) every `major_every` appends, and otherwise
+//!   only on a public counter: the DocMap has fewer never-written rows than a
+//!   write needs (rows layout), or the version map of the stateless DocMap
+//!   has no slot left for an edit or removal (fixed layout). A stash overflow
+//!   never triggers a rebuild: it is a public failure and the structure halts.
+//!   A rebuild reveals nothing beyond this schedule:
+//!     - ValMap: exactly `val_cap` items are encoded (live chunks plus filler
+//!       items under fresh random keys, in one uniformly random order); reuse
+//!       mode frees the fillers right after the Encode, keep mode keeps them.
+//!       Chunk keys carry the epoch, so every lookup key is fresh per epoch.
+//!     - DocMap (rows): a repack re-places live chunks at random rows and
+//!       reserves `doc_live_cap - live` rows, so exactly `doc_rows -
+//!       doc_live_cap` never-written rows remain. A repack happens when a
+//!       write lacks never-written rows, or at a scheduled rebuild when fewer
+//!       than `doc_repack_below` remain.
+//!     - DocMap (fixed, stateless): re-encoded under the new epoch with
+//!       exactly `doc_live_cap` items (fillers as for ValMap).
+//!     - Log: a snapshot of exactly `kw_pad` flush records and `ver_cap`
+//!       version records (current versions of live documents, dummies pad),
+//!       in a uniformly random order.
 
 use crate::pir_backend::{frodo_hint_bytes, frodo_row_delta_bytes};
-use crate::uokvs::{derive, Key, OpOut, OwnerKeys, Params, Table, UpdateMode, CHECK, K32, META, NONCE};
+use crate::uokvs::{derive, Key, OpOut, OwnerKeys, Params, Table, CHECK, K32, META, NONCE};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -55,9 +70,12 @@ pub enum Policy {
 pub enum DocLayout {
     Rows,
     Cuckoo,
-    /// UOKVS keyed `(id, j)`; edits and removals are invalidation-mode
-    /// updates (the highest version wins), so clients need no version records.
-    /// Used by the stateless client model.
+    /// UOKVS keyed `(id, (epoch, u, j))` without version records in the log
+    /// (the stateless client model): version u = 0 of every live document is
+    /// encoded at each rebuild; an edit inserts the new version's chunks under
+    /// fresh keys (reuse mode frees the old ones), a removal frees them, and
+    /// both record (id, u, n_id | deleted) in a padded stash-only version map
+    /// that clients download with every search.
     Fixed,
 }
 
@@ -93,6 +111,21 @@ pub struct LogCfg {
     /// the pending-posting stash (padded to `pend_pad`). DocMap is `Fixed`.
     pub stateless: bool,
     pub pend_pad: usize,
+    /// public number of ValMap items encoded at every rebuild (live chunks +
+    /// fillers); more live chunks than this is a capacity failure (panic)
+    pub val_cap: usize,
+    /// public cap on live DocMap chunks at a repack/rebuild (rows layout: the
+    /// repack leaves `doc_rows - doc_live_cap` never-written rows; fixed
+    /// layout: the DocMap Encode has exactly this many items)
+    pub doc_live_cap: usize,
+    /// rows layout: a scheduled rebuild also repacks the DocMap when fewer
+    /// never-written rows than this remain (0 = only when a write needs it)
+    pub doc_repack_below: usize,
+    /// public number of document version records in a log snapshot
+    pub ver_cap: usize,
+    /// fixed layout: slots of the padded version map (one per edit or removal
+    /// in an epoch); a rebuild runs when an edit or removal finds it full
+    pub vmap_pad: usize,
 }
 
 impl LogCfg {
@@ -130,6 +163,15 @@ impl LogCfg {
     pub fn pending_stash_bytes(&self) -> usize {
         self.pend_pad * self.record_bytes()
     }
+    /// The padded version map of the fixed DocMap layout (one record per slot),
+    /// downloaded with every search.
+    pub fn vmap_bytes(&self) -> usize {
+        if self.doc_layout == DocLayout::Fixed {
+            self.vmap_pad * self.record_bytes()
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +187,15 @@ enum Body {
     Flush { vc: u32 },
     DocVer { ver: u32, nch: u16, deleted: bool, rows: Vec<u32> },
     Dummy,
+}
+
+/// One planned ValMap chunk write of a batch: an insertion of a fresh key
+/// and, in reuse mode, the owner-local Free of the chunk it supersedes.
+struct ChunkWrite {
+    free: Option<Key>,
+    key: Key,
+    keys: (K32, K32),
+    val: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +228,10 @@ pub struct Doc {
     /// version records in the current epoch
     m: u32,
     keywords: Vec<u32>,
+    /// fixed layout: the DocMap keys of the current version are
+    /// `(id, (dk_ep, u, j))`; `u` counts versions within epoch `dk_ep`
+    u: u32,
+    dk_ep: u32,
 }
 
 /// What one owner action did, for accounting.
@@ -190,6 +245,8 @@ pub struct Action {
     pub compactions: usize,
     pub rebuilds: Vec<f64>,
     pub doc_compactions: usize,
+    /// fixed layout: refreshes of the padded version map (edits, removals)
+    pub vmap_refreshes: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -266,6 +323,23 @@ pub struct MkseLog {
     /// filler insertions and superseded chunks kept (reuse_freed = false)
     pub fillers: u64,
     pub superseded: u64,
+    /// fixed layout: version map (id -> (u, n_id, deleted)) of the documents
+    /// edited or removed in the current epoch, and the slots used (one per
+    /// edit or removal, a public count)
+    vmap: HashMap<u32, (u32, u16, bool)>,
+    pub vmap_ops: usize,
+    pub vmap_peak: usize,
+    /// a public failure (stash overflow of a table, or more pending postings
+    /// than the padded pending stash holds) halted the structure
+    pub halted: bool,
+    pub halt_reason: String,
+    /// largest number of live items a rebuild had to encode / place / write
+    /// (to check the public caps val_cap, doc_live_cap, ver_cap)
+    pub val_live_max: usize,
+    pub doc_live_max: usize,
+    pub ver_max: usize,
+    /// items passed to the last padded Encode (= its public cap)
+    pub last_encode: usize,
 }
 
 fn tag_of(k: &K32, dom: &[u8], epoch: u32, a: u64, b: u32) -> Tag {
@@ -314,6 +388,64 @@ impl MkseLog {
     }
     fn doc_key(id: u32, ver: u32, j: u16) -> Key {
         Key::sub(&id.to_le_bytes(), ((ver as u64) << 16) | j as u64)
+    }
+    /// fixed layout: chunk j of version u (within epoch ep) of document id
+    fn doc_key_fixed(id: u32, ep: u32, u: u32, j: u16) -> Key {
+        assert!(ep < 1 << 16, "too many epochs for the key encoding");
+        Key::sub(&id.to_le_bytes(), ((ep as u64) << 48) | ((u as u64) << 16) | j as u64)
+    }
+    fn halt(&mut self, why: String) {
+        if !self.halted {
+            self.halted = true;
+            self.halt_reason = why;
+        }
+    }
+    /// A table whose stash overflowed has halted; so does the whole structure.
+    fn check_tables(&mut self) {
+        if self.val.halted {
+            self.halt(format!("ValMap stash overflow (more than sigma = {} items) after {} appends", self.val.prm.sigma, self.total_appends));
+        }
+        if self.doc_table.as_ref().map_or(false, |t| t.halted) {
+            let sg = self.doc_table.as_ref().unwrap().prm.sigma;
+            self.halt(format!("DocMap stash overflow (more than sigma = {sg} items) after {} appends", self.total_appends));
+        }
+    }
+    fn assert_live(&self) {
+        assert!(!self.halted, "the structure halted after a public failure: {}", self.halt_reason);
+    }
+    /// Fresh random filler item (fresh random keys; never looked up).
+    fn filler<R: Rng>(&mut self, rng: &mut R) -> (Key, (K32, K32), Vec<u8>) {
+        self.fillers += 1;
+        let key = Key::sub(b"\0filler", self.fillers);
+        let mut lk = [0u8; 32];
+        let mut dk = [0u8; 32];
+        rng.fill(&mut lk);
+        rng.fill(&mut dk);
+        (key, (lk, dk), vec![])
+    }
+    /// Encode of a rebuilt table with exactly `cap` items: the live entries
+    /// padded with fillers, all in one uniformly random order. Reuse mode
+    /// frees the fillers (owner-local) right after the Encode; keep mode keeps
+    /// them, so the occupancy stays public all epoch.
+    fn encode_padded<R: Rng>(&mut self, prm: Params, mut entries: Vec<(Key, (K32, K32), Vec<u8>)>, cap: usize, what: &str, rng: &mut R) -> Table {
+        let live = entries.len();
+        assert!(live <= cap, "{what} capacity exceeded: {live} live items at a rebuild > public cap {cap}");
+        let mut fill = Vec::with_capacity(cap - live);
+        for _ in live..cap {
+            let f = self.filler(rng);
+            fill.push(f.0.clone());
+            entries.push(f);
+        }
+        entries.shuffle(rng);
+        self.last_encode = entries.len();
+        let mut t = Table::new(prm, rng);
+        t.encode(entries, rng);
+        if self.cfg.reuse_freed {
+            for k in &fill {
+                t.remove(k);
+            }
+        }
+        t
     }
     pub fn doc_nch(&self, len: usize) -> u16 {
         ((len + self.cfg.doc_row_bytes - 1) / self.cfg.doc_row_bytes).clamp(1, u16::MAX as usize) as u16
@@ -417,6 +549,15 @@ impl MkseLog {
             pend_pad_overflow: 0,
             fillers: 0,
             superseded: 0,
+            vmap: HashMap::new(),
+            vmap_ops: 0,
+            vmap_peak: 0,
+            halted: false,
+            halt_reason: String::new(),
+            val_live_max: 0,
+            doc_live_max: 0,
+            ver_max: 0,
+            last_encode: 0,
             cfg,
         };
         if s.cfg.doc_layout == DocLayout::Rows {
@@ -441,7 +582,7 @@ impl MkseLog {
             let len = *doc_len.get(&id).unwrap_or(&default_doc_len);
             let nch = s.doc_nch(len);
             let cap = s.kd.cap(&id.to_le_bytes());
-            let mut d = Doc { cap, ver: 0, nch, rows: vec![], deleted: false, m: 0, keywords: doc_kws.remove(&id).unwrap() };
+            let mut d = Doc { cap, ver: 0, nch, rows: vec![], deleted: false, m: 0, keywords: doc_kws.remove(&id).unwrap(), u: 0, dk_ep: 0 };
             match s.cfg.doc_layout {
                 DocLayout::Rows => {
                     for j in 0..nch {
@@ -452,7 +593,7 @@ impl MkseLog {
                 }
                 DocLayout::Cuckoo | DocLayout::Fixed => {
                     for j in 0..nch {
-                        let k = Self::doc_key(id, 0, j);
+                        let k = if s.cfg.doc_layout == DocLayout::Fixed { Self::doc_key_fixed(id, 0, 0, j) } else { Self::doc_key(id, 0, j) };
                         let keys = derive(&cap, k.idx);
                         cuckoo_entries.push((k, keys, vec![0u8; 1]));
                     }
@@ -460,8 +601,15 @@ impl MkseLog {
             }
             s.docs.insert(id, d);
         }
-        if let Some(t) = s.doc_table.as_mut() {
-            t.encode(cuckoo_entries, rng);
+        match s.cfg.doc_layout {
+            DocLayout::Cuckoo => s.doc_table.as_mut().unwrap().encode(cuckoo_entries, rng),
+            DocLayout::Fixed => {
+                // the same padded Encode as at every rebuild
+                s.doc_live_max = s.doc_live_max.max(cuckoo_entries.len());
+                let (prm, cap) = (s.cfg.doc.clone(), s.cfg.doc_live_cap);
+                s.doc_table = Some(s.encode_padded(prm, cuckoo_entries, cap, "DocMap (--doc-live-cap)", rng));
+            }
+            DocLayout::Rows => {}
         }
         // ValMap: canonical chunks (full chunks, then one partial chunk)
         let c = s.cfg.chunk_cap();
@@ -478,7 +626,11 @@ impl MkseLog {
             kw.n = ps.len() as u32;
             kw.committed = ps;
         }
-        s.val.encode(entries, rng);
+        // the same padded Encode (exactly val_cap items) as at every rebuild
+        s.val_live_max = s.val_live_max.max(entries.len());
+        let (prm, cap) = (s.cfg.val.clone(), s.cfg.val_cap);
+        s.val = s.encode_padded(prm, entries, cap, "ValMap (--val-cap)", rng);
+        s.check_tables();
         // initial log = epoch-0 snapshot
         s.write_snapshot(rng);
         s
@@ -505,48 +657,59 @@ impl MkseLog {
         i
     }
 
-    /// Writes a fresh log for the current epoch: one flush record per keyword
-    /// with postings (dummies pad to `kw_pad`), any pending postings (none
-    /// after a major compaction), and the current version of every document.
+    /// Writes a fresh log for the current epoch (nothing is pending after a
+    /// rebuild): exactly `kw_pad` flush records (one per keyword with
+    /// postings, dummies pad) and exactly `ver_cap` version records (the
+    /// current version of every live document; removed documents are dropped;
+    /// dummies pad), all in a uniformly random order. Its size is public.
     fn write_snapshot<R: Rng>(&mut self, rng: &mut R) {
+        assert_eq!(self.pend_total, 0, "a snapshot is written only when nothing is pending");
         self.log.clear();
         self.tag_ix.clear();
-        self.log_live_since_compaction = 0;
         let mut kw_records = 0usize;
-        let mut pend_records = 0usize;
         for w in 0..self.kws.len() as u32 {
             self.kws[w as usize].m = 0;
             if self.kws[w as usize].n == 0 {
                 continue;
             }
+            debug_assert!(self.kws[w as usize].pend.is_empty());
             self.append_flush(w);
             kw_records += 1;
-            let (cap, vc, pend) = {
-                let k = &self.kws[w as usize];
-                (k.cap_log, k.committed.len(), k.pend.iter().map(|x| x.0).collect::<Vec<_>>())
-            };
-            for (o, p) in pend.into_iter().enumerate() {
-                let t = tag_of(&cap, b"post", self.epoch, (vc + o) as u64, 0);
-                self.push_rec(t, Body::Post(p));
-                pend_records += 1;
-            }
         }
+        assert!(kw_records <= self.cfg.kw_pad, "snapshot needs {kw_records} flush records > kw_pad = {}", self.cfg.kw_pad);
         for _ in kw_records..self.cfg.kw_pad {
             self.append_dummy(rng);
         }
         let mut ids: Vec<u32> = self.docs.keys().copied().collect();
         ids.sort_unstable();
-        let mut doc_records = 0usize;
+        let mut ver_records = 0usize;
         for id in ids {
-            self.docs.get_mut(&id).unwrap().m = 0;
-            doc_records += self.cfg.doc_records(self.docs[&id].nch as usize);
+            let d = self.docs.get_mut(&id).unwrap();
+            d.m = 0;
+            if d.deleted {
+                continue;
+            }
+            ver_records += self.cfg.doc_records(d.nch as usize);
             self.append_doc_version(id);
         }
-        // leakage check: with nothing pending, the compacted log has the public
-        // size kw_pad + (records of every document ever inserted)
-        if pend_records == 0 && kw_records <= self.cfg.kw_pad {
-            assert_eq!(self.log.len(), self.cfg.kw_pad + doc_records);
+        self.ver_max = self.ver_max.max(ver_records);
+        assert!(
+            ver_records <= self.cfg.ver_cap,
+            "log snapshot capacity exceeded: {ver_records} version records of live documents > ver_cap = {}; raise --ver-cap",
+            self.cfg.ver_cap
+        );
+        for _ in ver_records..self.cfg.ver_cap {
+            self.append_dummy(rng);
         }
+        // one uniformly random order; clients find records by tag
+        self.log.shuffle(rng);
+        self.tag_ix.clear();
+        for (i, r) in self.log.iter().enumerate() {
+            if !matches!(r.body, Body::Dummy) {
+                self.tag_ix.insert(r.tag, i);
+            }
+        }
+        assert_eq!(self.log.len(), self.cfg.kw_pad + self.cfg.ver_cap, "the snapshot size must be public");
         self.compacted_records = self.log.len();
         self.log_live_since_compaction = 0;
     }
@@ -558,12 +721,18 @@ impl MkseLog {
         self.since_batch += 1;
         self.since_major += 1;
         act.appends += 1;
+        if self.halted {
+            return;
+        }
         let major_every = match self.cfg.policy {
             Policy::Batched { b, k, .. } => {
                 if k > 0 && self.since_batch >= b {
                     self.since_batch = 0;
                     let bo = self.run_batch(rng);
                     act.batches.push(bo);
+                    if self.halted {
+                        return;
+                    }
                 }
                 self.cfg.major_every
             }
@@ -574,15 +743,65 @@ impl MkseLog {
         }
     }
 
-    /// Major compaction: rebuild ValMap (all postings, tombstones applied)
-    /// and rewrite the log in a new epoch.
+    /// Scheduled major compaction (a rebuild): rebuild ValMap (all postings,
+    /// tombstones applied, padded to `val_cap`), repack the DocMap if fewer
+    /// than `doc_repack_below` never-written rows remain (rows layout) or
+    /// re-encode it (fixed layout), and rewrite the log in a new epoch.
     pub fn major<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
+        self.major_inner(false, act, rng);
+    }
+
+    /// `repack`: the DocMap lacks never-written rows for a write (public).
+    fn major_inner<R: Rng>(&mut self, repack: bool, act: &mut Action, rng: &mut R) {
         let t = Instant::now();
         self.since_major = 0;
+        if self.cfg.doc_layout == DocLayout::Rows && (repack || self.virgin.len() < self.cfg.doc_repack_below) {
+            self.compact_docmap(rng);
+            act.doc_compactions += 1;
+        }
         self.rebuild_val(rng);
+        if self.cfg.doc_layout == DocLayout::Fixed {
+            self.rebuild_doc(rng);
+            act.doc_compactions += 1;
+        }
         self.compact(rng);
+        self.check_tables();
         act.rebuilds.push(t.elapsed().as_secs_f64() * 1e3);
         act.compactions += 1;
+    }
+
+    /// Rows layout: before a write of `n` chunks, rebuild (with a DocMap
+    /// repack) if fewer than `n` never-written rows remain. Both counts are
+    /// public: every write reveals its chunk count, and a repack resets the
+    /// never-written rows to `doc_rows - doc_live_cap`.
+    fn ensure_doc_rows<R: Rng>(&mut self, n: usize, act: &mut Action, rng: &mut R) {
+        if self.cfg.doc_layout == DocLayout::Rows && self.virgin.len() < n {
+            self.major_inner(true, act, rng);
+            assert!(
+                self.virgin.len() >= n,
+                "DocMap too small even after a repack ({} never-written rows, {n} needed); raise --doc-spare or lower --doc-live-cap",
+                self.virgin.len()
+            );
+        }
+    }
+
+    /// Fixed layout: an edit or removal takes a version-map slot; rebuild
+    /// first if none is left (the slot count is public).
+    fn ensure_vmap_slot<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
+        if self.cfg.doc_layout == DocLayout::Fixed {
+            if self.vmap_ops >= self.cfg.vmap_pad {
+                self.major_inner(false, act, rng);
+            }
+            assert!(self.vmap_ops < self.cfg.vmap_pad, "--vmap-pad must be at least 1");
+            self.vmap_ops += 1;
+        }
+    }
+
+    fn set_vmap(&mut self, id: u32, e: (u32, u16, bool), act: &mut Action) {
+        self.vmap.insert(id, e);
+        assert!(self.vmap.len() <= self.vmap_ops.max(1), "version map holds more entries than slots used");
+        self.vmap_peak = self.vmap_peak.max(self.vmap.len());
+        act.vmap_refreshes += 1;
     }
 
     fn add_posting<R: Rng>(&mut self, w: u32, p: Posting, act: &mut Action, rng: &mut R) {
@@ -604,6 +823,7 @@ impl MkseLog {
 
     /// Inserts posting (w, id); a new id also inserts the document.
     pub fn insert<R: Rng>(&mut self, w: &str, id: u32, doc_len: usize, rng: &mut R) -> Action {
+        self.assert_live();
         let mut act = Action::default();
         let wi = self.kw_index(w);
         if !self.docs.contains_key(&id) || self.docs[&id].deleted {
@@ -613,26 +833,24 @@ impl MkseLog {
         d.keywords.push(wi);
         let nch = d.nch;
         self.add_posting(wi, Posting { id, nch, tomb: false }, &mut act, rng);
+        self.check_tables();
         act
     }
 
     pub fn delete_posting<R: Rng>(&mut self, w: &str, id: u32, rng: &mut R) -> Action {
+        self.assert_live();
         let mut act = Action::default();
         let wi = self.kw_index(w);
         if let Some(d) = self.docs.get_mut(&id) {
             d.keywords.retain(|&x| x != wi);
         }
         self.add_posting(wi, Posting { id, nch: 0, tomb: true }, &mut act, rng);
+        self.check_tables();
         act
     }
 
-    fn alloc_rows<R: Rng>(&mut self, n: usize, act: &mut Action, rng: &mut R) -> Vec<u32> {
-        if self.virgin.len() < n {
-            self.compact_docmap(rng);
-            act.doc_compactions += 1;
-            self.major(act, rng);
-            assert!(self.virgin.len() >= n, "DocMap too small even after compaction; raise --doc-spare");
-        }
+    fn alloc_rows(&mut self, n: usize) -> Vec<u32> {
+        assert!(self.virgin.len() >= n, "DocMap write without enough never-written rows (ensure_doc_rows not called)");
         (0..n).map(|_| self.virgin.pop().unwrap()).collect()
     }
 
@@ -643,7 +861,7 @@ impl MkseLog {
         };
         match self.cfg.doc_layout {
             DocLayout::Rows => {
-                let rows = self.alloc_rows(nch as usize, act, rng);
+                let rows = self.alloc_rows(nch as usize);
                 for (j, &r) in rows.iter().enumerate() {
                     self.doc_rows[r as usize] = Some((id, j as u16));
                     act.doc_rows_written.push(r as usize);
@@ -659,25 +877,33 @@ impl MkseLog {
                 }
             }
             DocLayout::Fixed => {
+                // a fresh version u of the current epoch: fresh keys (id, (ep, u, j))
+                let ep = self.val_epoch;
+                let u = {
+                    let d = self.docs.get_mut(&id).unwrap();
+                    d.u = if d.dk_ep == ep { d.u + 1 } else { 0 };
+                    d.dk_ep = ep;
+                    d.u
+                };
                 let t = self.doc_table.as_mut().unwrap();
                 for j in 0..nch {
-                    let k = Self::doc_key(id, 0, j);
-                    let v = vec![(ver % 251) as u8; 1];
-                    if t.contains(&k) {
-                        act.doc_ops.push(t.update(&k, v, false, UpdateMode::Invalidation, rng));
-                    } else {
-                        let (lk, dk) = derive(&cap, k.idx);
-                        act.doc_ops.push(t.insert(&k, lk, dk, v, rng));
-                    }
+                    let k = Self::doc_key_fixed(id, ep, u, j);
+                    let (lk, dk) = derive(&cap, k.idx);
+                    act.doc_ops.push(t.insert(&k, lk, dk, vec![(ver % 251) as u8; 1], rng));
+                }
+                // version 0 of an epoch is the default; later ones (edits, a
+                // re-insertion after a removal in this epoch) are announced
+                if u > 0 {
+                    self.set_vmap(id, (u, nch, false), act);
                 }
             }
         }
     }
 
     fn free_doc_chunks(&mut self, id: u32) {
-        let (nch, ver, rows) = {
+        let (nch, ver, rows, u, ep) = {
             let d = &self.docs[&id];
-            (d.nch, d.ver, d.rows.clone())
+            (d.nch, d.ver, d.rows.clone(), d.u, d.dk_ep)
         };
         match self.cfg.doc_layout {
             DocLayout::Rows => {
@@ -692,24 +918,30 @@ impl MkseLog {
                     t.remove(&Self::doc_key(id, ver, j));
                 }
             }
-            // fixed keys are overwritten by the next version (or a tombstone)
-            DocLayout::Fixed => {}
+            // owner-local Free of the old version (reuse mode); keep mode
+            // leaves it until the next rebuild
+            DocLayout::Fixed => {
+                if self.cfg.reuse_freed {
+                    let t = self.doc_table.as_mut().unwrap();
+                    for j in 0..nch {
+                        let removed = t.remove(&Self::doc_key_fixed(id, ep, u, j));
+                        debug_assert!(removed, "missing DocMap chunk {id}/{ep}/{u}/{j}");
+                    }
+                } else {
+                    self.superseded += nch as u64;
+                }
+            }
         }
         self.docs.get_mut(&id).unwrap().rows.clear();
     }
 
     fn insert_doc<R: Rng>(&mut self, id: u32, len: usize, act: &mut Action, rng: &mut R) {
-        let mut nch = self.doc_nch(len);
-        if self.cfg.doc_layout == DocLayout::Fixed {
-            // fixed keys: a re-inserted identifier keeps its chunk count
-            if let Some(d) = self.docs.get(&id) {
-                nch = d.nch;
-            }
-        }
-        let prev = self.docs.get(&id).map(|d| (d.ver, d.m));
+        let nch = self.doc_nch(len);
+        self.ensure_doc_rows(nch as usize, act, rng);
+        let prev = self.docs.get(&id).map(|d| (d.ver, d.m, d.u, d.dk_ep));
         let cap = self.kd.cap(&id.to_le_bytes());
-        let (ver, m) = prev.map(|(v, m)| (v + 1, m)).unwrap_or((0, 0));
-        self.docs.insert(id, Doc { cap, ver, nch, rows: vec![], deleted: false, m, keywords: vec![] });
+        let (ver, m, u, dk_ep) = prev.map(|(v, m, u, e)| (v + 1, m, u, e)).unwrap_or((0, 0, 0, u32::MAX));
+        self.docs.insert(id, Doc { cap, ver, nch, rows: vec![], deleted: false, m, keywords: vec![], u, dk_ep });
         self.write_doc_chunks(id, act, rng);
         self.append_doc_version(id);
         for _ in 0..self.cfg.doc_records(nch as usize) {
@@ -719,18 +951,15 @@ impl MkseLog {
 
     /// Replaces a document's content (new length `len`).
     pub fn update_doc<R: Rng>(&mut self, id: u32, len: usize, rng: &mut R) -> Action {
+        self.assert_live();
         let mut act = Action::default();
         if self.docs.get(&id).map_or(true, |d| d.deleted) {
             return act;
         }
+        let nch = self.doc_nch(len);
+        self.ensure_doc_rows(nch as usize, &mut act, rng);
+        self.ensure_vmap_slot(&mut act, rng);
         self.free_doc_chunks(id);
-        let nch = if self.cfg.doc_layout == DocLayout::Fixed {
-            // fixed keys: an edit keeps the chunk count (padded or truncated),
-            // so it does not even reveal the new length
-            self.docs[&id].nch
-        } else {
-            self.doc_nch(len)
-        };
         {
             let d = self.docs.get_mut(&id).unwrap();
             d.ver += 1;
@@ -741,29 +970,30 @@ impl MkseLog {
         for _ in 0..self.cfg.doc_records(nch as usize) {
             self.tick(&mut act, rng);
         }
+        self.check_tables();
         act
     }
 
-    /// Deletes a document: a version record marks it deleted, its postings get
-    /// tombstones, its chunks are freed (no server-visible write).
+    /// Deletes a document: a version record (or, fixed layout, a version-map
+    /// entry) marks it deleted, its postings get tombstones, its chunks are
+    /// freed (no server-visible write).
     pub fn delete_doc<R: Rng>(&mut self, id: u32, rng: &mut R) -> Action {
+        self.assert_live();
         let mut act = Action::default();
         if self.docs.get(&id).map_or(true, |d| d.deleted) {
             return act;
         }
-        if self.cfg.doc_layout == DocLayout::Fixed {
-            let nch = self.docs[&id].nch;
-            let t = self.doc_table.as_mut().unwrap();
-            for j in 0..nch {
-                act.doc_ops.push(t.update(&Self::doc_key(id, 0, j), vec![], true, UpdateMode::Invalidation, rng));
-            }
-        }
+        self.ensure_vmap_slot(&mut act, rng);
         self.free_doc_chunks(id);
         let kws = {
             let d = self.docs.get_mut(&id).unwrap();
             d.deleted = true;
             std::mem::take(&mut d.keywords)
         };
+        if self.cfg.doc_layout == DocLayout::Fixed {
+            let (u, nch) = (self.docs[&id].u, self.docs[&id].nch);
+            self.set_vmap(id, (u, nch, true), &mut act);
+        }
         let nch = self.docs[&id].nch as usize;
         self.append_doc_version(id);
         for _ in 0..self.cfg.doc_records(nch) {
@@ -772,6 +1002,7 @@ impl MkseLog {
         for w in kws {
             self.add_posting(w, Posting { id, nch: 0, tomb: true }, &mut act, rng);
         }
+        self.check_tables();
         act
     }
 
@@ -799,15 +1030,16 @@ impl MkseLog {
         }
         due.sort_unstable();
         let mut out = BatchOut { index: now, due: due.len(), ..Default::default() };
-        let mut ops_left = k;
+        // 1. plan the K operations (owner state advances; nothing is executed yet)
+        let mut plan: Vec<Option<ChunkWrite>> = Vec::with_capacity(k);
         let mut served: Vec<u32> = Vec::new();
         for &(_, w) in &due {
-            if ops_left == 0 {
+            let left = k - plan.len();
+            if left == 0 {
                 out.deferred += 1;
                 continue;
             }
-            let (ops, moved) = self.flush_kw(w, ops_left, rng, &mut out.accessed);
-            ops_left -= ops;
+            let (ops, moved) = self.flush_kw(w, left, &mut plan);
             out.real_ops += ops;
             out.postings_flushed += moved;
             if ops > 0 {
@@ -817,46 +1049,66 @@ impl MkseLog {
                 out.deferred += 1;
             }
         }
-        for _ in 0..ops_left {
-            let o = if self.cfg.reuse_freed {
-                self.val.dummy(rng)
-            } else {
-                // filler insertion of a fresh random key, dropped at compaction
-                self.fillers += 1;
-                let key = Key::sub(b"\0filler", self.fillers);
-                let mut lk = [0u8; 32];
-                let mut dk = [0u8; 32];
-                rng.fill(&mut lk);
-                rng.fill(&mut dk);
-                self.val.insert(&key, lk, dk, vec![], rng)
-            };
-            out.accessed.extend_from_slice(&o.accessed);
+        // padding: Dummy (reuse) or a filler insertion (keep)
+        while plan.len() < k {
+            plan.push(None);
             out.dummy_ops += 1;
         }
+        // 2. execute them in a uniformly random order
+        plan.shuffle(rng);
+        for op in plan {
+            let o = match op {
+                Some(c) => {
+                    if let Some(old) = c.free {
+                        let removed = self.val.remove(&old);
+                        debug_assert!(removed, "missing chunk {old:?}");
+                    }
+                    self.val.insert(&c.key, c.keys.0, c.keys.1, c.val, rng)
+                }
+                None if self.cfg.reuse_freed => self.val.dummy(rng),
+                None => {
+                    // filler insertion of a fresh random key, dropped at compaction
+                    let (key, (lk, dk), v) = self.filler(rng);
+                    self.val.insert(&key, lk, dk, v, rng)
+                }
+            };
+            out.accessed.extend_from_slice(&o.accessed);
+        }
+        // 3. exactly K flush records (dummies pad), in a uniformly random order
         out.keywords_served = served.len();
         assert!(served.len() <= k);
-        for &w in &served {
-            self.append_flush(w);
-        }
-        for _ in served.len()..k {
-            self.append_dummy(rng);
+        let mut recs: Vec<Option<u32>> = served.iter().map(|&w| Some(w)).collect();
+        recs.resize(k, None);
+        recs.shuffle(rng);
+        for r in recs {
+            match r {
+                Some(w) => self.append_flush(w),
+                None => self.append_dummy(rng),
+            }
         }
         if self.cfg.stateless && self.pend_total > self.cfg.pend_pad {
+            // the padded pending stash cannot grow: a public failure
             self.pend_pad_overflow += 1;
+            self.halt(format!(
+                "pending stash overflow ({} pending postings > pend_pad = {}) after {} appends",
+                self.pend_total, self.cfg.pend_pad, self.total_appends
+            ));
         }
         if out.deferred > 0 {
             self.k_overflow_batches += 1;
             self.deferred_total += out.deferred;
         }
         assert_eq!(out.accessed.len(), k * self.cfg.val.accesses_per_op(), "a batch must make exactly k(alpha+1) accesses");
+        self.check_tables();
         out.owner_ms = t.elapsed().as_secs_f64() * 1e3;
         out
     }
 
-    /// Commits pending postings of w using at most `budget` ValMap operations:
-    /// first fills the partial last chunk (a fresh key (w, i, len')), then
-    /// starts new chunks. Returns (operations, postings committed).
-    fn flush_kw<R: Rng>(&mut self, w: u32, budget: usize, rng: &mut R, acc: &mut Vec<usize>) -> (usize, usize) {
+    /// Plans the commit of w's pending postings with at most `budget` ValMap
+    /// operations (appended to `plan`): first the partial last chunk (a fresh
+    /// key (w, i, len'); reuse mode frees the old one), then new chunks.
+    /// Returns (operations, postings committed).
+    fn flush_kw(&mut self, w: u32, budget: usize, plan: &mut Vec<Option<ChunkWrite>>) -> (usize, usize) {
         let c = self.cfg.chunk_cap();
         let mut ops = 0;
         let mut moved = 0;
@@ -868,10 +1120,9 @@ impl MkseLog {
             let i = vc / c;
             let have = vc % c;
             let take = (c - have).min(npend);
+            let mut free = None;
             if have > 0 && self.cfg.reuse_freed {
-                let old = self.chunk_key(&name, i, have);
-                let removed = self.val.remove(&old);
-                debug_assert!(removed, "missing chunk {name}/{i}/{have}");
+                free = Some(self.chunk_key(&name, i, have));
             } else if have > 0 {
                 self.superseded += 1;
             }
@@ -879,9 +1130,8 @@ impl MkseLog {
             let drained: Vec<(Posting, u64)> = self.kws[w as usize].pend.drain(..take).collect();
             content.extend(drained.iter().map(|x| x.0));
             let key = self.chunk_key(&name, i, have + take);
-            let (lk, dk) = self.chunk_keys(&self.kws[w as usize], &key);
-            let o = self.val.insert(&key, lk, dk, enc_postings(&content, self.cfg.posting_bytes), rng);
-            acc.extend_from_slice(&o.accessed);
+            let keys = self.chunk_keys(&self.kws[w as usize], &key);
+            plan.push(Some(ChunkWrite { free, key, keys, val: enc_postings(&content, self.cfg.posting_bytes) }));
             let kw = &mut self.kws[w as usize];
             kw.committed.extend(drained.iter().map(|x| x.0));
             ops += 1;
@@ -903,11 +1153,19 @@ impl MkseLog {
         self.write_snapshot(rng);
     }
 
-    /// Re-places every live document chunk in a fresh random order of rows;
-    /// all rows are rewritten (clients take a fresh DocMap hint). The caller
-    /// runs a major compaction so version records carry the new row numbers.
+    /// Repack (only inside a rebuild): re-places every live document chunk at
+    /// uniformly random rows, all rows are rewritten (clients take a fresh
+    /// DocMap hint), and `doc_live_cap - live` further rows are reserved as
+    /// unusable until the next repack, so exactly `doc_rows - doc_live_cap`
+    /// never-written rows remain (a public number). The caller rebuilds and
+    /// writes a log snapshot so version records carry the new row numbers.
     pub fn compact_docmap<R: Rng>(&mut self, rng: &mut R) {
         let n = self.doc_rows.len();
+        let cap = self.cfg.doc_live_cap;
+        assert!(cap <= n, "doc_live_cap {cap} > DocMap rows {n}");
+        let live: usize = self.docs.values().filter(|d| !d.deleted).map(|d| d.nch as usize).sum();
+        self.doc_live_max = self.doc_live_max.max(live);
+        assert!(live <= cap, "DocMap capacity exceeded: {live} live chunks at a repack > doc_live_cap = {cap}; raise --doc-live-cap");
         let mut perm: Vec<u32> = (0..n as u32).collect();
         perm.shuffle(rng);
         self.doc_rows = vec![None; n];
@@ -926,12 +1184,16 @@ impl MkseLog {
             }
             d.rows = rows;
         }
+        // reserve cap - live rows: never written, but not usable before the next repack
+        perm.truncate(n - cap);
         self.virgin = perm;
         self.doc_freed = 0;
+        debug_assert_eq!(self.virgin.len(), n - cap);
     }
 
-    /// Static rebuild of ValMap (baseline): every keyword's postings, with
-    /// tombstones applied, re-chunked canonically into a new table.
+    /// Rebuild of ValMap: every keyword's postings, with tombstones applied,
+    /// re-chunked canonically under the new epoch's chunk keys, padded with
+    /// fillers to exactly `val_cap` items (one uniformly random order).
     pub fn rebuild_val<R: Rng>(&mut self, rng: &mut R) {
         self.val_epoch += 1;
         let c = self.cfg.chunk_cap();
@@ -958,8 +1220,38 @@ impl MkseLog {
         }
         self.pending_kws.clear();
         self.pend_total = 0;
-        self.val = Table::new(self.cfg.val.clone(), rng);
-        self.val.encode(entries, rng);
+        self.val_live_max = self.val_live_max.max(entries.len());
+        let (prm, cap) = (self.cfg.val.clone(), self.cfg.val_cap);
+        self.val = self.encode_padded(prm, entries, cap, "ValMap (--val-cap)", rng);
+    }
+
+    /// Fixed layout: re-encode the DocMap under the new epoch (call after
+    /// `rebuild_val`): every live document at version u = 0 with its current
+    /// chunk count, padded with fillers to exactly `doc_live_cap` items; the
+    /// version map is cleared.
+    fn rebuild_doc<R: Rng>(&mut self, rng: &mut R) {
+        let ep = self.val_epoch;
+        let mut ids: Vec<u32> = self.docs.keys().copied().collect();
+        ids.sort_unstable();
+        let mut entries = Vec::new();
+        for id in ids {
+            let d = self.docs.get_mut(&id).unwrap();
+            if d.deleted {
+                continue;
+            }
+            d.u = 0;
+            d.dk_ep = ep;
+            for j in 0..d.nch {
+                let k = Self::doc_key_fixed(id, ep, 0, j);
+                let keys = derive(&d.cap, k.idx);
+                entries.push((k, keys, vec![(d.ver % 251) as u8; 1]));
+            }
+        }
+        self.doc_live_max = self.doc_live_max.max(entries.len());
+        let (prm, cap) = (self.cfg.doc.clone(), self.cfg.doc_live_cap);
+        self.doc_table = Some(self.encode_padded(prm, entries, cap, "DocMap (--doc-live-cap)", rng));
+        self.vmap.clear();
+        self.vmap_ops = 0;
     }
 
     // ------------------------------------------------------------ client
@@ -1026,15 +1318,32 @@ impl MkseLog {
         out.chunks_queried = total_chunks;
         all.extend(pending);
         out.ids = apply_tombstones(&all);
+        // chunk count carried by each live posting (the latest one wins)
+        let mut nch_of: HashMap<u32, u16> = HashMap::new();
+        for p in &all {
+            if !p.tomb {
+                nch_of.insert(p.id, p.nch);
+            }
+        }
         // 4. documents: latest version record from the log
         for &id in &out.ids {
             let d = &self.docs[&id];
             let before = out.doc_queries.len();
             if self.cfg.doc_layout == DocLayout::Fixed {
-                // the chunk count comes with the posting; the newest copy wins
+                // the version map (downloaded with the search) names the
+                // version of a document edited or removed in this epoch;
+                // otherwise it is version 0 with the posting's chunk count
+                let (u, n) = match self.vmap.get(&id) {
+                    Some(&(u, n, del)) => {
+                        assert!(!del, "search returned a removed document");
+                        (u, n)
+                    }
+                    None => (0, nch_of[&id]),
+                };
+                assert_eq!(n, d.nch, "stale chunk count for document {id}");
                 let t = self.doc_table.as_ref().unwrap();
-                for j in 0..d.nch {
-                    let k = Self::doc_key(id, 0, j);
+                for j in 0..n {
+                    let k = Self::doc_key_fixed(id, self.val_epoch, u, j);
                     let (lk, _) = derive(&d.cap, k.idx);
                     let (_, tomb) = t.lookup(&k, &lk).expect("document chunk missing");
                     assert!(!tomb, "search returned a removed document");
@@ -1436,7 +1745,7 @@ impl Profile {
             if self.dirty { m.cfg.volmap_bytes() + m.cfg.pending_stash_bytes() } else { 0 }
         } else {
             self.log_bytes
-        };
+        } + m.cfg.vmap_bytes(); // fixed DocMap layout: the padded version map, with every search
         let (vp, dp) = (m.val_pir(), m.doc_pir());
         for (c, &(kv, kd)) in PIR_COMBOS.iter().enumerate() {
             let pp = |k: PirKind, q: usize| if k == PirKind::Ypir { ypir_pp_bytes(q) } else { 0 };
@@ -1477,4 +1786,285 @@ pub fn median(v: &[usize]) -> usize {
     let mut h = v.to_vec();
     h.sort_unstable();
     h.get(h.len() / 2).copied().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uokvs::{Discipline, Evict};
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    const DOC_ROW: usize = 512;
+
+    fn prm(mu: usize, val_len: usize, sigma: usize) -> Params {
+        Params { mu, p: 1, s: 4, alpha: 20, sigma, evict: Evict::Bfs, disc: Discipline::Paper, bfs_max_branch: 2, bfs_max_depth: 64, val_len }
+    }
+
+    /// 40 keywords over 300 documents (setup: the first 200).
+    fn data(rng: &mut StdRng) -> (Vec<(String, Vec<u32>)>, Vec<(String, u32)>, Vec<String>) {
+        let kws: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        let mut mm: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut later = Vec::new();
+        for d in 1..=300u32 {
+            let mut ws: Vec<usize> = (0..40).collect();
+            ws.shuffle(rng);
+            for &w in ws.iter().take(rng.gen_range(2..7)) {
+                if d <= 200 {
+                    mm.entry(kws[w].clone()).or_default().push(d);
+                } else {
+                    later.push((kws[w].clone(), d));
+                }
+            }
+        }
+        let mut mm: Vec<(String, Vec<u32>)> = mm.into_iter().collect();
+        mm.sort();
+        (mm, later, kws)
+    }
+
+    fn cfg(layout: DocLayout, reuse: bool, stateless: bool) -> LogCfg {
+        let val_len = 1024 - NONCE - META - CHECK;
+        let c = val_len / 40;
+        // chunks of all 300 documents (about 4.5 keywords each), with slack
+        let chunks = 40 * ((300 * 9 / 2 / 40) * 3 / 2 / c + 1);
+        let mu = 3 * chunks;
+        let mu = if reuse { mu } else { mu * 13 / 10 };
+        let policy = if stateless {
+            Policy::Batched { b: 10, k: 12, theta: 1, age: usize::MAX / 4 }
+        } else {
+            Policy::Batched { b: 20, k: 6, theta: 10, age: 5 }
+        };
+        LogCfg {
+            val: prm(mu, val_len, 16),
+            posting_bytes: 40,
+            policy,
+            major_every: 400,
+            doc_layout: layout,
+            doc: prm(4000, DOC_ROW, 32),
+            doc_row_bytes: DOC_ROW,
+            doc_rows: 2600,
+            record_body: 40,
+            kw_pad: 40,
+            reuse_freed: reuse,
+            stateless,
+            pend_pad: 20,
+            val_cap: (0.46 * (3 * chunks) as f64).ceil() as usize,
+            doc_live_cap: 1800,
+            doc_repack_below: 0,
+            ver_cap: if layout == DocLayout::Fixed { 0 } else { 400 },
+            vmap_pad: 40,
+        }
+    }
+
+    struct Run {
+        m: MkseLog,
+        refmm: HashMap<String, Vec<u32>>,
+        live: Vec<u32>,
+    }
+
+    fn setup(c: LogCfg, seed: u64) -> (Run, Vec<(String, u32)>, StdRng) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let (mm, later, kws) = data(&mut rng);
+        let lens: HashMap<u32, usize> = (1..=300).map(|d| (d, 300 + (d as usize * 37) % 2000)).collect();
+        let m = MkseLog::setup(c, &mm, &kws, &lens, 1500, &mut rng);
+        let refmm: HashMap<String, Vec<u32>> = mm.iter().cloned().collect();
+        (Run { m, refmm, live: (1..=200).collect() }, later, rng)
+    }
+
+    impl Run {
+        /// one insertion, then with some probability a posting deletion, an
+        /// edit, or a removal
+        fn step(&mut self, w: &str, d: u32, rng: &mut StdRng) {
+            self.m.insert(w, d, 300 + (d as usize * 37) % 2000, rng);
+            self.refmm.entry(w.to_string()).or_default().push(d);
+            if !self.live.contains(&d) {
+                self.live.push(d);
+            }
+            let r: f64 = rng.gen();
+            if r < 0.1 {
+                let w2 = format!("w{}", rng.gen_range(0..40));
+                if let Some(list) = self.refmm.get_mut(&w2) {
+                    if !list.is_empty() {
+                        let id = list.remove(rng.gen_range(0..list.len()));
+                        self.m.delete_posting(&w2, id, rng);
+                    }
+                }
+            } else if r < 0.25 {
+                let id = *self.live.choose(rng).unwrap();
+                self.m.update_doc(id, rng.gen_range(100..3500), rng);
+            } else if r < 0.3 && self.live.len() > 1 {
+                let id = self.live.swap_remove(rng.gen_range(0..self.live.len()));
+                self.m.delete_doc(id, rng);
+                for list in self.refmm.values_mut() {
+                    list.retain(|x| *x != id);
+                }
+            }
+        }
+        fn check(&self) {
+            for i in 0..40 {
+                let w = format!("w{i}");
+                let mut got = self.m.search(&w).ids;
+                let mut want = self.refmm.get(&w).cloned().unwrap_or_default();
+                got.sort_unstable();
+                want.sort_unstable();
+                want.dedup();
+                assert_eq!(got, want, "search mismatch for {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_has_public_size() {
+        for layout in [DocLayout::Rows, DocLayout::Cuckoo] {
+            let c = cfg(layout, true, false);
+            let want = c.kw_pad + c.ver_cap;
+            let (mut r, later, mut rng) = setup(c, 3);
+            assert_eq!(r.m.log.len(), want);
+            assert_eq!(r.m.compacted_records, want);
+            for (i, (w, d)) in later.iter().enumerate() {
+                r.step(w, *d, &mut rng);
+                if i % 97 == 0 {
+                    let mut act = Action::default();
+                    r.m.major(&mut act, &mut rng);
+                    assert_eq!(r.m.log.len(), want, "{layout:?}: snapshot size depends on the data");
+                    r.check();
+                }
+            }
+            // removed documents left the snapshot: the needed records changed, the size did not
+            assert!(r.m.docs.values().any(|d| d.deleted));
+            r.check();
+        }
+    }
+
+    #[test]
+    fn rebuild_encodes_exactly_val_cap() {
+        for reuse in [true, false] {
+            let c = cfg(DocLayout::Rows, reuse, false);
+            let cap = c.val_cap;
+            let (mut r, later, mut rng) = setup(c, 5);
+            assert_eq!(r.m.last_encode, cap);
+            let mut rebuilds = 0;
+            for (w, d) in later.iter() {
+                let before = r.m.val_epoch;
+                r.step(w, *d, &mut rng);
+                if r.m.val_epoch != before {
+                    rebuilds += 1;
+                    assert_eq!(r.m.last_encode, cap);
+                }
+            }
+            let mut act = Action::default();
+            r.m.major(&mut act, &mut rng);
+            assert_eq!(r.m.last_encode, cap);
+            let live: usize = r.m.kws.iter().map(|k| (k.committed.len() + r.m.cfg.chunk_cap() - 1) / r.m.cfg.chunk_cap()).sum();
+            if reuse {
+                // fillers freed right after the Encode
+                assert_eq!(r.m.val.len(), live);
+            } else {
+                // fillers kept: occupancy is public all epoch
+                assert_eq!(r.m.val.len(), cap);
+            }
+            assert!(rebuilds > 0);
+            r.m.val.check_invariants();
+            r.check();
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity exceeded")]
+    fn rebuild_over_val_cap_panics() {
+        let mut c = cfg(DocLayout::Rows, true, false);
+        c.val_cap = 3;
+        let _ = setup(c, 1);
+    }
+
+    #[test]
+    fn repack_leaves_public_never_written_rows() {
+        let mut c = cfg(DocLayout::Rows, true, false);
+        // few spare rows: writes run out of never-written rows and force repacks
+        c.doc_rows = 1100;
+        c.doc_live_cap = 1000;
+        c.major_every = 0;
+        let (mu_d, cap) = (c.doc_rows, c.doc_live_cap);
+        let (mut r, later, mut rng) = setup(c, 9);
+        let mut repacks = 0;
+        for (w, d) in later.iter() {
+            let before = r.m.epoch;
+            r.step(w, *d, &mut rng);
+            if r.m.epoch != before {
+                repacks += 1;
+                // the write that triggered it then took its rows from the never-written ones
+                assert!(r.m.virgin_rows() <= mu_d - cap);
+            }
+        }
+        assert!(repacks > 0, "test should force a repack");
+        r.check();
+        // a repack inside a scheduled rebuild, with a threshold
+        r.m.cfg.doc_repack_below = mu_d;
+        let mut act = Action::default();
+        r.m.major(&mut act, &mut rng);
+        assert_eq!(act.doc_compactions, 1);
+        assert_eq!(r.m.virgin_rows(), mu_d - cap);
+        r.check();
+        // without the threshold a scheduled rebuild does not repack
+        r.m.cfg.doc_repack_below = 0;
+        let v = r.m.virgin_rows();
+        let mut act = Action::default();
+        r.m.major(&mut act, &mut rng);
+        assert_eq!((act.doc_compactions, r.m.virgin_rows()), (0, v));
+    }
+
+    #[test]
+    fn stateless_docmap_versions() {
+        for reuse in [true, false] {
+            let mut c = cfg(DocLayout::Fixed, reuse, true);
+            if !reuse {
+                c.doc = prm(6000, DOC_ROW, 32);
+            }
+            c.vmap_pad = 25; // full every ~25 edits/removals: forces rebuilds
+            let cap = c.doc_live_cap;
+            let (mut r, later, mut rng) = setup(c, 13);
+            let mut vmap_rebuilds = 0;
+            for (i, (w, d)) in later.iter().enumerate() {
+                let before = r.m.val_epoch;
+                let ops = r.m.vmap_ops;
+                r.step(w, *d, &mut rng);
+                if r.m.val_epoch != before {
+                    // the DocMap Encode (after the ValMap one) has exactly doc_live_cap items
+                    assert_eq!(r.m.last_encode, cap);
+                    if ops >= 24 {
+                        vmap_rebuilds += 1;
+                    }
+                }
+                assert!(r.m.vmap.len() <= r.m.vmap_ops && r.m.vmap_ops <= 25);
+                if i % 50 == 0 {
+                    r.check();
+                }
+            }
+            assert!(!r.m.halted, "{}", r.m.halt_reason);
+            assert!(vmap_rebuilds > 0);
+            r.check();
+            let mut act = Action::default();
+            r.m.major(&mut act, &mut rng);
+            assert_eq!(act.doc_compactions, 1);
+            let live: usize = r.m.docs.values().filter(|d| !d.deleted).map(|d| d.nch as usize).sum();
+            assert_eq!(r.m.doc_table.as_ref().unwrap().len(), if reuse { live } else { cap });
+            assert!(r.m.vmap.is_empty() && r.m.vmap_ops == 0);
+            r.check();
+            r.m.doc_table.as_ref().unwrap().check_invariants();
+        }
+    }
+
+    #[test]
+    fn stash_overflow_halts() {
+        let mut c = cfg(DocLayout::Rows, true, false);
+        // a full table with no stash: the Encode overflows
+        c.val = prm(c.val_cap, c.val.val_len, 0);
+        c.val.alpha = 1;
+        let (mut r, later, mut rng) = setup(c, 2);
+        assert!(r.m.halted && r.m.val.halted && r.m.val.overflow > 0, "no overflow");
+        assert!(r.m.halt_reason.contains("stash overflow"));
+        let (w, d) = later[0].clone();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.step(&w, d, &mut rng)));
+        assert!(res.is_err(), "a halted structure must refuse operations");
+    }
 }

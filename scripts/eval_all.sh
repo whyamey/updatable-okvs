@@ -41,10 +41,14 @@ B=./target/release/uokvs_bench
 if [[ $QUICK == 1 ]]; then
   SRC=(--synthetic 3000,20000,40); N=1000000; MFS="2.0 1.333"; PIR_ROWS="16384"; DOC_ROWS="65536"; TRIALS=1
   QPIR=(--synthetic 1000,5000,20)   # smaller replays for the real-PIR runs
+  # the synthetic corpus has many one-chunk keywords: its live chunks reach ~0.47 mu
+  # at a rebuild, above the default --val-cap of 0.46 mu (Enron: <= 0.44 mu);
+  # 0.5 mu always suffices at --mu-factor 2 (mu counts the full corpus + 10%)
+  QCAP=(--val-cap-frac 0.5)
 else
   if [[ ! -f $DATA/keyword_file_map.json ]]; then echo "no $DATA/keyword_file_map.json (set DATA or QUICK=1)"; exit 1; fi
   SRC=(--data "$DATA"); N=24000000; MFS="2.0 1.5 1.333 1.111"; PIR_ROWS="131072 262144 524288"; DOC_ROWS="2097152 4194304"; TRIALS=2
-  QPIR=()
+  QPIR=(); QCAP=()
 fi
 CLIENTS=100,1000,10000,100000,1000000
 # real-PIR replays measure server time per batch and per search; a prefix of
@@ -53,7 +57,7 @@ PIR_APPENDS=${PIR_APPENDS:-200000}
 PREFIX=(); (( PIR_APPENDS > 0 )) && PREFIX=(--max-appends $PIR_APPENDS)
 COMMON=(--build-frac 0.8 --order fileid --del-frac 0.02 --upd-frac 0.02 --docdel-frac 0.002
         --clients $CLIENTS --search-every 20000 --search-sample 20 --snap-every 10000
-        --summary "$OUT/design_summary.csv")
+        --summary "$OUT/design_summary.csv" "${QCAP[@]}")
 design() { # label, extra args...
   local l=$1; shift
   if ! rerun "$CUR" && grep -q "^\[$l\] done:" "$OUT/logs/design_$l.log" 2>/dev/null; then
@@ -135,9 +139,14 @@ fi
 # (refresh on search) and every row the owner writes. No PIR here, so it is fast.
 if want write; then
   # the recommended schedule (defaults): B = 10^4 appends per batch, flush a
-  # keyword once a full chunk (theta = C = 203) is pending, BFS alpha = 10,
-  # major compaction every 10^6 appends
+  # keyword once a full chunk (theta = C = 203) is pending, BFS alpha = 20 with
+  # sigma = 16, major compaction every 10^6 appends. Every MKSE run below uses
+  # alpha = 20 (the default) except main_a10, which varies alpha. A rebuild
+  # encodes exactly --val-cap items (default ceil(0.46 mu) of the reuse-mode
+  # table), a DocMap repack leaves rows - --doc-live-cap never-written rows,
+  # and a log snapshot has kw_pad + --ver-cap records (see `design --help`).
   design main           --policy batched
+  design main_a10       --policy batched --alpha 10
   # baselines: append-only log, no ValMap writes until a rebuild
   design logonly        --policy rebuild --r 0
   for r in 100000 300000 1000000; do design rebuild_$r --policy rebuild --r $r; done
@@ -146,9 +155,10 @@ if want write; then
   # sensitivity around the recommended schedule
   for b in 1000 3000 30000; do design main_b$b --policy batched --b $b; done
   for th in 50 101; do design main_t$th --policy batched --theta $th; done
-  design main_a20       --policy batched --alpha 20
   for e in 300000 0; do design main_major$e --policy batched --major-every $e; done
-  design main_rw        --policy batched --evict rw
+  # random walk: its stash holds ~3% of the chunks (thousands), so sigma = 16
+  # would halt at setup; this run uses a stash large enough to complete
+  design main_rw        --policy batched --evict rw --sigma 8192
   design main_age       --policy batched --age 64       # adds an age bound on pending postings
   # superseded chunks kept until compaction, filler insertions instead of dummies
   # (every operation is an insertion: Theorem 1 covers owners that share with
@@ -251,7 +261,9 @@ fi
 #   log clients       copy the append-only log (rebuild or batched schedules)
 #   stateless clients download VolMap + the pending stash; every insertion
 #                     reaches ValMap through the eviction walk (batches of B,
-#                     theta = 1), DocMap is a UOKVS with invalidation updates
+#                     theta = 1), DocMap is a UOKVS with versioned keys
+#                     (id, (epoch, u, j)) re-encoded at every rebuild, plus a
+#                     padded version map (--vmap-pad) downloaded with every search
 # The real-PIR runs then measure server time for the main pairings,
 # including Spiral for ValMap with FrodoPIR for DocMap.
 if want paired; then

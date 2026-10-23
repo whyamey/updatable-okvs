@@ -144,8 +144,14 @@ pir    --rows 2^18 --elem-bytes 8192 --batches 4,8,16,64,784 --widths 8,16,32,64
        --trials 3 --seed 1 --out results/pir.csv
 design --data DIR | --synthetic K,D,PER  --policy batched|perop|rebuild
        --b 10000 --k auto --theta C --age inf | --r 100000   --major-every 1000000
-       --doc-layout rows|cuckoo --doc-row 1024 --doc-spare 0.2 --bucket-bytes 8192 --no-reuse
-       --evict bfs --alpha 10 --mu-factor 2.0 --sigma 16 --clients 100,1000,10000,100000
+       --doc-layout rows|cuckoo|fixed --doc-row 1024 --doc-spare 0.2 --bucket-bytes 8192 --no-reuse
+       --evict bfs --alpha 20 --mu-factor 2.0 --sigma 16 --clients 100,1000,10000,100000
+       public rebuild sizes: --val-cap auto (ceil(0.46 mu) of the reuse-mode table;
+       --val-cap-frac 0.46, keep mode uses mu at --reuse-mu-factor 2.0)
+       --doc-live-cap auto (expected document chunks + edits, i.e. the DocMap rows
+       without --doc-spare) --doc-repack-below 0 --ver-cap auto (version records of
+       all documents x (1 + --ver-spare 0.1) + 64) --vmap-pad auto (fixed layout:
+       1.2 x (upd-frac + docdel-frac) x major-every + 64)
        --build-frac 0.8 --del-frac 0.02 --upd-frac 0.02 --docdel-frac 0.002
        --pir --no-doc-pir --pir-width 32 --pir-search 2 --search-every 5000 --search-sample 10
        --max-appends 0 (replay only a prefix) --stateless --val-pir frodo|spiral --doc-pir frodo|spiral
@@ -1042,8 +1048,8 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
     let val_len = bucket - slot_over;
     let c = val_len / pb;
     let evict = evict_of(&a.s("evict", "bfs"));
-    // design default: BFS with alpha = 10 (recommended schedule B in the revision plan)
-    let alpha = a.u("alpha", 10);
+    // design default: BFS with alpha = 20 (with sigma = 16; Theorem intro-bfs)
+    let alpha = a.u("alpha", 20);
     // ValMap: canonical chunks of the full dataset, inflated by --mu-factor
     let del = a.f("del-frac", 0.02) + a.f("docdel-frac", 0.002) * 40.0;
     let chunks: usize = wl
@@ -1051,8 +1057,19 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         .iter()
         .map(|(_, ids)| ((ids.len() as f64 * (1.0 + del)).ceil() as usize + c - 1) / c)
         .sum();
+    let mu_of = |mf: f64| ((mf * chunks as f64).ceil() as usize).max(64);
     let mu_val = match a.s("val-mu", "auto").as_str() {
-        "auto" => ((a.f("mu-factor", 2.0) * chunks as f64).ceil() as usize).max(64),
+        "auto" => mu_of(a.f("mu-factor", 2.0)),
+        x => parse_num(x) as usize,
+    };
+    // public ValMap rebuild size: ceil(0.46 mu) of the reuse-mode table (keep
+    // mode, --no-reuse, takes mu at --reuse-mu-factor, default 2.0, so its
+    // larger table absorbs the fillers and superseded chunks of an epoch)
+    let val_cap = match a.s("val-cap", "auto").as_str() {
+        "auto" => {
+            let mu_r = if a.b("no-reuse") { mu_of(a.f("reuse-mu-factor", 2.0)) } else { mu_val };
+            (a.f("val-cap-frac", 0.46) * mu_r as f64).ceil() as usize
+        }
         x => parse_num(x) as usize,
     };
     let doc_row = a.u("doc-row", 1024);
@@ -1064,6 +1081,14 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
     let edits = a.f("upd-frac", 0.02) * wl.doc_kw.values().map(|v| v.len()).sum::<usize>() as f64 * (1.0 - a.f("build-frac", 0.8));
     let avg = doc_chunks as f64 / wl.docs.len().max(1) as f64;
     let doc_rows = ((doc_chunks as f64 + edits * avg) * (1.0 + a.f("doc-spare", 0.2))).ceil() as usize + 64;
+    // public cap on live DocMap chunks at a repack / rebuild: the expected
+    // content (all documents of the data set + edits) without the spare rows,
+    // so a repack leaves doc_rows - doc_live_cap ~ doc-spare * doc_live_cap + 64
+    // never-written rows
+    let doc_live_cap = match a.s("doc-live-cap", "auto").as_str() {
+        "auto" => (doc_chunks as f64 + edits * avg).ceil() as usize,
+        x => parse_num(x) as usize,
+    };
     let stateless = a.b("stateless");
     let policy = match a.s("policy", "batched").as_str() {
         // stateless clients: every batch commits everything pending (theta = 1),
@@ -1105,6 +1130,39 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         Policy::Batched { b, .. } => 2 * b,
         _ => 0,
     };
+    // public number of version records in a log snapshot: those of every
+    // document of the data set at its original length, plus --ver-spare
+    // (default 10%) headroom for edits, plus 64
+    let record_body = a.u("record-body", pb.max(40));
+    let rpr = ((record_body - 8) / 4).max(1);
+    let ver_cap = match a.s("ver-cap", "auto").as_str() {
+        "auto" => {
+            let recs: usize = match doc_layout {
+                DocLayout::Rows => wl
+                    .docs
+                    .iter()
+                    .map(|d| {
+                        let n = ((wl.lens.get(d).copied().unwrap_or(wl.default_len) + doc_row - 1) / doc_row).max(1);
+                        (n + rpr - 1) / rpr
+                    })
+                    .sum(),
+                DocLayout::Cuckoo => wl.docs.len(),
+                DocLayout::Fixed => 0,
+            };
+            if recs == 0 { 0 } else { (recs as f64 * (1.0 + a.f("ver-spare", 0.1))).ceil() as usize + 64 }
+        }
+        x => parse_num(x) as usize,
+    };
+    // fixed DocMap layout: version-map slots per epoch (one per edit or
+    // removal): 1.2 x the expected edits and removals between scheduled rebuilds
+    let major_every = a.u("major-every", 1_000_000);
+    let vmap_pad = match a.s("vmap-pad", "auto").as_str() {
+        "auto" => {
+            let e = if major_every > 0 { major_every } else { 1_000_000 };
+            (1.2 * (a.f("upd-frac", 0.02) + a.f("docdel-frac", 0.002)) * e as f64).ceil() as usize + 64
+        }
+        x => parse_num(x) as usize,
+    };
     let tparams = |mu: usize, val_len: usize, sigma: usize| Params {
         mu,
         p: 1,
@@ -1121,16 +1179,21 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         val: tparams(mu_val, val_len, a.u("sigma", 16)),
         posting_bytes: pb,
         policy,
-        major_every: a.u("major-every", 1_000_000),
+        major_every,
         doc_layout,
         doc: tparams(((a.f("doc-mu-factor", 2.0) * (doc_chunks as f64 + edits * avg)).ceil() as usize).max(64), doc_row, a.u("doc-sigma", 64)),
         doc_row_bytes: doc_row,
         doc_rows,
-        record_body: a.u("record-body", pb.max(40)),
+        record_body,
         kw_pad: wl.mm_full.len(),
         reuse_freed: !a.b("no-reuse"),
         stateless,
         pend_pad,
+        val_cap,
+        doc_live_cap,
+        doc_repack_below: a.u("doc-repack-below", 0),
+        ver_cap,
+        vmap_pad,
     }
 }
 
@@ -1309,6 +1372,8 @@ fn design(a: &Args) {
         if m.cfg.doc_layout != DocLayout::Rows && !act.doc_ops.is_empty() {
             owner_upload += m.cfg.doc.stash_bytes();
         }
+        // fixed DocMap layout: the padded version map is re-encrypted and resent
+        owner_upload += act.vmap_refreshes * m.cfg.vmap_bytes();
         if let (Some(pd), false) = (pd.as_mut(), drows.is_empty()) {
             let rows: Vec<(usize, Vec<u8>)> = drows
                 .iter()
@@ -1337,7 +1402,10 @@ fn design(a: &Args) {
         if act.doc_compactions > 0 {
             doc_compactions += act.doc_compactions;
             if let Some(p) = pd.as_mut() {
-                let rows: Vec<Vec<u8>> = (0..m.doc_mu()).map(|r| m.doc_row_cipher(r, rng)).collect();
+                let rows: Vec<Vec<u8>> = match m.cfg.doc_layout {
+                    DocLayout::Rows => (0..m.doc_mu()).map(|r| m.doc_row_cipher(r, rng)).collect(),
+                    _ => m.doc_table.as_ref().unwrap().encrypt_all(rng),
+                };
                 *p = Pir::new(p.name(), &rows, m.cfg.doc_row_cipher_bytes()).0;
             }
             owner_upload += m.doc_mu() * m.cfg.doc_row_cipher_bytes();
@@ -1408,11 +1476,15 @@ fn design(a: &Args) {
     };
 
     snap(&m, &mut ws);
-    do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
+    if !m.halted {
+        do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
+    }
     let t_replay = Instant::now();
     // --max-appends N: stop the replay after N log appends (a prefix of the workload)
     let max_appends = a.u("max-appends", 0);
-    'replay: for &d in &wl.docs[wl.nb..] {
+    // a structure that halted already at setup (stash overflow of its Encode) replays nothing
+    let replay_docs = if m.halted { &wl.docs[..0] } else { &wl.docs[wl.nb..] };
+    'replay: for &d in replay_docs {
         let len = wl.lens.get(&d).copied().unwrap_or(wl.default_len);
         for w in wl.doc_kw[&d].clone() {
             if max_appends > 0 && m.total_appends >= max_appends {
@@ -1423,6 +1495,9 @@ fn design(a: &Args) {
             let act = m.insert(&w, d, len, &mut rng);
             let ms = t.elapsed().as_secs_f64() * 1e3;
             handle(act, ms, &mut m, &mut rng, &mut pv, &mut pd, &mut wb, &mut we);
+            if m.halted {
+                break 'replay;
+            }
             refmm.entry(w).or_default().push(d);
             let r: f64 = rng.gen();
             if r < del_frac {
@@ -1434,6 +1509,9 @@ fn design(a: &Args) {
                         let act = m.delete_posting(w2, id, &mut rng);
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         handle(act, ms, &mut m, &mut rng, &mut pv, &mut pd, &mut wb, &mut we);
+                        if m.halted {
+                            break 'replay;
+                        }
                     }
                 }
             } else if r < del_frac + upd_frac && !live_docs.is_empty() {
@@ -1444,6 +1522,9 @@ fn design(a: &Args) {
                 let act = m.update_doc(id, nl, &mut rng);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 handle(act, ms, &mut m, &mut rng, &mut pv, &mut pd, &mut wb, &mut we);
+                if m.halted {
+                    break 'replay;
+                }
             } else if r < del_frac + upd_frac + docdel_frac && !live_docs.is_empty() {
                 let k = rng.gen_range(0..live_docs.len());
                 let id = live_docs.swap_remove(k);
@@ -1451,6 +1532,9 @@ fn design(a: &Args) {
                 let act = m.delete_doc(id, &mut rng);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 handle(act, ms, &mut m, &mut rng, &mut pv, &mut pd, &mut wb, &mut we);
+                if m.halted {
+                    break 'replay;
+                }
                 deleted.insert(id);
                 for list in refmm.values_mut() {
                     list.retain(|x| *x != id);
@@ -1469,7 +1553,12 @@ fn design(a: &Args) {
     }
     let replay_s = t_replay.elapsed().as_secs_f64();
     snap(&m, &mut ws);
-    do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
+    if m.halted {
+        // a public failure (stash overflow): the structure stopped; counted in the summary
+        println!("[{label}] HALTED after {} appends: {}", m.total_appends, m.halt_reason);
+    } else {
+        do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
+    }
     for w in [&mut wb, &mut ws, &mut wq, &mut we] {
         w.flush().unwrap();
     }
@@ -1479,7 +1568,7 @@ fn design(a: &Args) {
     let summary_path = a.s("summary", "results/design_summary.csv");
     let mut sw = append_csv(
         &summary_path,
-        "label,policy,b,k,theta,age,r,major_every,client_model,val_pir,doc_pir,pend_pad_overflow,val_rows,doc_rows,doc_cap,doc_layout,evict,alpha,mu_factor,keywords,docs_setup,docs_total,appends,batches,k_overflow_batches,deferred_total,pend_peak,max_pending_age,log_peak_bytes,compacted_log_bytes,val_stash_peak,val_overflow,val_load,val_stale,doc_load,doc_compactions,log_compactions,rebuilds,rebuild_ms_mean,setup_ms,replay_s,owner_ms_per_append,owner_upload_per_append,val_rows_per_append,doc_rows_per_append,pir_hint_ms_per_batch,val_hint_bytes,doc_hint_bytes,val_delta_packed,join_bytes",
+        "label,policy,b,k,theta,age,r,major_every,client_model,val_pir,doc_pir,pend_pad_overflow,val_rows,doc_rows,doc_cap,doc_layout,evict,alpha,mu_factor,keywords,docs_setup,docs_total,appends,batches,k_overflow_batches,deferred_total,pend_peak,max_pending_age,log_peak_bytes,compacted_log_bytes,val_stash_peak,val_overflow,val_load,val_stale,doc_load,doc_compactions,log_compactions,rebuilds,rebuild_ms_mean,setup_ms,replay_s,owner_ms_per_append,owner_upload_per_append,val_rows_per_append,doc_rows_per_append,pir_hint_ms_per_batch,val_hint_bytes,doc_hint_bytes,val_delta_packed,join_bytes,halted,val_cap,val_live_max,doc_live_cap,doc_live_max,ver_cap,ver_max,vmap_pad,vmap_peak,compacted_log_records",
     );
     writeln!(
         sw,
@@ -1530,6 +1619,16 @@ fn design(a: &Args) {
             m.doc_hint_bytes().to_string(),
             m.val_delta_bytes(true).to_string(),
             (m.val_hint_bytes() + m.doc_hint_bytes() + m.compacted_bytes()).to_string(),
+            (m.halted as u8).to_string(),
+            cfg.val_cap.to_string(),
+            m.val_live_max.to_string(),
+            cfg.doc_live_cap.to_string(),
+            m.doc_live_max.to_string(),
+            cfg.ver_cap.to_string(),
+            m.ver_max.to_string(),
+            (if cfg.doc_layout == DocLayout::Fixed { cfg.vmap_pad } else { 0 }).to_string(),
+            m.vmap_peak.to_string(),
+            (m.compacted_bytes() / cfg.record_bytes()).to_string(),
         ]
         .join(",")
     )
@@ -1562,9 +1661,14 @@ fn design(a: &Args) {
         }
     }
     println!(
-        "[{label}] done: {} appends in {:.1}s, {} batches, K-overflow batches {}, pending-stash overflows {}, pend peak {}, max pending age {} batches, log peak {:.1} MB, val stash peak {}, val load {:.3}, rebuilds {}, compactions {}, doc compactions {}",
+        "[{label}] done: {} appends in {:.1}s, {} batches, K-overflow batches {}, pending-stash overflows {}, pend peak {}, max pending age {} batches, log peak {:.1} MB, val stash peak {} (sigma {}, overflows {}{}), val load {:.3}, rebuilds {}, compactions {}, doc compactions {}",
         m.total_appends, replay_s, batches, m.k_overflow_batches, m.pend_pad_overflow, m.pend_peak, m.max_pend_age, log_peak as f64 / 1e6,
-        m.val.stash_peak, m.val.load(), rebuild_ms.len(), compactions, doc_compactions
+        m.val.stash_peak, cfg.val.sigma, m.val.overflow, if m.halted { ", HALTED" } else { "" }, m.val.load(), rebuild_ms.len(), compactions, doc_compactions
+    );
+    println!(
+        "[{label}]   public caps: ValMap Encode {} items (live max {}), DocMap live cap {} (live max {}, {} rows), snapshot {} flush + {} version records (needed max {}){}",
+        cfg.val_cap, m.val_live_max, cfg.doc_live_cap, m.doc_live_max, m.doc_mu(), cfg.kw_pad, cfg.ver_cap, m.ver_max,
+        if cfg.doc_layout == DocLayout::Fixed { format!(", version map {} slots (peak {} entries)", cfg.vmap_pad, m.vmap_peak) } else { String::new() }
     );
     for p in profiles.iter() {
         let mb = |x: usize| x as f64 / 1e6;
@@ -1605,6 +1709,7 @@ fn selftest_design() {
         }
         if policy == "noreuse" {
             m.insert("no-reuse".to_string(), "true".to_string());
+            m.insert("reuse-mu-factor".to_string(), "3.0".to_string());
         }
         if policy == "stateless" {
             m.insert("stateless".to_string(), "true".to_string());
@@ -1741,15 +1846,16 @@ fn report(a: &Args) {
     if let Some((h, rows)) = read_csv(&sp) {
         let rows = dedup_last(&h, rows, &["label"]);
         md.push_str("## Write path: schedules and DocMap layouts\n\n");
-        md.push_str("| run | policy | b | k | θ | r | DocMap | α | appends | K-overflow batches | pending peak | log peak | ValMap rows / append | DocMap rows / append | owner upload / append | owner ms / append | hint update ms / batch | rebuilds (mean ms) | stash peak | ValMap load |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+        md.push_str("| run | policy | b | k | θ | r | DocMap | α | appends | K-overflow batches | pending peak | log peak | ValMap rows / append | DocMap rows / append | owner upload / append | owner ms / append | hint update ms / batch | rebuilds (mean ms) | stash peak | ValMap load | halted (stash overflow) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
         for r in &rows {
             let g = |n: &str| r[col(&h, n)].clone();
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {} | {:.3} | {} | {} ({}) | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {} | {:.3} | {} | {} ({}) | {} | {} | {} |\n",
                 g("label"), g("policy"), g("b"), g("k"), g("theta"), g("r"), g("doc_layout"), g("alpha"), g("appends"),
                 g("k_overflow_batches"), g("pend_peak"), human(fnum(&g("log_peak_bytes"))), fnum(&g("val_rows_per_append")),
                 fnum(&g("doc_rows_per_append")), human(fnum(&g("owner_upload_per_append"))), fnum(&g("owner_ms_per_append")),
-                g("pir_hint_ms_per_batch"), g("rebuilds"), g("rebuild_ms_mean"), g("val_stash_peak"), g("val_load")
+                g("pir_hint_ms_per_batch"), g("rebuilds"), g("rebuild_ms_mean"), g("val_stash_peak"), g("val_load"),
+                h.iter().position(|x| x == "halted").map_or("-".to_string(), |i| if r[i] == "1" { "**yes**".to_string() } else { "no".to_string() })
             ));
         }
         md.push('\n');
