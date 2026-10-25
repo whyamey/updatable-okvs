@@ -11,7 +11,9 @@
 //!       (or a tombstone)
 //!     - flush record, tag F(k_w, "flush", epoch, m): w's committed volume v_c
 //!     - document version record, tag F(cap_id, "ver", epoch, m, part)
-//!   Every compaction starts a new epoch, so tags never repeat across epochs.
+//!   Every log compaction starts a new log epoch ε_L, so tags never repeat
+//!   across epochs. ValMap chunk keys carry the ValMap epoch ε_V, a separate
+//!   counter that only a ValMap rebuild advances.
 //! * **DocMap**: either rows addressed by number (`DocLayout::Rows`; the row
 //!   numbers live in the document version records, chunks are written to
 //!   never-used rows, freed rows are reused only after a DocMap compaction)
@@ -25,35 +27,62 @@
 //!   postings or its oldest pending posting is `age` batches old; due keywords
 //!   are served first-due-first. Whether w is due depends only on w's own
 //!   history; serving more than `k` operations in one batch is a K-overflow
-//!   (counted) and delays the rest.
+//!   (counted) and delays the rest. Log budget: a posting appended after
+//!   batch j is due at batch j + `age` at the latest, i.e. within `age * b`
+//!   appends, so with no K-overflow every posting is committed (and the
+//!   uncommitted log tail spans) fewer than `age * b` appends.
+//!   Phased (`age_phased`, the bench's `--age-appends`): keyword w has a
+//!   phase φ(w) in [0, age) from a PRF under an owner-only key (never
+//!   delegated) of its keyword index, and is due by age at
+//!   batch t if it has pending postings and (t + φ(w)) mod age = 0. Every
+//!   pending posting is still committed within `age * b` appends, and the
+//!   deadlines of different keywords are spread over the batches, so there is
+//!   no synchronized burst (e.g. right after setup). Whether w is due depends
+//!   only on w's own history and its hidden phase.
 //!   `b = 1, k = 1` is the old one-operation-per-insertion design.
-//! * `Policy::Rebuild{r}`: no flushes; a major compaction every `r` appends
-//!   (the static-PIR-plus-rebuild baseline).
-//! * Major compaction (a rebuild) every `major_every` appends, and otherwise
-//!   only on a public counter: the DocMap has fewer never-written rows than a
-//!   write needs (rows layout), or the version map of the stateless DocMap
-//!   has no slot left for an edit or removal (fixed layout). A stash overflow
-//!   never triggers a rebuild: it is a public failure and the structure halts.
-//!   A rebuild reveals nothing beyond this schedule:
-//!     - ValMap: exactly `val_cap` items are encoded (live chunks plus filler
+//! * `Policy::Rebuild{r}`: no flushes; a ValMap rebuild every `r` appends
+//!   (the static-PIR-plus-rebuild baseline; the same as `Batched` with
+//!   `k = 0` and `major_every = r`).
+//! * Two public schedules on the append counter t (absolute: a forced
+//!   compaction does not shift them):
+//!     - **ValMap rebuild** when t is a multiple of E_V (`major_every`, or `r`;
+//!       0 = never). It commits every pending posting, re-encodes ValMap
+//!       under epoch ε_V + 1, and is always accompanied by a log compaction.
+//!     - **Log compaction** when t is a multiple of E_L (`log_every`, 0 = only
+//!       with ValMap rebuilds). E_V must be a multiple of E_L, so a scheduled
+//!       ValMap rebuild coincides with a scheduled log compaction.
+//!   Otherwise only on a public counter: the DocMap has fewer never-written
+//!   rows than a write needs (rows layout: an early log compaction with a
+//!   repack; with `pend_cap = 0`, which keeps pending postings out of
+//!   snapshots, it is a full rebuild as well), or the version map of the
+//!   stateless DocMap has no slot left for an edit or removal (fixed layout:
+//!   a full rebuild). A stash overflow never triggers a rebuild: it is a
+//!   public failure and the structure halts.
+//!   Compactions reveal nothing beyond this schedule:
+//!     - ValMap (rebuilds only): exactly `val_cap` items are encoded (live chunks plus filler
 //!       items under fresh random keys, in one uniformly random order); reuse
 //!       mode frees the fillers right after the Encode, keep mode keeps them.
 //!       Chunk keys carry the epoch, so every lookup key is fresh per epoch.
-//!     - DocMap (rows): a repack re-places live chunks at random rows and
+//!     - DocMap (rows; at log compactions only, since only version records
+//!       carry row numbers): a repack re-places live chunks at random rows and
 //!       reserves `doc_live_cap - live` rows, so exactly `doc_rows -
 //!       doc_live_cap` never-written rows remain. A repack happens when a
-//!       write lacks never-written rows, or at a scheduled rebuild when fewer
-//!       than `doc_repack_below` remain.
-//!     - DocMap (fixed, stateless): re-encoded under the new epoch with
-//!       exactly `doc_live_cap` items (fillers as for ValMap).
-//!     - Log: a snapshot of exactly `kw_pad` flush records and `ver_cap`
-//!       version records (current versions of live documents, dummies pad),
-//!       in a uniformly random order.
+//!       write lacks never-written rows, or at a scheduled compaction when
+//!       fewer than `doc_repack_below` remain.
+//!     - DocMap (fixed, stateless; at ValMap rebuilds): re-encoded under the
+//!       new epoch with exactly `doc_live_cap` items (fillers as for ValMap).
+//!     - Log: a snapshot of exactly `kw_pad` flush records (each keyword's
+//!       committed count v^c), `pend_cap` posting records (the postings not
+//!       yet committed to ValMap, under epoch-(ε_L + 1) tags with their old
+//!       posting numbers n in [v^c, v), so a search is unchanged; dummies
+//!       pad) and `ver_cap` version records (current versions of live
+//!       documents, dummies pad), in one uniformly random order.
 
 use crate::pir_backend::{frodo_hint_bytes, frodo_row_delta_bytes};
 use crate::uokvs::{derive, Key, OpOut, OwnerKeys, Params, Table, CHECK, K32, META, NONCE};
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
@@ -85,10 +114,26 @@ pub struct LogCfg {
     pub val: Params,
     pub posting_bytes: usize,
     pub policy: Policy,
-    /// log appends between major compactions (0 = never, except when the
-    /// DocMap runs out of never-used rows). A major compaction rebuilds ValMap
-    /// with all postings (tombstones applied), and rewrites the log.
+    /// E_V: a ValMap rebuild when the append counter is a multiple of this
+    /// (0 = never; `Policy::Rebuild{r}` uses r instead). A rebuild commits all
+    /// postings (tombstones applied) and comes with a log compaction.
     pub major_every: usize,
+    /// E_L: a log compaction when the append counter is a multiple of this
+    /// (0 = only together with ValMap rebuilds). E_V must be a multiple of E_L.
+    pub log_every: usize,
+    /// P̂: posting records in every log snapshot (pending postings, dummies
+    /// pad); more pending postings at a compaction is a capacity failure.
+    /// 0 is allowed only when every compaction is a ValMap rebuild (E_L = E_V
+    /// or E_L = 0); forced compactions then rebuild ValMap too.
+    pub pend_cap: usize,
+    /// dry runs only: snapshots carry the pending postings without padding
+    /// (data-dependent size) so that `pend_snap_max` can size `pend_cap`
+    pub pend_measure: bool,
+    /// dry runs only: batches serve all due work without padding (K is then
+    /// not public); `max_batch_ops` sizes K for the real run
+    pub k_measure: bool,
+    /// age rule with per-keyword phases (see the module docs)
+    pub age_phased: bool,
     pub doc_layout: DocLayout,
     /// DocMap table for `DocLayout::Cuckoo` (val_len = doc row bytes)
     pub doc: Params,
@@ -129,6 +174,25 @@ pub struct LogCfg {
 }
 
 impl LogCfg {
+    /// E_V, the effective ValMap rebuild period (0 = never)
+    pub fn val_every(&self) -> usize {
+        match self.policy {
+            Policy::Rebuild { r } => r,
+            Policy::Batched { .. } => self.major_every,
+        }
+    }
+    /// every scheduled log compaction is a ValMap rebuild
+    pub fn coupled(&self) -> bool {
+        self.log_every == 0 || self.log_every == self.val_every()
+    }
+    /// forced compactions (DocMap repacks) are log compactions, not rebuilds
+    pub fn pending_in_snapshots(&self) -> bool {
+        self.pend_cap > 0 || self.pend_measure
+    }
+    /// public size of a log snapshot, in records (not in measure mode)
+    pub fn snapshot_records(&self) -> usize {
+        self.kw_pad + self.pend_cap + self.ver_cap
+    }
     pub fn chunk_cap(&self) -> usize {
         self.val.val_len / self.posting_bytes
     }
@@ -217,6 +281,8 @@ struct Kw {
     /// flush records in the current epoch
     m: u32,
     due_since: Option<u64>,
+    /// phase of the phased age rule: owner-only PRF of the keyword index, in [0, 2^32)
+    phase: u32,
 }
 
 pub struct Doc {
@@ -242,8 +308,12 @@ pub struct Action {
     pub doc_rows_written: Vec<usize>,
     pub doc_ops: Vec<OpOut>,
     pub batches: Vec<BatchOut>,
+    /// log compactions (with or without a ValMap rebuild)
     pub compactions: usize,
+    /// ValMap rebuilds (owner ms each); each comes with a log compaction
     pub rebuilds: Vec<f64>,
+    /// owner ms of log compactions without a ValMap rebuild
+    pub log_only_ms: Vec<f64>,
     pub doc_compactions: usize,
     /// fixed layout: refreshes of the padded version map (edits, removals)
     pub vmap_refreshes: usize,
@@ -254,6 +324,8 @@ pub struct BatchOut {
     pub index: u64,
     pub real_ops: usize,
     pub dummy_ops: usize,
+    /// flush records appended (K, or the keywords served in measure mode)
+    pub records: usize,
     pub keywords_served: usize,
     pub postings_flushed: usize,
     pub due: usize,
@@ -287,6 +359,8 @@ pub struct MkseLog {
     pub cfg: LogCfg,
     ki: OwnerKeys,
     kl: OwnerKeys,
+    /// owner-only PRF key of the age phases
+    kphase: K32,
     kd: OwnerKeys,
     pub val: Table,
     pub val_epoch: u32,
@@ -309,8 +383,31 @@ pub struct MkseLog {
     // schedule
     pub batch: u64,
     since_batch: usize,
-    since_major: usize,
+    /// randomness of snapshot padding and order only, so that the rest of a
+    /// run (and its random workload) does not depend on `pend_cap`: a dry run
+    /// with `pend_measure` sees exactly the pending counts of the real run
+    srng: StdRng,
+    /// randomness of batch execution (see `run_batch`)
+    brng: StdRng,
+    /// most real ValMap operations a batch needed (to size K)
+    pub max_batch_ops: usize,
+    /// the same over batches after the first two age windows (age rule):
+    /// leaves out the burst when the postings of the first batch interval
+    /// after setup all come due together
+    pub max_batch_ops_steady: usize,
+    /// kappa_A statistics: windows of this many appends (0 = off; set by the
+    /// caller): distinct keywords that got a posting record, and that were
+    /// committed by a batch, per complete window
+    pub kappa_window: usize,
+    win_active: HashSet<u32>,
+    win_committed: HashSet<u32>,
+    pub kappa_active: Vec<usize>,
+    pub kappa_committed: Vec<usize>,
     // counters
+    pub log_compactions: usize,
+    pub val_rebuilds: usize,
+    /// largest number of pending postings a log snapshot had to carry
+    pub pend_snap_max: usize,
     pub total_appends: usize,
     pub k_overflow_batches: usize,
     pub deferred_total: usize,
@@ -336,6 +433,9 @@ pub struct MkseLog {
     /// largest number of live items a rebuild had to encode / place / write
     /// (to check the public caps val_cap, doc_live_cap, ver_cap)
     pub val_live_max: usize,
+    /// live (committed, current) ValMap chunks now: sum over keywords of
+    /// ceil(committed / C); capped by val_cap at all times
+    pub val_live: usize,
     pub doc_live_max: usize,
     pub ver_max: usize,
     /// items passed to the last padded Encode (= its public cap)
@@ -510,9 +610,17 @@ impl MkseLog {
         default_doc_len: usize,
         rng: &mut R,
     ) -> Self {
+        let (ve, le) = (cfg.val_every(), cfg.log_every);
+        assert!(ve == 0 || le == 0 || ve % le == 0, "the ValMap rebuild period E_V = {ve} must be a multiple of the log compaction period E_L = {le}");
+        assert!(
+            cfg.coupled() || cfg.pending_in_snapshots(),
+            "log compactions between ValMap rebuilds (E_L = {le}, E_V = {ve}) carry pending postings: pend_cap must be > 0"
+        );
         let ki = OwnerKeys::random(rng);
         let kl = OwnerKeys::random(rng);
         let kd = OwnerKeys::random(rng);
+        let mut kphase = [0u8; 32];
+        rng.fill(&mut kphase);
         let val = Table::new(cfg.val.clone(), rng);
         let doc_table = match cfg.doc_layout {
             DocLayout::Cuckoo | DocLayout::Fixed => Some(Table::new(cfg.doc.clone(), rng)),
@@ -521,6 +629,7 @@ impl MkseLog {
         let mut s = Self {
             ki,
             kl,
+            kphase,
             kd,
             val,
             val_epoch: 0,
@@ -539,7 +648,18 @@ impl MkseLog {
             compacted_records: 0,
             batch: 0,
             since_batch: 0,
-            since_major: 0,
+            srng: StdRng::seed_from_u64(rng.gen()),
+            brng: StdRng::seed_from_u64(rng.gen()),
+            max_batch_ops: 0,
+            max_batch_ops_steady: 0,
+            kappa_window: 0,
+            win_active: HashSet::new(),
+            win_committed: HashSet::new(),
+            kappa_active: Vec::new(),
+            kappa_committed: Vec::new(),
+            log_compactions: 0,
+            val_rebuilds: 0,
+            pend_snap_max: 0,
             total_appends: 0,
             k_overflow_batches: 0,
             deferred_total: 0,
@@ -555,6 +675,7 @@ impl MkseLog {
             halted: false,
             halt_reason: String::new(),
             val_live_max: 0,
+            val_live: 0,
             doc_live_max: 0,
             ver_max: 0,
             last_encode: 0,
@@ -628,11 +749,12 @@ impl MkseLog {
         }
         // the same padded Encode (exactly val_cap items) as at every rebuild
         s.val_live_max = s.val_live_max.max(entries.len());
+        s.val_live = entries.len();
         let (prm, cap) = (s.cfg.val.clone(), s.cfg.val_cap);
         s.val = s.encode_padded(prm, entries, cap, "ValMap (--val-cap)", rng);
         s.check_tables();
         // initial log = epoch-0 snapshot
-        s.write_snapshot(rng);
+        s.write_snapshot();
         s
     }
 
@@ -643,6 +765,9 @@ impl MkseLog {
         let i = self.kws.len() as u32;
         let cap_val = self.ki.cap(w.as_bytes());
         let cap_log = self.kl.cap(w.as_bytes()).0;
+        // owner-only PRF key (not derived from any delegated key)
+        let ph = tag_of(&self.kphase, b"phase", 0, i as u64, 0);
+        let phase = u32::from_le_bytes(ph[..4].try_into().unwrap());
         self.kws.push(Kw {
             name: w.to_string(),
             cap_val,
@@ -652,33 +777,64 @@ impl MkseLog {
             n: 0,
             m: 0,
             due_since: None,
+            phase,
         });
         self.kw_ix.insert(w.to_string(), i);
         i
     }
 
-    /// Writes a fresh log for the current epoch (nothing is pending after a
-    /// rebuild): exactly `kw_pad` flush records (one per keyword with
-    /// postings, dummies pad) and exactly `ver_cap` version records (the
-    /// current version of every live document; removed documents are dropped;
-    /// dummies pad), all in a uniformly random order. Its size is public.
-    fn write_snapshot<R: Rng>(&mut self, rng: &mut R) {
-        assert_eq!(self.pend_total, 0, "a snapshot is written only when nothing is pending");
+    /// Snapshot padding: a dummy record with a random tag (from `srng`).
+    fn snap_dummies(&mut self, n: usize) {
+        for _ in 0..n {
+            let mut t = [0u8; TAG];
+            self.srng.fill(&mut t);
+            self.log.push(Rec { tag: t, body: Body::Dummy });
+        }
+    }
+
+    /// Writes a fresh log for the current epoch: exactly `kw_pad` flush
+    /// records (one per keyword with postings, holding its committed count
+    /// v^c; dummies pad), exactly `pend_cap` posting records (the pending
+    /// postings v^c, ..., v - 1 of every keyword under the new epoch's tags
+    /// with their old posting numbers; dummies pad; none right after a ValMap
+    /// rebuild) and exactly `ver_cap` version records (the current version of
+    /// every live document; removed documents are dropped; dummies pad), all
+    /// in a uniformly random order. Its size is public.
+    fn write_snapshot(&mut self) {
         self.log.clear();
         self.tag_ix.clear();
         let mut kw_records = 0usize;
+        let mut pend_records = 0usize;
         for w in 0..self.kws.len() as u32 {
             self.kws[w as usize].m = 0;
             if self.kws[w as usize].n == 0 {
                 continue;
             }
-            debug_assert!(self.kws[w as usize].pend.is_empty());
             self.append_flush(w);
             kw_records += 1;
+            // pending postings keep their numbers n in [v^c, v)
+            let (cap, vc, ps) = {
+                let k = &self.kws[w as usize];
+                debug_assert_eq!(k.committed.len() + k.pend.len(), k.n as usize);
+                (k.cap_log, k.committed.len(), k.pend.iter().map(|x| x.0).collect::<Vec<_>>())
+            };
+            for (j, p) in ps.into_iter().enumerate() {
+                let t = tag_of(&cap, b"post", self.epoch, (vc + j) as u64, 0);
+                self.push_rec(t, Body::Post(p));
+                pend_records += 1;
+            }
         }
+        debug_assert_eq!(pend_records, self.pend_total);
         assert!(kw_records <= self.cfg.kw_pad, "snapshot needs {kw_records} flush records > kw_pad = {}", self.cfg.kw_pad);
-        for _ in kw_records..self.cfg.kw_pad {
-            self.append_dummy(rng);
+        self.snap_dummies(self.cfg.kw_pad - kw_records);
+        self.pend_snap_max = self.pend_snap_max.max(pend_records);
+        if !self.cfg.pend_measure {
+            assert!(
+                pend_records <= self.cfg.pend_cap,
+                "log snapshot capacity exceeded: {pend_records} pending postings at a log compaction > pend_cap = {}; raise --pend-cap",
+                self.cfg.pend_cap
+            );
+            self.snap_dummies(self.cfg.pend_cap - pend_records);
         }
         let mut ids: Vec<u32> = self.docs.keys().copied().collect();
         ids.sort_unstable();
@@ -698,18 +854,18 @@ impl MkseLog {
             "log snapshot capacity exceeded: {ver_records} version records of live documents > ver_cap = {}; raise --ver-cap",
             self.cfg.ver_cap
         );
-        for _ in ver_records..self.cfg.ver_cap {
-            self.append_dummy(rng);
-        }
+        self.snap_dummies(self.cfg.ver_cap - ver_records);
         // one uniformly random order; clients find records by tag
-        self.log.shuffle(rng);
+        self.log.shuffle(&mut self.srng);
         self.tag_ix.clear();
         for (i, r) in self.log.iter().enumerate() {
             if !matches!(r.body, Body::Dummy) {
                 self.tag_ix.insert(r.tag, i);
             }
         }
-        assert_eq!(self.log.len(), self.cfg.kw_pad + self.cfg.ver_cap, "the snapshot size must be public");
+        if !self.cfg.pend_measure {
+            assert_eq!(self.log.len(), self.cfg.snapshot_records(), "the snapshot size must be public");
+        }
         self.compacted_records = self.log.len();
         self.log_live_since_compaction = 0;
     }
@@ -719,31 +875,37 @@ impl MkseLog {
     fn tick<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
         self.total_appends += 1;
         self.since_batch += 1;
-        self.since_major += 1;
         act.appends += 1;
         if self.halted {
             return;
         }
-        let major_every = match self.cfg.policy {
-            Policy::Batched { b, k, .. } => {
-                if k > 0 && self.since_batch >= b {
-                    self.since_batch = 0;
-                    let bo = self.run_batch(rng);
-                    act.batches.push(bo);
-                    if self.halted {
-                        return;
-                    }
+        if let Policy::Batched { b, k, .. } = self.cfg.policy {
+            if k > 0 && self.since_batch >= b {
+                self.since_batch = 0;
+                let bo = self.run_batch();
+                act.batches.push(bo);
+                if self.halted {
+                    return;
                 }
-                self.cfg.major_every
             }
-            Policy::Rebuild { r } => r,
-        };
-        if major_every > 0 && self.since_major >= major_every {
+        }
+        // kappa_A: distinct keywords with a posting record / committed per window
+        if self.kappa_window > 0 && self.total_appends % self.kappa_window == 0 {
+            self.kappa_active.push(self.win_active.len());
+            self.kappa_committed.push(self.win_committed.len());
+            self.win_active.clear();
+            self.win_committed.clear();
+        }
+        // the two public schedules, on the absolute append counter
+        let (ve, le, t) = (self.cfg.val_every(), self.cfg.log_every, self.total_appends);
+        if ve > 0 && t % ve == 0 {
             self.major(act, rng);
+        } else if le > 0 && t % le == 0 {
+            self.log_compaction(act, rng);
         }
     }
 
-    /// Scheduled major compaction (a rebuild): rebuild ValMap (all postings,
+    /// ValMap rebuild (with a log compaction): rebuild ValMap (all postings,
     /// tombstones applied, padded to `val_cap`), repack the DocMap if fewer
     /// than `doc_repack_below` never-written rows remain (rows layout) or
     /// re-encode it (fixed layout), and rewrite the log in a new epoch.
@@ -754,7 +916,6 @@ impl MkseLog {
     /// `repack`: the DocMap lacks never-written rows for a write (public).
     fn major_inner<R: Rng>(&mut self, repack: bool, act: &mut Action, rng: &mut R) {
         let t = Instant::now();
-        self.since_major = 0;
         if self.cfg.doc_layout == DocLayout::Rows && (repack || self.virgin.len() < self.cfg.doc_repack_below) {
             self.compact_docmap(rng);
             act.doc_compactions += 1;
@@ -766,17 +927,42 @@ impl MkseLog {
         }
         self.compact(rng);
         self.check_tables();
+        self.val_rebuilds += 1;
         act.rebuilds.push(t.elapsed().as_secs_f64() * 1e3);
         act.compactions += 1;
     }
 
-    /// Rows layout: before a write of `n` chunks, rebuild (with a DocMap
-    /// repack) if fewer than `n` never-written rows remain. Both counts are
-    /// public: every write reveals its chunk count, and a repack resets the
-    /// never-written rows to `doc_rows - doc_live_cap`.
+    /// Log compaction without a ValMap rebuild: repack the DocMap if fewer
+    /// than `doc_repack_below` never-written rows remain (rows layout), and
+    /// write a snapshot in a new log epoch that carries the pending postings.
+    pub fn log_compaction<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
+        self.log_compaction_inner(false, act, rng);
+    }
+
+    fn log_compaction_inner<R: Rng>(&mut self, repack: bool, act: &mut Action, rng: &mut R) {
+        let t = Instant::now();
+        if self.cfg.doc_layout == DocLayout::Rows && (repack || self.virgin.len() < self.cfg.doc_repack_below) {
+            self.compact_docmap(rng);
+            act.doc_compactions += 1;
+        }
+        self.compact(rng);
+        act.log_only_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        act.compactions += 1;
+    }
+
+    /// Rows layout: before a write of `n` chunks, compact the log early (with
+    /// a DocMap repack) if fewer than `n` never-written rows remain. Both
+    /// counts are public: every write reveals its chunk count, and a repack
+    /// resets the never-written rows to `doc_rows - doc_live_cap`. With
+    /// `pend_cap = 0` (snapshots never carry pending postings) the forced
+    /// compaction also rebuilds ValMap.
     fn ensure_doc_rows<R: Rng>(&mut self, n: usize, act: &mut Action, rng: &mut R) {
         if self.cfg.doc_layout == DocLayout::Rows && self.virgin.len() < n {
-            self.major_inner(true, act, rng);
+            if self.cfg.pending_in_snapshots() {
+                self.log_compaction_inner(true, act, rng);
+            } else {
+                self.major_inner(true, act, rng);
+            }
             assert!(
                 self.virgin.len() >= n,
                 "DocMap too small even after a repack ({} never-written rows, {n} needed); raise --doc-spare or lower --doc-live-cap",
@@ -816,6 +1002,9 @@ impl MkseLog {
         k.n += 1;
         k.pend.push((p, b));
         self.pending_kws.insert(w);
+        if self.kappa_window > 0 {
+            self.win_active.insert(w);
+        }
         self.pend_total += 1;
         self.pend_peak = self.pend_peak.max(self.pend_total);
         self.tick(act, rng);
@@ -1008,20 +1197,33 @@ impl MkseLog {
 
     // ------------------------------------------------------------ batches
 
-    fn run_batch<R: Rng>(&mut self, rng: &mut R) -> BatchOut {
+    /// One batch. Its randomness (operation order, dummy and filler
+    /// operations, eviction walks, flush-record order) comes from `brng`, so
+    /// the rest of the run, including the random workload of the bench, does
+    /// not depend on K: a dry run with `k_measure` serves exactly the due work
+    /// of the real run as long as the real K is at least its maximum.
+    fn run_batch(&mut self) -> BatchOut {
         let t = Instant::now();
         self.batch += 1;
         let (k, theta, age) = match self.cfg.policy {
             Policy::Batched { k, theta, age, .. } => (k, theta, age as u64),
             _ => unreachable!(),
         };
+        let phased = self.cfg.age_phased && age < u64::MAX / 8;
+        // measure mode: serve all due work, no padding
+        let budget = if self.cfg.k_measure { usize::MAX } else { k };
         let now = self.batch;
         let mut due: Vec<(u64, u32)> = Vec::new();
         for &w in &self.pending_kws {
             let kw = &mut self.kws[w as usize];
             let oldest = kw.pend.first().map(|x| x.1).unwrap_or(now);
             self.max_pend_age = self.max_pend_age.max(now - oldest);
-            if kw.pend.len() >= theta || now - oldest >= age {
+            let by_age = if phased {
+                !kw.pend.is_empty() && (now + kw.phase as u64 % age) % age == 0
+            } else {
+                now - oldest >= age
+            };
+            if kw.pend.len() >= theta || by_age {
                 if kw.due_since.is_none() {
                     kw.due_since = Some(now);
                 }
@@ -1031,10 +1233,10 @@ impl MkseLog {
         due.sort_unstable();
         let mut out = BatchOut { index: now, due: due.len(), ..Default::default() };
         // 1. plan the K operations (owner state advances; nothing is executed yet)
-        let mut plan: Vec<Option<ChunkWrite>> = Vec::with_capacity(k);
+        let mut plan: Vec<Option<ChunkWrite>> = Vec::with_capacity(k.min(1 << 20));
         let mut served: Vec<u32> = Vec::new();
         for &(_, w) in &due {
-            let left = k - plan.len();
+            let left = budget - plan.len();
             if left == 0 {
                 out.deferred += 1;
                 continue;
@@ -1044,18 +1246,27 @@ impl MkseLog {
             out.postings_flushed += moved;
             if ops > 0 {
                 served.push(w);
+                if self.kappa_window > 0 {
+                    self.win_committed.insert(w);
+                }
             }
             if !self.kws[w as usize].pend.is_empty() {
                 out.deferred += 1;
             }
         }
+        self.max_batch_ops = self.max_batch_ops.max(out.real_ops);
+        if age < u64::MAX / 8 && now > 2 * age {
+            self.max_batch_ops_steady = self.max_batch_ops_steady.max(out.real_ops);
+        }
         // padding: Dummy (reuse) or a filler insertion (keep)
-        while plan.len() < k {
+        let width = if self.cfg.k_measure { plan.len() } else { k };
+        while plan.len() < width {
             plan.push(None);
             out.dummy_ops += 1;
         }
         // 2. execute them in a uniformly random order
-        plan.shuffle(rng);
+        let mut br = std::mem::replace(&mut self.brng, StdRng::seed_from_u64(0));
+        plan.shuffle(&mut br);
         for op in plan {
             let o = match op {
                 Some(c) => {
@@ -1063,29 +1274,32 @@ impl MkseLog {
                         let removed = self.val.remove(&old);
                         debug_assert!(removed, "missing chunk {old:?}");
                     }
-                    self.val.insert(&c.key, c.keys.0, c.keys.1, c.val, rng)
+                    self.val.insert(&c.key, c.keys.0, c.keys.1, c.val, &mut br)
                 }
-                None if self.cfg.reuse_freed => self.val.dummy(rng),
+                None if self.cfg.reuse_freed => self.val.dummy(&mut br),
                 None => {
                     // filler insertion of a fresh random key, dropped at compaction
-                    let (key, (lk, dk), v) = self.filler(rng);
-                    self.val.insert(&key, lk, dk, v, rng)
+                    let (key, (lk, dk), v) = self.filler(&mut br);
+                    self.val.insert(&key, lk, dk, v, &mut br)
                 }
             };
             out.accessed.extend_from_slice(&o.accessed);
         }
         // 3. exactly K flush records (dummies pad), in a uniformly random order
         out.keywords_served = served.len();
-        assert!(served.len() <= k);
+        let nrec = if self.cfg.k_measure { served.len() } else { k };
+        assert!(served.len() <= nrec);
+        out.records = nrec;
         let mut recs: Vec<Option<u32>> = served.iter().map(|&w| Some(w)).collect();
-        recs.resize(k, None);
-        recs.shuffle(rng);
+        recs.resize(nrec, None);
+        recs.shuffle(&mut br);
         for r in recs {
             match r {
                 Some(w) => self.append_flush(w),
-                None => self.append_dummy(rng),
+                None => self.append_dummy(&mut br),
             }
         }
+        self.brng = br;
         if self.cfg.stateless && self.pend_total > self.cfg.pend_pad {
             // the padded pending stash cannot grow: a public failure
             self.pend_pad_overflow += 1;
@@ -1094,11 +1308,19 @@ impl MkseLog {
                 self.pend_total, self.cfg.pend_pad, self.total_appends
             ));
         }
+        // the stash bound assumes at most val_cap live chunks all epoch
+        self.val_live_max = self.val_live_max.max(self.val_live);
+        if self.val_live > self.cfg.val_cap {
+            self.halt(format!(
+                "ValMap capacity exceeded: {} live chunks > val_cap = {} after {} appends",
+                self.val_live, self.cfg.val_cap, self.total_appends
+            ));
+        }
         if out.deferred > 0 {
             self.k_overflow_batches += 1;
             self.deferred_total += out.deferred;
         }
-        assert_eq!(out.accessed.len(), k * self.cfg.val.accesses_per_op(), "a batch must make exactly k(alpha+1) accesses");
+        assert_eq!(out.accessed.len(), width * self.cfg.val.accesses_per_op(), "a batch must make exactly k(alpha+1) accesses");
         self.check_tables();
         out.owner_ms = t.elapsed().as_secs_f64() * 1e3;
         out
@@ -1112,6 +1334,7 @@ impl MkseLog {
         let c = self.cfg.chunk_cap();
         let mut ops = 0;
         let mut moved = 0;
+        let chunks_before = (self.kws[w as usize].committed.len() + c - 1) / c;
         while ops < budget && !self.kws[w as usize].pend.is_empty() {
             let (name, vc, npend) = {
                 let k = &self.kws[w as usize];
@@ -1138,6 +1361,7 @@ impl MkseLog {
             moved += take;
         }
         self.pend_total -= moved;
+        self.val_live += (self.kws[w as usize].committed.len() + c - 1) / c - chunks_before;
         let kw = &mut self.kws[w as usize];
         if kw.pend.is_empty() {
             kw.due_since = None;
@@ -1148,17 +1372,19 @@ impl MkseLog {
 
     // ------------------------------------------------------------ compaction
 
-    pub fn compact<R: Rng>(&mut self, rng: &mut R) {
+    /// Starts log epoch ε_L + 1 with a snapshot (see `write_snapshot`).
+    pub fn compact<R: Rng>(&mut self, _rng: &mut R) {
         self.epoch += 1;
-        self.write_snapshot(rng);
+        self.log_compactions += 1;
+        self.write_snapshot();
     }
 
-    /// Repack (only inside a rebuild): re-places every live document chunk at
+    /// Repack (only inside a log compaction): re-places every live document chunk at
     /// uniformly random rows, all rows are rewritten (clients take a fresh
     /// DocMap hint), and `doc_live_cap - live` further rows are reserved as
     /// unusable until the next repack, so exactly `doc_rows - doc_live_cap`
-    /// never-written rows remain (a public number). The caller rebuilds and
-    /// writes a log snapshot so version records carry the new row numbers.
+    /// never-written rows remain (a public number). The caller then writes a
+    /// log snapshot so version records carry the new row numbers.
     pub fn compact_docmap<R: Rng>(&mut self, rng: &mut R) {
         let n = self.doc_rows.len();
         let cap = self.cfg.doc_live_cap;
@@ -1221,6 +1447,7 @@ impl MkseLog {
         self.pending_kws.clear();
         self.pend_total = 0;
         self.val_live_max = self.val_live_max.max(entries.len());
+        self.val_live = entries.len();
         let (prm, cap) = (self.cfg.val.clone(), self.cfg.val_cap);
         self.val = self.encode_padded(prm, entries, cap, "ValMap (--val-cap)", rng);
     }
@@ -1713,7 +1940,7 @@ impl Profile {
         }
         if !m.cfg.stateless {
             // log: a compaction replaces everything the client had
-            let appended = act.appends + act.batches.len() * match m.cfg.policy { Policy::Batched { k, .. } => k, _ => 0 };
+            let appended = act.appends + act.batches.iter().map(|b| b.records).sum::<usize>();
             if act.compactions > 0 {
                 self.log_bytes = m.compacted_bytes() + m.log_live_since_compaction * m.cfg.record_bytes();
             } else {
@@ -1839,6 +2066,11 @@ mod tests {
             posting_bytes: 40,
             policy,
             major_every: 400,
+            log_every: 400,
+            pend_cap: 0,
+            pend_measure: false,
+            k_measure: false,
+            age_phased: false,
             doc_layout: layout,
             doc: prm(4000, DOC_ROW, 32),
             doc_row_bytes: DOC_ROW,
@@ -1981,16 +2213,20 @@ mod tests {
     fn repack_leaves_public_never_written_rows() {
         let mut c = cfg(DocLayout::Rows, true, false);
         // few spare rows: writes run out of never-written rows and force repacks
-        c.doc_rows = 1100;
+        c.doc_rows = 1040;
         c.doc_live_cap = 1000;
         c.major_every = 0;
+        c.log_every = 0;
         let (mu_d, cap) = (c.doc_rows, c.doc_live_cap);
         let (mut r, later, mut rng) = setup(c, 9);
         let mut repacks = 0;
         for (w, d) in later.iter() {
             let before = r.m.epoch;
+            let vbefore = r.m.val_epoch;
             r.step(w, *d, &mut rng);
             if r.m.epoch != before {
+                // pend_cap = 0: the forced compaction is a full rebuild
+                assert_ne!(r.m.val_epoch, vbefore);
                 repacks += 1;
                 // the write that triggered it then took its rows from the never-written ones
                 assert!(r.m.virgin_rows() <= mu_d - cap);
@@ -2066,5 +2302,282 @@ mod tests {
         let (w, d) = later[0].clone();
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.step(&w, d, &mut rng)));
         assert!(res.is_err(), "a halted structure must refuse operations");
+    }
+
+    /// batched with a high theta (postings stay pending), log compaction every
+    /// `le` appends, ValMap rebuild every `ve` (0 = never), P̂ = `cap`
+    fn decoupled(layout: DocLayout, le: usize, ve: usize, cap: usize) -> LogCfg {
+        let mut c = cfg(layout, true, false);
+        c.policy = Policy::Batched { b: 20, k: 3, theta: 15, age: usize::MAX / 4 };
+        c.log_every = le;
+        c.major_every = ve;
+        c.pend_cap = cap;
+        c
+    }
+
+    #[test]
+    fn decoupled_snapshot_carries_pending() {
+        for layout in [DocLayout::Rows, DocLayout::Cuckoo] {
+            let c = decoupled(layout, 60, 0, 3000);
+            let want = c.kw_pad + c.pend_cap + c.ver_cap;
+            assert_eq!(want, c.snapshot_records());
+            let (mut r, later, mut rng) = setup(c, 21);
+            assert_eq!(r.m.log.len(), want);
+            let (mut seen_pending, mut manual) = (0, 0);
+            for (i, (w, d)) in later.iter().enumerate() {
+                r.step(w, *d, &mut rng);
+                assert_eq!(r.m.compacted_records, want, "{layout:?}: snapshot size depends on the data");
+                if i % 40 == 39 {
+                    let (ve, le, pend) = (r.m.val_epoch, r.m.epoch, r.m.pend_total);
+                    let mut act = Action::default();
+                    r.m.log_compaction(&mut act, &mut rng);
+                    assert_eq!((r.m.val_epoch, r.m.epoch, act.compactions, act.rebuilds.len()), (ve, le + 1, 1, 0));
+                    // the snapshot alone (nothing appended yet) has exactly κ̂ + P̂ + V̂ records
+                    assert_eq!(r.m.log.len(), want);
+                    assert_eq!(r.m.pend_total, pend, "a log compaction commits nothing");
+                    if pend > 0 {
+                        manual += 1;
+                    }
+                    // pending postings survive under the new epoch's tags with their numbers
+                    for k in 0..40 {
+                        seen_pending += r.m.search(&format!("w{k}")).pending;
+                    }
+                    r.check();
+                }
+            }
+            assert!(manual > 0 && seen_pending > 0, "test should compact with pending postings");
+            assert_eq!(r.m.val_rebuilds, 0);
+            assert!(r.m.log_compactions > 10);
+            assert!(r.m.pend_snap_max > 0 && r.m.pend_snap_max <= 3000);
+            r.check();
+        }
+    }
+
+    #[test]
+    fn val_rebuild_coincides_with_log_compaction() {
+        let (le, ve) = (50, 200);
+        let (mut r, later, mut rng) = setup(decoupled(DocLayout::Rows, le, ve, 3000), 23);
+        let (mut rebuilds, mut logs) = (0, 0);
+        for (i, (w, d)) in later.iter().enumerate() {
+            let (v0, l0, t0) = (r.m.val_epoch, r.m.epoch, r.m.total_appends);
+            r.step(w, *d, &mut rng);
+            let t1 = r.m.total_appends;
+            // absolute schedules (no forced compaction in this test)
+            let due_v = (t0 + 1..=t1).filter(|t| t % ve == 0).count();
+            let due_l = (t0 + 1..=t1).filter(|t| t % le == 0).count();
+            assert_eq!((r.m.val_epoch - v0) as usize, due_v);
+            assert_eq!((r.m.epoch - l0) as usize, due_l, "every ValMap rebuild is also a scheduled log compaction");
+            rebuilds += due_v;
+            logs += due_l;
+            if i % 30 == 0 {
+                r.check();
+            }
+        }
+        assert!(rebuilds >= 2 && logs >= 4 * rebuilds);
+        assert_eq!((r.m.val_rebuilds, r.m.log_compactions), (rebuilds, logs));
+        assert!(r.m.pend_snap_max > 0);
+        // a rebuild commits everything: its snapshot has only dummy posting records
+        let mut act = Action::default();
+        r.m.major(&mut act, &mut rng);
+        assert_eq!(r.m.pend_total, 0);
+        assert_eq!(r.m.log.len(), r.m.cfg.snapshot_records());
+        assert!(r.m.log.iter().all(|x| !matches!(x.body, Body::Post(_))));
+        r.check();
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple")]
+    fn val_period_must_be_a_multiple_of_log_period() {
+        let _ = setup(decoupled(DocLayout::Rows, 60, 200, 3000), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pend_cap must be > 0")]
+    fn decoupled_needs_pend_cap() {
+        let _ = setup(decoupled(DocLayout::Rows, 50, 200, 0), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity exceeded")]
+    fn pend_cap_exceeded_panics() {
+        let mut c = decoupled(DocLayout::Rows, 20, 0, 1);
+        c.policy = Policy::Batched { b: 20, k: 0, theta: 15, age: usize::MAX / 4 };
+        let (mut r, later, mut rng) = setup(c, 4);
+        for (w, d) in later.iter() {
+            r.step(w, *d, &mut rng);
+        }
+    }
+
+    /// K = 0: no ValMap writes between rebuilds; the log carries everything
+    #[test]
+    fn static_baseline_k0() {
+        for (le, ve, cap) in [(150, 150, 0), (100, 300, 300)] {
+            let mut c = decoupled(DocLayout::Rows, le, ve, cap);
+            c.policy = Policy::Batched { b: 20, k: 0, theta: 15, age: usize::MAX / 4 };
+            let (mut r, later, mut rng) = setup(c, 29);
+            for (i, (w, d)) in later.iter().enumerate() {
+                let (v0, n0) = (r.m.val_epoch, r.m.val.len());
+                r.step(w, *d, &mut rng);
+                if r.m.val_epoch == v0 {
+                    assert_eq!(r.m.val.len(), n0, "ValMap written between rebuilds");
+                }
+                if i % 25 == 0 {
+                    r.check();
+                }
+            }
+            assert_eq!(r.m.batch, 0, "K = 0 runs no batches");
+            assert!(r.m.val_rebuilds >= 2);
+            // pending postings at a log-only compaction: at most E_V - E_L
+            assert!(r.m.pend_snap_max <= ve - le && (cap == 0 || r.m.pend_snap_max > 0));
+            r.check();
+        }
+    }
+
+    /// With pend_cap > 0 a forced compaction (DocMap repack) is a log compaction only.
+    #[test]
+    fn forced_compaction_keeps_valmap() {
+        let mut c = decoupled(DocLayout::Rows, 0, 0, 3000);
+        c.doc_rows = 1040;
+        c.doc_live_cap = 1000;
+        let (mu_d, cap) = (c.doc_rows, c.doc_live_cap);
+        let (mut r, later, mut rng) = setup(c, 9);
+        let mut repacks = 0;
+        for (w, d) in later.iter() {
+            let (l0, v0) = (r.m.epoch, r.m.val_epoch);
+            r.step(w, *d, &mut rng);
+            if r.m.epoch != l0 {
+                assert_eq!(r.m.val_epoch, v0, "a forced compaction rebuilt ValMap");
+                assert!(r.m.virgin_rows() <= mu_d - cap);
+                repacks += 1;
+                r.check();
+            }
+        }
+        assert!(repacks > 0, "test should force a repack");
+        assert!(r.m.pend_snap_max > 0);
+        r.check();
+    }
+
+    /// A dry run (`pend_measure`) follows exactly the trajectory of the real
+    /// run, so its largest pending count sizes `pend_cap` for that run.
+    #[test]
+    fn measure_mode_matches_real_run() {
+        let real = decoupled(DocLayout::Rows, 60, 0, 3000);
+        let mut dry = real.clone();
+        dry.pend_cap = 0;
+        dry.pend_measure = true;
+        let (mut a, later, mut ra) = setup(real, 31);
+        let (mut b, _, mut rb) = setup(dry, 31);
+        for (w, d) in later.iter() {
+            a.step(w, *d, &mut ra);
+            b.step(w, *d, &mut rb);
+            assert_eq!(a.m.pend_total, b.m.pend_total);
+        }
+        assert_eq!(a.m.pend_snap_max, b.m.pend_snap_max);
+        assert!(b.m.pend_snap_max > 0);
+        assert_eq!(a.m.compacted_records, a.m.cfg.snapshot_records());
+        assert_eq!(a.refmm, b.refmm);
+        a.check();
+        b.check();
+    }
+
+    /// age rule (log budget): age 3 batches of 20 appends, theta high
+    fn aged(k: usize, measure: bool) -> LogCfg {
+        aged_p(k, measure, false)
+    }
+    fn aged_p(k: usize, measure: bool, phased: bool) -> LogCfg {
+        let mut c = decoupled(DocLayout::Rows, 60, 0, 3000);
+        c.policy = Policy::Batched { b: 20, k, theta: 50, age: 3 };
+        c.k_measure = measure;
+        c.age_phased = phased;
+        c
+    }
+
+    /// A K dry run (`k_measure`) serves all due work; with K = its maximum the
+    /// real run has no K-overflow and the same trajectory (batches have their
+    /// own randomness), so every posting is committed within age * b appends.
+    #[test]
+    fn k_measure_sizes_k_and_age_bounds_the_tail() {
+        for phased in [false, true] {
+            k_measure_and_tail(phased);
+        }
+    }
+
+    fn k_measure_and_tail(phased: bool) {
+        let aged = |k, m| aged_p(k, m, phased);
+        let (mut d, later, mut rd) = setup(aged(1, true), 41);
+        d.m.kappa_window = 60;
+        for (w, x) in later.iter() {
+            d.step(w, *x, &mut rd);
+        }
+        let kmax = d.m.max_batch_ops;
+        assert!(kmax > 1 && d.m.k_overflow_batches == 0);
+        let (mut r, _, mut rr) = setup(aged(kmax, false), 41);
+        r.m.kappa_window = 60;
+        let (mut dd, _, mut rdd) = setup(aged(1, true), 41);
+        for (w, x) in later.iter() {
+            r.step(w, *x, &mut rr);
+            dd.step(w, *x, &mut rdd);
+            assert_eq!(r.m.pend_total, dd.m.pend_total, "the dry run diverged");
+            // the uncommitted tail: no pending posting is older than age batches
+            let now = r.m.batch;
+            for k in &r.m.kws {
+                if let Some(&(_, j)) = k.pend.first() {
+                    assert!(now - j < 3, "a posting waited {} batches", now - j);
+                }
+            }
+        }
+        assert_eq!(r.m.k_overflow_batches, 0);
+        assert_eq!(r.m.max_batch_ops, kmax);
+        assert!(r.m.max_pend_age <= 3);
+        assert_eq!(r.refmm, d.refmm);
+        // kappa_A: committed keywords per window, at most the active ones of
+        // this and the previous windows, and the same as in the dry run
+        assert!(!r.m.kappa_committed.is_empty());
+        assert_eq!(r.m.kappa_committed, d.m.kappa_committed);
+        assert_eq!(r.m.kappa_active, d.m.kappa_active);
+        assert!(r.m.kappa_committed.iter().all(|&x| x <= 40) && r.m.kappa_active.iter().any(|&x| x > 0));
+        r.check();
+        d.check();
+    }
+
+    /// With K below the need, batches overflow (counted) but stay exactly K wide.
+    #[test]
+    fn small_k_overflows_but_stays_padded() {
+        let (mut r, later, mut rng) = setup(aged(1, false), 43);
+        for (w, x) in later.iter() {
+            let a = r.m.insert(w, *x, 1000, &mut rng);
+            r.refmm.entry(w.clone()).or_default().push(*x);
+            for b in &a.batches {
+                assert_eq!((b.real_ops + b.dummy_ops, b.records), (1, 1));
+            }
+        }
+        assert!(r.m.k_overflow_batches > 0);
+        r.check();
+    }
+
+    /// val_live tracks the live chunks exactly; more than val_cap halts.
+    #[test]
+    fn live_chunks_capped_at_all_times() {
+        let (mut r, later, mut rng) = setup(decoupled(DocLayout::Rows, 60, 0, 3000), 47);
+        let c = r.m.cfg.chunk_cap();
+        for (w, d) in later.iter() {
+            r.step(w, *d, &mut rng);
+            let live: usize = r.m.kws.iter().map(|k| (k.committed.len() + c - 1) / c).sum();
+            assert_eq!(r.m.val_live, live);
+            assert!(r.m.val_live_max >= live && r.m.val_live <= r.m.cfg.val_cap);
+            assert_eq!(r.m.val.len(), live, "reuse mode: the table holds exactly the live chunks");
+        }
+        // a cap just above the setup chunks: the first batches that add chunks halt it
+        let mut c2 = decoupled(DocLayout::Rows, 60, 0, 3000);
+        let (probe, _, _) = setup(c2.clone(), 47);
+        c2.val_cap = probe.m.val_live;
+        let (mut r2, later2, mut rng2) = setup(c2, 47);
+        for (w, d) in later2.iter() {
+            if r2.m.halted {
+                break;
+            }
+            r2.m.insert(w, *d, 1000, &mut rng2);
+        }
+        assert!(r2.m.halted && r2.m.halt_reason.contains("ValMap capacity exceeded"), "{}", r2.m.halt_reason);
     }
 }

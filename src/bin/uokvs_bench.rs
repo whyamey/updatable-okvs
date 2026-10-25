@@ -143,7 +143,22 @@ ops    --data DIR (keyword_file_map.json, files.txt) | --synthetic 20000,100000,
 pir    --rows 2^18 --elem-bytes 8192 --batches 4,8,16,64,784 --widths 8,16,32,64 --update-rows 10,21
        --trials 3 --seed 1 --out results/pir.csv
 design --data DIR | --synthetic K,D,PER  --policy batched|perop|rebuild
-       --b 10000 --k auto --theta C --age inf | --r 100000   --major-every 1000000
+       --b 10000 --k auto --theta C --age inf | --r 100000
+       --major-every 1000000 (alias --val-every; E_V: ValMap rebuild every E_V appends, 0 = never;
+       --policy rebuild uses --r) --log-every auto (E_L: log compaction every E_L appends;
+       auto = E_V, so every log compaction is a ValMap rebuild; E_V must be a multiple of E_L)
+       --pend-cap auto|measure|N (P̂: pending-posting records in every log snapshot; auto = 0
+       when E_L = E_V, else E_V, a safe but large bound; measure = dry run with unpadded
+       snapshots, prints pend_max_at_compaction); --k 0 with E_L = E_V = R is the static
+       OKVS baseline; --scale 1 (k copies of the corpus, interleaved round-robin) --scale-mode
+       disjoint|shared (disjoint: keywords renamed per copy, kappa grows k-fold; shared:
+       keywords kept, kappa fixed, volumes and mu grow k-fold)
+       log budget: --age-appends A (phased age rule, A/B batches: keyword w with pending
+       postings is due at batch t when (t + phase(w)) mod (A/B) = 0, phase(w) from a PRF
+       of its log key, so every posting is committed within A appends unless K
+       overflows, and deadlines are spread over the batches); --age N (batches,
+       unphased: due once the oldest pending posting is N batches old); --k measure = dry run serving all due work (prints
+       k_max_ops_per_batch); --kappa-window (default A, else E_V, E_L, 10^6) for kappa_A
        --doc-layout rows|cuckoo|fixed --doc-row 1024 --doc-spare 0.2 --bucket-bytes 8192 --no-reuse
        --evict bfs --alpha 20 --mu-factor 2.0 --sigma 16 --clients 100,1000,10000,100000
        public rebuild sizes: --val-cap auto (ceil(0.46 mu) of the reuse-mode table;
@@ -1038,7 +1053,77 @@ fn workload(a: &Args, rng: &mut StdRng) -> Workload {
         .collect();
     doc_kw.retain(|d, _| keep.contains(d));
     let nb = (a.f("build-frac", 0.8) * docs.len() as f64) as usize;
-    Workload { mm_full, lens, docs, doc_kw, nb, default_len: a.u("default-doc-len", 4096) }
+    let wl = Workload { mm_full, lens, docs, doc_kw, nb, default_len: a.u("default-doc-len", 4096) };
+    let shared = match a.s("scale-mode", "disjoint").as_str() {
+        "disjoint" => false,
+        "shared" => true,
+        x => panic!("--scale-mode shared|disjoint, got {x}"),
+    };
+    scale_workload(wl, a.u("scale", 1).max(1), shared)
+}
+
+/// `--scale k`: k copies of the corpus. Copy c renames document id to
+/// `id + c * (max id + 1)`. `--scale-mode disjoint` (default) also renames
+/// keyword w to `w~c` (copy 0 keeps the original names), so keywords,
+/// postings, documents and DocMap chunks grow k-fold with the same
+/// per-keyword statistics (vocabulary linear in the corpus: the worst case).
+/// `--scale-mode shared` keeps the keywords: kappa stays fixed and every
+/// keyword's volume (and so its chunks, and mu) grows k-fold. The document order
+/// interleaves the copies round-robin (d1 of every copy, then d2, ...), so
+/// the setup holds all copies of the first `nb` documents and the replay
+/// interleaves the k operation streams: each keyword sees appends at the same
+/// rate per original document, and appends per original document scale by k.
+fn scale_workload(wl: Workload, k: usize, shared: bool) -> Workload {
+    if k == 1 {
+        return wl;
+    }
+    let off = wl.docs.iter().copied().max().unwrap_or(0) as u64 + 1;
+    assert!(off * k as u64 <= u32::MAX as u64, "--scale {k}: document ids do not fit in u32");
+    let cid = |id: u32, c: usize| (id as u64 + c as u64 * off) as u32;
+    let cname = |w: &str, c: usize| if c == 0 || shared { w.to_string() } else { format!("{w}~{c}") };
+    let mut mm_full = Vec::with_capacity(if shared { wl.mm_full.len() } else { wl.mm_full.len() * k });
+    if shared {
+        // one list per keyword: every copy's ids, ascending
+        for (w, ids) in &wl.mm_full {
+            mm_full.push((w.clone(), (0..k).flat_map(|c| ids.iter().map(move |&i| cid(i, c))).collect::<Vec<_>>()));
+        }
+    } else {
+        for c in 0..k {
+            for (w, ids) in &wl.mm_full {
+                mm_full.push((cname(w, c), ids.iter().map(|&i| cid(i, c)).collect::<Vec<_>>()));
+            }
+        }
+    }
+    let names: HashSet<&str> = mm_full.iter().map(|(w, _)| w.as_str()).collect();
+    assert_eq!(names.len(), mm_full.len(), "--scale: a renamed keyword collides with an existing one");
+    let mut lens = HashMap::with_capacity(wl.lens.len() * k);
+    for (&id, &l) in &wl.lens {
+        for c in 0..k {
+            lens.insert(cid(id, c), l);
+        }
+    }
+    // setup: all copies of the first nb documents. Replay: round-robin over the
+    // copies; in shared mode copy c replays the original stream rotated by
+    // c R / k, so the k copies of one document are not adjacent and a window of
+    // A appends sees as many distinct documents (and so keywords) as at k = 1,
+    // drawn from k parts of the corpus (with adjacent copies a window would hold
+    // only A / k distinct documents and shrink kappa_A)
+    let (setup, replay) = wl.docs.split_at(wl.nb);
+    let r = replay.len().max(1);
+    let mut docs: Vec<u32> = setup.iter().flat_map(|&d| (0..k).map(move |c| cid(d, c))).collect();
+    for i in 0..replay.len() {
+        for c in 0..k {
+            let j = if shared { (i + c * r / k) % r } else { i };
+            docs.push(cid(replay[j], c));
+        }
+    }
+    let mut doc_kw = HashMap::with_capacity(wl.doc_kw.len() * k);
+    for (&d, ws) in &wl.doc_kw {
+        for c in 0..k {
+            doc_kw.insert(cid(d, c), ws.iter().map(|w| cname(w, c)).collect::<Vec<_>>());
+        }
+    }
+    Workload { mm_full, lens, docs, doc_kw, nb: wl.nb * k, default_len: wl.default_len }
 }
 
 fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
@@ -1107,11 +1192,20 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
             let theta = a.u("theta", c).max(1);
             let k = match a.s("k", "auto").as_str() {
                 "auto" => (3 * b + 2 * theta - 1) / (2 * theta) + 2,
+                // dry run: batches serve all due work (k_measure); K is a placeholder
+                "measure" => 1,
                 x => parse_num(x) as usize,
             };
-            let age = match a.s("age", "inf").as_str() {
-                "inf" => usize::MAX / 4,
-                x => parse_num(x) as usize,
+            // log budget: --age in batches, or --age-appends A (= A / B batches;
+            // every posting is then committed within A appends unless K overflows)
+            let age = match (a.s("age-appends", "").as_str(), a.s("age", "inf").as_str()) {
+                ("", "inf") => usize::MAX / 4,
+                ("", x) => parse_num(x) as usize,
+                (x, _) => {
+                    let ap = parse_num(x) as usize;
+                    assert!(ap >= b && ap % b == 0, "--age-appends {ap} must be a positive multiple of --b {b}");
+                    ap / b
+                }
             };
             Policy::Batched { b, k, theta, age }
         }
@@ -1155,7 +1249,35 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
     };
     // fixed DocMap layout: version-map slots per epoch (one per edit or
     // removal): 1.2 x the expected edits and removals between scheduled rebuilds
-    let major_every = a.u("major-every", 1_000_000);
+    // E_V (ValMap rebuild period): --major-every, or its alias --val-every
+    let major_every = a.u("val-every", a.u("major-every", 1_000_000));
+    let val_every = match policy {
+        Policy::Rebuild { r } => r,
+        Policy::Batched { .. } => major_every,
+    };
+    // E_L (log compaction period): default E_V, i.e. every log compaction is a
+    // ValMap rebuild (10^6 by default; 0 = never)
+    let log_every = match a.s("log-every", "auto").as_str() {
+        "auto" => val_every,
+        x => parse_num(x) as usize,
+    };
+    assert!(
+        val_every == 0 || log_every == 0 || val_every % log_every == 0,
+        "--major-every (E_V = {val_every}) must be a multiple of --log-every (E_L = {log_every})"
+    );
+    let coupled = log_every == 0 || log_every == val_every;
+    // P̂, posting records in every log snapshot. auto: 0 when every log
+    // compaction is a ValMap rebuild (nothing is pending then); otherwise
+    // E_V, the safe public bound (pending postings <= appends since the last
+    // ValMap rebuild < E_V), which is large: give --pend-cap N, e.g. from a
+    // dry run with --pend-cap measure (eval_all.sh does that).
+    let (pend_cap, pend_measure) = match a.s("pend-cap", "auto").as_str() {
+        "auto" if coupled => (0, false),
+        "auto" if val_every > 0 => (val_every, false),
+        "auto" => panic!("--log-every {log_every} without ValMap rebuilds (--major-every 0) needs --pend-cap N (or --pend-cap measure for a dry run)"),
+        "measure" => (0, true),
+        x => (parse_num(x) as usize, false),
+    };
     let vmap_pad = match a.s("vmap-pad", "auto").as_str() {
         "auto" => {
             let e = if major_every > 0 { major_every } else { 1_000_000 };
@@ -1163,6 +1285,7 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         }
         x => parse_num(x) as usize,
     };
+    let k_measure = matches!(policy, Policy::Batched { .. }) && a.s("k", "auto") == "measure";
     let tparams = |mu: usize, val_len: usize, sigma: usize| Params {
         mu,
         p: 1,
@@ -1180,6 +1303,12 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         posting_bytes: pb,
         policy,
         major_every,
+        log_every,
+        pend_cap,
+        pend_measure,
+        k_measure,
+        // --age-appends: phased deadlines; --age (batches): the unphased rule
+        age_phased: a.b("age-appends"),
         doc_layout,
         doc: tparams(((a.f("doc-mu-factor", 2.0) * (doc_chunks as f64 + edits * avg)).ceil() as usize).max(64), doc_row, a.u("doc-sigma", 64)),
         doc_row_bytes: doc_row,
@@ -1197,10 +1326,11 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
     }
 }
 
-fn policy_cols(p: &Policy) -> String {
+fn policy_cols(p: &Policy, k_measure: bool) -> String {
     match p {
         Policy::Batched { b, k, theta, age } => {
             let age = if *age >= usize::MAX / 8 { "inf".to_string() } else { age.to_string() };
+            let k = if k_measure { "measure".to_string() } else { k.to_string() };
             format!("batched,{b},{k},{theta},{age},")
         }
         Policy::Rebuild { r } => format!("rebuild,,,,,{r}"),
@@ -1244,12 +1374,24 @@ fn design(a: &Args) {
     let all_kw: Vec<String> = wl.mm_full.iter().map(|(w, _)| w.clone()).collect();
     let postings_total: usize = wl.mm_full.iter().map(|(_, v)| v.len()).sum();
     println!(
-        "[{label}] {} keywords, {} docs ({} at setup), {} postings; C={} ValMap mu={} DocMap {:?} rows={} policy={:?} major_every={}",
-        all_kw.len(), wl.docs.len(), wl.nb, postings_total, cfg.chunk_cap(), cfg.val.mu, cfg.doc_layout,
-        if cfg.doc_layout == DocLayout::Rows { cfg.doc_rows } else { cfg.doc.mu }, cfg.policy, cfg.major_every
+        "[{label}] {} keywords, {} docs ({} at setup), {} postings (scale {} {}); C={} ValMap mu={} DocMap {:?} rows={} policy={:?} ValMap rebuild every {} (E_V), log compaction every {} (E_L), pending records per snapshot {}",
+        all_kw.len(), wl.docs.len(), wl.nb, postings_total, a.u("scale", 1).max(1), a.s("scale-mode", "disjoint"), cfg.chunk_cap(), cfg.val.mu, cfg.doc_layout,
+        if cfg.doc_layout == DocLayout::Rows { cfg.doc_rows } else { cfg.doc.mu }, cfg.policy, cfg.val_every(),
+        if cfg.coupled() { "rebuild".to_string() } else { cfg.log_every.to_string() },
+        if cfg.pend_measure { "measured (dry run, unpadded)".to_string() } else { cfg.pend_cap.to_string() }
     );
     let t = Instant::now();
     let mut m = MkseLog::setup(cfg.clone(), &mm_build, &all_kw, &wl.lens, wl.default_len, &mut rng);
+    // kappa_A windows: --kappa-window, default the log budget A (age x B), else
+    // E_V, else E_L, else 10^6 appends
+    let age_appends = match cfg.policy {
+        Policy::Batched { b, age, .. } if age < usize::MAX / 8 => age * b,
+        _ => 0,
+    };
+    m.kappa_window = a.u(
+        "kappa-window",
+        [age_appends, cfg.val_every(), cfg.log_every, 1_000_000].into_iter().find(|&x| x > 0).unwrap(),
+    );
     let setup_ms = t.elapsed().as_secs_f64() * 1e3;
     println!(
         "[{label}] setup {:.1}s: ValMap {} chunks (load {:.3}), log {:.1} MB, ValMap hint {:.1} MB, DocMap hint {:.2} MB",
@@ -1313,15 +1455,37 @@ fn design(a: &Args) {
     let mut live_docs: Vec<u32> = wl.docs[..wl.nb].to_vec();
     let mut deleted: HashSet<u32> = HashSet::new();
 
-    // accounting
+    // accounting; owner upload split by what is uploaded
     let mut owner_upload: usize = 0;
+    let mut up_log = 0usize; // log records of the update operations
+    let mut up_batch = 0usize; // batch rows, flush records, ValMap stash (stateless: VolMap + pending stash)
+    let mut up_docw = 0usize; // DocMap writes of documents (rows or Cuckoo ops, DocMap stash, version map)
+    let mut up_snap = 0usize; // log snapshots
+    let mut up_valrb = 0usize; // ValMap rebuilds
+    let mut up_docrp = 0usize; // DocMap repacks / re-encodes
+    let mut log_only_ms: Vec<f64> = vec![];
     let mut val_rows_total: usize = 0;
     let mut doc_rows_total: usize = 0;
     let mut batches = 0usize;
+    let mut real_ops_total = 0usize;
     let mut rebuild_ms: Vec<f64> = vec![];
     let mut compactions = 0usize;
     let mut doc_compactions = 0usize;
     let mut log_peak = m.log_bytes();
+    // server persistent storage: ValMap (mu rows + stash), DocMap (rows or
+    // buckets + stash + version map), log (snapshot + records since)
+    let val_store = |m: &MkseLog| m.val.prm.mu * m.cfg.val_row_bytes() + m.val_stash_bytes();
+    let doc_store = |m: &MkseLog| {
+        m.doc_mu() * m.cfg.doc_row_cipher_bytes()
+            + if m.cfg.doc_layout == DocLayout::Rows { 0 } else { m.cfg.doc.stash_bytes() }
+            + m.cfg.vmap_bytes()
+    };
+    let mut snap_peak = m.compacted_bytes();
+    let mut storage_peak = val_store(&m) + doc_store(&m) + m.log_bytes();
+    // copy-on-write model: while a rebuild / repack / compaction is installed the
+    // server also holds the old ValMap / DocMap / log (the log as of the previous action)
+    let mut storage_peak_cow = storage_peak;
+    let mut last_log = m.log_bytes();
     let mut last_snap = 0usize;
     let mut last_search = 0usize;
     let mut owner_ms_total = 0.0;
@@ -1332,16 +1496,16 @@ fn design(a: &Args) {
                       pv: &mut Option<Pir>, pd: &mut Option<Pir>,
                       wb: &mut BufWriter<File>, we: &mut BufWriter<File>| {
         owner_ms_total += owner_ms;
-        owner_upload += act.appends * m.cfg.record_bytes();
+        up_log += act.appends * m.cfg.record_bytes();
         for b in &act.batches {
             batches += 1;
+            real_ops_total += b.real_ops;
             let distinct: HashSet<usize> = b.accessed.iter().copied().collect();
             val_rows_total += b.accessed.len();
-            let k = match m.cfg.policy { Policy::Batched { k, .. } => k, _ => 0 };
-            owner_upload += distinct.len() * m.cfg.val_row_bytes() + k * m.cfg.record_bytes() + m.val_stash_bytes();
+            up_batch += distinct.len() * m.cfg.val_row_bytes() + b.records * m.cfg.record_bytes() + m.val_stash_bytes();
             if m.cfg.stateless {
                 // VolMap and the pending stash are re-encrypted and resent after each batch
-                owner_upload += m.cfg.volmap_bytes() + m.cfg.pending_stash_bytes();
+                up_batch += m.cfg.volmap_bytes() + m.cfg.pending_stash_bytes();
             }
             let (mut enc_ms, mut db_ms, mut hint_ms) = (0.0, 0.0, 0.0);
             if let Some(pv) = pv.as_mut() {
@@ -1368,12 +1532,12 @@ fn design(a: &Args) {
             act.doc_ops.iter().flat_map(|o| o.accessed.iter().copied()).collect()
         };
         doc_rows_total += drows.len();
-        owner_upload += drows.len() * m.cfg.doc_row_cipher_bytes();
+        up_docw += drows.len() * m.cfg.doc_row_cipher_bytes();
         if m.cfg.doc_layout != DocLayout::Rows && !act.doc_ops.is_empty() {
-            owner_upload += m.cfg.doc.stash_bytes();
+            up_docw += m.cfg.doc.stash_bytes();
         }
         // fixed DocMap layout: the padded version map is re-encrypted and resent
-        owner_upload += act.vmap_refreshes * m.cfg.vmap_bytes();
+        up_docw += act.vmap_refreshes * m.cfg.vmap_bytes();
         if let (Some(pd), false) = (pd.as_mut(), drows.is_empty()) {
             let rows: Vec<(usize, Vec<u8>)> = drows
                 .iter()
@@ -1396,7 +1560,7 @@ fn design(a: &Args) {
                 *p = np;
                 pir_ms = ms2;
             }
-            owner_upload += m.val.prm.mu * m.cfg.val_row_bytes();
+            up_valrb += m.val.prm.mu * m.cfg.val_row_bytes();
             writeln!(we, "{},rebuild,{:.1},{}", m.total_appends, ms + pir_ms, m.val.prm.mu * m.cfg.val_row_bytes()).unwrap();
         }
         if act.doc_compactions > 0 {
@@ -1408,15 +1572,26 @@ fn design(a: &Args) {
                 };
                 *p = Pir::new(p.name(), &rows, m.cfg.doc_row_cipher_bytes()).0;
             }
-            owner_upload += m.doc_mu() * m.cfg.doc_row_cipher_bytes();
+            up_docrp += act.doc_compactions * m.doc_mu() * m.cfg.doc_row_cipher_bytes();
             writeln!(we, "{},doc_compaction,,{}", m.total_appends, m.doc_mu() * m.cfg.doc_row_cipher_bytes()).unwrap();
         }
         if act.compactions > 0 {
             compactions += act.compactions;
-            owner_upload += m.compacted_bytes();
-            writeln!(we, "{},log_compaction,,{}", m.total_appends, m.compacted_bytes()).unwrap();
+            up_snap += act.compactions * m.compacted_bytes();
+            log_only_ms.extend_from_slice(&act.log_only_ms);
+            let ms: f64 = act.log_only_ms.iter().sum();
+            writeln!(we, "{},log_compaction,{ms:.1},{}", m.total_appends, m.compacted_bytes()).unwrap();
         }
+        owner_upload = up_log + up_batch + up_docw + up_snap + up_valrb + up_docrp;
         log_peak = log_peak.max(m.log_bytes());
+        snap_peak = snap_peak.max(m.compacted_bytes());
+        let total = val_store(m) + doc_store(m) + m.log_bytes();
+        storage_peak = storage_peak.max(total);
+        let old = if act.rebuilds.is_empty() { 0 } else { val_store(m) }
+            + if act.doc_compactions > 0 { doc_store(m) } else { 0 }
+            + if act.compactions > 0 { last_log } else { 0 };
+        storage_peak_cow = storage_peak_cow.max(total + old);
+        last_log = m.log_bytes();
         stash_peak_seen = stash_peak_seen.max(m.val.stash_len());
         for p in profiles.iter_mut() {
             if p.observe(m, &act) {
@@ -1536,8 +1711,13 @@ fn design(a: &Args) {
                     break 'replay;
                 }
                 deleted.insert(id);
-                for list in refmm.values_mut() {
-                    list.retain(|x| *x != id);
+                // the reference lists holding id are those of its keywords (setup
+                // and replay postings both come from doc_kw); scanning every list
+                // would cost O(all postings) per removal, quadratic under --scale
+                for w in &wl.doc_kw[&id] {
+                    if let Some(list) = refmm.get_mut(w) {
+                        list.retain(|x| *x != id);
+                    }
                 }
             }
             if m.total_appends - last_snap >= snap_every {
@@ -1568,14 +1748,20 @@ fn design(a: &Args) {
     let summary_path = a.s("summary", "results/design_summary.csv");
     let mut sw = append_csv(
         &summary_path,
-        "label,policy,b,k,theta,age,r,major_every,client_model,val_pir,doc_pir,pend_pad_overflow,val_rows,doc_rows,doc_cap,doc_layout,evict,alpha,mu_factor,keywords,docs_setup,docs_total,appends,batches,k_overflow_batches,deferred_total,pend_peak,max_pending_age,log_peak_bytes,compacted_log_bytes,val_stash_peak,val_overflow,val_load,val_stale,doc_load,doc_compactions,log_compactions,rebuilds,rebuild_ms_mean,setup_ms,replay_s,owner_ms_per_append,owner_upload_per_append,val_rows_per_append,doc_rows_per_append,pir_hint_ms_per_batch,val_hint_bytes,doc_hint_bytes,val_delta_packed,join_bytes,halted,val_cap,val_live_max,doc_live_cap,doc_live_max,ver_cap,ver_max,vmap_pad,vmap_peak,compacted_log_records",
+        "label,policy,b,k,theta,age,r,major_every,client_model,val_pir,doc_pir,pend_pad_overflow,val_rows,doc_rows,doc_cap,doc_layout,evict,alpha,mu_factor,keywords,docs_setup,docs_total,appends,batches,k_overflow_batches,deferred_total,pend_peak,max_pending_age,log_peak_bytes,compacted_log_bytes,val_stash_peak,val_overflow,val_load,val_stale,doc_load,doc_compactions,log_compactions,rebuilds,rebuild_ms_mean,setup_ms,replay_s,owner_ms_per_append,owner_upload_per_append,val_rows_per_append,doc_rows_per_append,pir_hint_ms_per_batch,val_hint_bytes,doc_hint_bytes,val_delta_packed,join_bytes,halted,val_cap,val_live_max,doc_live_cap,doc_live_max,ver_cap,ver_max,vmap_pad,vmap_peak,compacted_log_records,scale,log_every,val_every,pend_cap,pend_max_at_compaction,snapshot_records,snapshot_bytes,val_rebuilds,log_only_compactions,log_compaction_ms_mean,up_log_records_per_append,up_batches_per_append,up_doc_writes_per_append,up_snapshots_per_append,up_val_rebuilds_per_append,up_doc_repacks_per_append,val_rebuild_per_append_analytic,owner_upload_per_append_analytic,k_max_ops_per_batch,age_appends,kappa_window,kappa_windows,kappa_active_mean,kappa_committed_mean,val_rebuild_bytes,k_mean_ops_per_batch,k_max_ops_steady,scale_mode,snapshot_peak_bytes,val_bytes,doc_bytes,storage_peak_bytes,storage_peak_cow_bytes",
     );
+    let mean = |v: &[usize]| if v.is_empty() { 0.0 } else { v.iter().sum::<usize>() as f64 / v.len() as f64 };
+    let per = |x: usize| format!("{:.1}", x as f64 / appends as f64);
+    // ValMap rebuild upload per append if ValMap is rebuilt every E_V appends,
+    // computed (mu rows / E_V) rather than measured: E_V can exceed the replay
+    let val_every = cfg.val_every();
+    let valrb_analytic = if val_every > 0 { (m.val.prm.mu * cfg.val_row_bytes()) as f64 / val_every as f64 } else { 0.0 };
     writeln!(
         sw,
         "{}",
         [
             label.clone(),
-            policy_cols(&cfg.policy),
+            policy_cols(&cfg.policy, cfg.k_measure),
             cfg.major_every.to_string(),
             (if cfg.stateless { "stateless" } else { "log" }).to_string(),
             (if use_pir { val_kind.clone() } else { "-".to_string() }),
@@ -1629,6 +1815,39 @@ fn design(a: &Args) {
             (if cfg.doc_layout == DocLayout::Fixed { cfg.vmap_pad } else { 0 }).to_string(),
             m.vmap_peak.to_string(),
             (m.compacted_bytes() / cfg.record_bytes()).to_string(),
+            a.u("scale", 1).max(1).to_string(),
+            cfg.log_every.to_string(),
+            val_every.to_string(),
+            (if cfg.pend_measure { "measure".to_string() } else { cfg.pend_cap.to_string() }),
+            m.pend_snap_max.to_string(),
+            m.compacted_records.to_string(),
+            m.compacted_bytes().to_string(),
+            m.val_rebuilds.to_string(),
+            (m.log_compactions - m.val_rebuilds).to_string(),
+            format!("{:.1}", if log_only_ms.is_empty() { 0.0 } else { log_only_ms.iter().sum::<f64>() / log_only_ms.len() as f64 }),
+            per(up_log),
+            per(up_batch),
+            per(up_docw),
+            per(up_snap),
+            per(up_valrb),
+            per(up_docrp),
+            format!("{:.1}", valrb_analytic),
+            format!("{:.1}", (owner_upload - up_valrb) as f64 / appends as f64 + valrb_analytic),
+            m.max_batch_ops.to_string(),
+            age_appends.to_string(),
+            m.kappa_window.to_string(),
+            m.kappa_committed.len().to_string(),
+            format!("{:.1}", mean(&m.kappa_active)),
+            format!("{:.1}", mean(&m.kappa_committed)),
+            (m.val.prm.mu * cfg.val_row_bytes()).to_string(),
+            format!("{:.1}", real_ops_total as f64 / batches.max(1) as f64),
+            m.max_batch_ops_steady.to_string(),
+            a.s("scale-mode", "disjoint"),
+            snap_peak.to_string(),
+            val_store(&m).to_string(),
+            doc_store(&m).to_string(),
+            storage_peak.to_string(),
+            storage_peak_cow.to_string(),
         ]
         .join(",")
     )
@@ -1666,10 +1885,33 @@ fn design(a: &Args) {
         m.val.stash_peak, cfg.val.sigma, m.val.overflow, if m.halted { ", HALTED" } else { "" }, m.val.load(), rebuild_ms.len(), compactions, doc_compactions
     );
     println!(
-        "[{label}]   public caps: ValMap Encode {} items (live max {}), DocMap live cap {} (live max {}, {} rows), snapshot {} flush + {} version records (needed max {}){}",
-        cfg.val_cap, m.val_live_max, cfg.doc_live_cap, m.doc_live_max, m.doc_mu(), cfg.kw_pad, cfg.ver_cap, m.ver_max,
+        "[{label}]   public caps: ValMap Encode {} items (live max {}), DocMap live cap {} (live max {}, {} rows), snapshot {} flush + {} pending (needed max {}) + {} version records (needed max {}){}",
+        cfg.val_cap, m.val_live_max, cfg.doc_live_cap, m.doc_live_max, m.doc_mu(), cfg.kw_pad,
+        if cfg.pend_measure { "unpadded".to_string() } else { cfg.pend_cap.to_string() }, m.pend_snap_max, cfg.ver_cap, m.ver_max,
         if cfg.doc_layout == DocLayout::Fixed { format!(", version map {} slots (peak {} entries)", cfg.vmap_pad, m.vmap_peak) } else { String::new() }
     );
+    let kb = |x: usize| x as f64 / appends as f64 / 1e3;
+    println!(
+        "[{label}]   schedule: {} log compactions ({} with a ValMap rebuild), snapshot {:.1} MB ({} records); owner upload per append {:.2} KB = log records {:.3} + batches {:.3} + document writes {:.3} + snapshots {:.3} + ValMap rebuilds {:.3} + DocMap repacks {:.3} KB; ValMap rebuild every E_V = {} analytic {:.3} KB/append (total with it {:.2} KB)",
+        m.log_compactions, m.val_rebuilds, m.compacted_bytes() as f64 / 1e6, m.compacted_records, kb(owner_upload), kb(up_log), kb(up_batch), kb(up_docw), kb(up_snap),
+        kb(up_valrb), kb(up_docrp), val_every, valrb_analytic / 1e3, ((owner_upload - up_valrb) as f64 / appends as f64 + valrb_analytic) / 1e3
+    );
+    println!(
+        "[{label}]   batches: K {} (real operations per batch: most {}, most after the first two age windows {}, mean {:.1}), K-overflow batches {}, log budget (age) {} appends, max pending postings {}; per {}-append window: {:.0} keywords with postings, {:.0} committed ({} windows); ValMap rebuild uploads {:.1} MB (mu x row)",
+        if cfg.k_measure { "measure".to_string() } else { match cfg.policy { Policy::Batched { k, .. } => k.to_string(), _ => "0".to_string() } },
+        m.max_batch_ops, m.max_batch_ops_steady, real_ops_total as f64 / batches.max(1) as f64, m.k_overflow_batches, if age_appends > 0 { age_appends.to_string() } else { "inf".to_string() }, m.pend_peak,
+        m.kappa_window, mean(&m.kappa_active), mean(&m.kappa_committed), m.kappa_committed.len(), (m.val.prm.mu * cfg.val_row_bytes()) as f64 / 1e6
+    );
+    let gb = |x: usize| x as f64 / 1e9;
+    println!(
+        "[{label}]   server storage: ValMap {:.3} GB, DocMap {:.3} GB, log peak {:.3} GB (snapshot peak {:.3} GB); total peak {:.3} GB, {:.3} GB with old copies during {} ValMap rebuilds / {} DocMap repacks / {} log compactions (copy-on-write); ValMap live chunks max {} (cap {})",
+        gb(val_store(&m)), gb(doc_store(&m)), gb(log_peak), gb(snap_peak), gb(storage_peak), gb(storage_peak_cow),
+        m.val_rebuilds, doc_compactions, m.log_compactions, m.val_live_max, cfg.val_cap
+    );
+    // machine-readable (eval_all.sh sizes --pend-cap and --k from a dry run)
+    println!("[{label}] pend_max_at_compaction {}", m.pend_snap_max);
+    println!("[{label}] k_max_ops_per_batch {}", m.max_batch_ops);
+    println!("[{label}] k_max_ops_steady {}", m.max_batch_ops_steady);
     for p in profiles.iter() {
         let mb = |x: usize| x as f64 / 1e6;
         let n = p.searches.max(1);
@@ -1697,10 +1939,25 @@ fn selftest_design() {
         ("batched", "cuckoo"),
         ("perop", "rows"),
         ("rebuild", "rows"),
+        // log compaction every 300 appends, ValMap rebuild every 1200 (P̂ auto = 1200)
+        ("decoupled", "rows"),
+        // static OKVS baseline: K = 0, ValMap rebuild and log compaction every 700
+        ("static", "rows"),
+        // static with log compactions between rebuilds (the log carries everything pending)
+        ("static_dec", "rows"),
+        // two disjoint copies of the corpus, interleaved
+        ("scale2", "rows"),
+        ("shared2", "rows"),
+        // log budget 120 appends (age 3 batches of 40), K dry run (serves all due work)
+        ("aged", "rows"),
     ] {
         let mut m = HashMap::new();
+        let base = match policy {
+            "noreuse" | "stateless" | "decoupled" | "static" | "static_dec" | "scale2" | "shared2" | "aged" => "batched",
+            p => p,
+        };
         for (k, v) in [
-            ("policy", if policy == "noreuse" || policy == "stateless" { "batched" } else { policy }), ("doc-layout", layout), ("synthetic", "80,600,10"), ("b", "40"), ("k", "6"),
+            ("policy", base), ("doc-layout", layout), ("synthetic", "80,600,10"), ("b", "40"), ("k", "6"),
             ("theta", "20"), ("age", "6"), ("r", "300"), ("major-every", "700"), ("bucket-bytes", "1024"),
             ("doc-row", "512"), ("default-doc-len", "1500"), ("sigma", "64"), ("doc-sigma", "64"), ("mu-factor", "3.0"),
             ("doc-spare", "0.05"),
@@ -1710,6 +1967,35 @@ fn selftest_design() {
         if policy == "noreuse" {
             m.insert("no-reuse".to_string(), "true".to_string());
             m.insert("reuse-mu-factor".to_string(), "3.0".to_string());
+        }
+        let mut set = |k: &str, v: &str| {
+            m.insert(k.to_string(), v.to_string());
+        };
+        match policy {
+            "decoupled" => {
+                set("log-every", "300");
+                set("major-every", "1200");
+            }
+            "static" => {
+                set("k", "0");
+                set("major-every", "700");
+            }
+            "static_dec" => {
+                set("k", "0");
+                set("major-every", "1200");
+                set("log-every", "300");
+            }
+            "scale2" => set("scale", "2"),
+            "shared2" => {
+                set("scale", "2");
+                set("scale-mode", "shared");
+            }
+            "aged" => {
+                set("age-appends", "120");
+                set("theta", "200");
+                set("k", "measure");
+            }
+            _ => {}
         }
         if policy == "stateless" {
             m.insert("stateless".to_string(), "true".to_string());
@@ -1782,9 +2068,19 @@ fn selftest_design() {
             t.check_invariants();
         }
         println!(
-            "ok  design {policy}/{layout}: {} appends, {} batches, {} compactions ({} DocMap), K-overflow batches {}, pend peak {}, val stash {}",
-            s.total_appends, nb, ncomp, ndoc, s.k_overflow_batches, s.pend_peak, s.val.stash_len()
+            "ok  design {policy}/{layout}: {} appends, {} batches, {} compactions ({} DocMap; log {}, ValMap rebuilds {}), K-overflow batches {}, pend peak {}, pending in a snapshot max {} (cap {}), val stash {}, {} keywords",
+            s.total_appends, nb, ncomp, ndoc, s.log_compactions, s.val_rebuilds, s.k_overflow_batches, s.pend_peak, s.pend_snap_max, cfg.pend_cap,
+            s.val.stash_len(), all_kw.len()
         );
+        match policy {
+            "decoupled" | "static_dec" => {
+                assert!(s.log_compactions > s.val_rebuilds && s.val_rebuilds > 0 && s.pend_snap_max > 0, "{policy}: no log-only compaction with pending postings");
+                assert_eq!(s.compacted_records, cfg.kw_pad + cfg.pend_cap + cfg.ver_cap);
+            }
+            "static" => assert!(nb == 0 && s.val_rebuilds > 0),
+            "aged" => assert!(s.k_overflow_batches == 0 && s.max_pend_age <= 3 && s.max_batch_ops > 0, "aged: overflow or a posting older than the budget"),
+            _ => {}
+        }
     }
 }
 
@@ -1859,6 +2155,43 @@ fn report(a: &Args) {
             ));
         }
         md.push('\n');
+        if h.contains(&"pend_max_at_compaction".to_string()) {
+            md.push_str("## Log compaction vs ValMap rebuild schedules, scale\n\nE_L = log compaction period, E_V = ValMap rebuild period (appends; 0 = never). A log snapshot (the join download besides hints) has κ̂ flush + P̂ pending-posting + V̂ version records; P̂ is shown next to the most pending postings a snapshot had to carry. Owner upload per append, split by what is uploaded. *Analytic* = ValMap rebuild upload μ·row/E_V per append, and the total with it in place of the measured rebuilds (E_V may exceed the replay).\n\n| run | scale | K | E_L | E_V | appends | log compactions | ValMap rebuilds | snapshot | P̂ (needed) | log records | batches | doc writes | snapshots | ValMap rebuilds | DocMap repacks | total | rebuilds, analytic | total, analytic |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            for r in &rows {
+                let g = |n: &str| r[col(&h, n)].clone();
+                let b = |n: &str| human(fnum(&g(n)));
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    g("label"), g("scale"), g("k"), g("log_every"), g("val_every"), g("appends"), g("log_compactions"), g("val_rebuilds"),
+                    b("snapshot_bytes"), g("pend_cap"), g("pend_max_at_compaction"), b("up_log_records_per_append"), b("up_batches_per_append"),
+                    b("up_doc_writes_per_append"), b("up_snapshots_per_append"), b("up_val_rebuilds_per_append"), b("up_doc_repacks_per_append"),
+                    b("owner_upload_per_append"), b("val_rebuild_per_append_analytic"), b("owner_upload_per_append_analytic")
+                ));
+            }
+            md.push('\n');
+        }
+        if h.contains(&"kappa_committed_mean".to_string()) {
+            md.push_str("## Equal log budgets: UOKVS (age rule) vs append + rebuild\n\nLog budget A: UOKVS commits every posting within A appends (a keyword is due once its oldest pending posting is A appends old; K from a dry run), the static baseline (K = 0) rebuilds ValMap every A appends. Max pending = the uncommitted log tail. κ_A = distinct keywords per A-append window that got a posting record (active) / that a batch committed. Upload per append. μ·row = upload of one ValMap rebuild: add μ·row / E_V per append for UOKVS with a rebuild every E_V appends. Server storage: ValMap (μ rows + stash), DocMap, log peak (snapshot + records since), and the total peak, also with the old ValMap / DocMap / log kept while a rebuild, repack or compaction is installed (copy-on-write). ValMap live chunks are capped by ℓ̂ at all times (more is a halt).\n\n| run | scale | A (κ window) | K | K needed (max / after 2A / mean) | K-overflow batches | E_L | E_V | appends | max pending | snapshot | log records | batches | snapshots | ValMap rebuilds | DocMap writes + repacks | total | κ_A active | κ_A committed | stash peak | μ·row | ValMap live max / ℓ̂ | rebuilds | server: ValMap | DocMap | log peak | snapshot peak | total peak | total peak, copy-on-write |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            for r in &rows {
+                let g = |n: &str| r[col(&h, n)].clone();
+                let b = |n: &str| human(fnum(&g(n)));
+                let docs = human(fnum(&g("up_doc_writes_per_append")) + fnum(&g("up_doc_repacks_per_append")));
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    g("label"), format!("{} {}", g("scale"), g("scale_mode")), g("kappa_window"), g("k"), format!("{} / {} / {}", g("k_max_ops_per_batch"), g("k_max_ops_steady"), g("k_mean_ops_per_batch")), g("k_overflow_batches"), g("log_every"), g("val_every"),
+                    g("appends"), g("pend_peak"), b("snapshot_bytes"), b("up_log_records_per_append"), b("up_batches_per_append"),
+                    b("up_snapshots_per_append"), b("up_val_rebuilds_per_append"), docs, b("owner_upload_per_append"),
+                    g("kappa_active_mean"), g("kappa_committed_mean"), g("val_stash_peak"), b("val_rebuild_bytes")
+                ));
+                md.pop();
+                md.push_str(&format!(
+                    " {} / {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    g("val_live_max"), g("val_cap"), g("val_rebuilds"), b("val_bytes"), b("doc_bytes"), b("log_peak_bytes"),
+                    b("snapshot_peak_bytes"), b("storage_peak_bytes"), b("storage_peak_cow_bytes")
+                ));
+            }
+            md.push('\n');
+        }
     }
     let cp = Path::new(&dir).join("design_summary_clients.csv");
     if let Some((h, rows)) = read_csv(&cp).filter(|(h, _)| h.contains(&"lookup_mean".to_string())) {
@@ -2081,4 +2414,169 @@ fn report(a: &Args) {
     }
     std::fs::write(&out, md).expect("write report");
     println!("wrote {out}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(kv: &[(&str, &str)]) -> Args {
+        Args(kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    /// `--scale 2`: twice the keywords, postings, documents, chunks and caps,
+    /// with the same per-keyword statistics, and the copies interleaved.
+    #[test]
+    fn scale_doubles_the_corpus() {
+        let base = [("synthetic", "200,1500,10"), ("bucket-bytes", "1024"), ("doc-row", "512"), ("default-doc-len", "1500")];
+        let a1 = args(&base);
+        let mut kv2 = base.to_vec();
+        kv2.push(("scale", "2"));
+        let a2 = args(&kv2);
+        let w1 = workload(&a1, &mut StdRng::seed_from_u64(5));
+        let w2 = workload(&a2, &mut StdRng::seed_from_u64(5));
+        assert_eq!(w2.mm_full.len(), 2 * w1.mm_full.len());
+        assert_eq!(w2.docs.len(), 2 * w1.docs.len());
+        assert_eq!(w2.nb, 2 * w1.nb);
+        let post = |w: &Workload| w.mm_full.iter().map(|(_, v)| v.len()).sum::<usize>();
+        assert_eq!(post(&w2), 2 * post(&w1));
+        // same per-keyword volumes in each copy
+        let mut v1: Vec<usize> = w1.mm_full.iter().map(|(_, v)| v.len()).collect();
+        let mut v2: Vec<usize> = w2.mm_full.iter().map(|(_, v)| v.len()).collect();
+        v1.extend(v1.clone());
+        v1.sort_unstable();
+        v2.sort_unstable();
+        assert_eq!(v1, v2);
+        // round-robin interleave: copy 0 and copy 1 of each document are adjacent
+        let off = w1.docs.iter().max().unwrap() + 1;
+        for (i, &d) in w1.docs.iter().enumerate() {
+            assert_eq!((w2.docs[2 * i], w2.docs[2 * i + 1]), (d, d + off));
+            let ws1 = &w1.doc_kw[&d];
+            let ws2 = &w2.doc_kw[&(d + off)];
+            assert_eq!(ws2.len(), ws1.len());
+            assert!(ws1.iter().zip(ws2).all(|(a, b)| *b == format!("{a}~1")));
+        }
+        let (c1, c2) = (log_cfg(&a1, &w1), log_cfg(&a2, &w2));
+        // ValMap chunks (mu = 2 x chunks) and the public caps double
+        assert!(c2.val.mu.abs_diff(2 * c1.val.mu) <= 1, "mu {} vs {}", c2.val.mu, c1.val.mu);
+        assert!(c2.val_cap.abs_diff(2 * c1.val_cap) <= 1);
+        assert_eq!(c2.kw_pad, 2 * c1.kw_pad);
+        assert!(c2.doc_rows.abs_diff(2 * c1.doc_rows) <= 66);
+        assert!(c2.doc_live_cap.abs_diff(2 * c1.doc_live_cap) <= 1);
+        assert!(c2.ver_cap.abs_diff(2 * c1.ver_cap) <= 66);
+        // the batch schedule does not change with the scale (K auto depends on B and theta)
+        assert_eq!(format!("{:?}", c1.policy), format!("{:?}", c2.policy));
+        // setup: twice the live ValMap chunks
+        let s1 = setup_of(&w1, &c1);
+        let s2 = setup_of(&w2, &c2);
+        assert_eq!(s2.val_live_max, 2 * s1.val_live_max);
+        assert_eq!(s2.keywords(), 2 * s1.keywords());
+    }
+
+    /// `--scale-mode shared`: same keywords, twice the postings and chunks,
+    /// and a replay with removals verified against the reference multimap.
+    #[test]
+    fn shared_scale_keeps_keywords() {
+        let base = [("synthetic", "200,1500,10"), ("bucket-bytes", "1024"), ("doc-row", "512"), ("default-doc-len", "1500"), ("sigma", "64"), ("b", "200"), ("major-every", "1000")];
+        let a1 = args(&base);
+        let mut kv2 = base.to_vec();
+        kv2.extend([("scale", "2"), ("scale-mode", "shared")]);
+        let a2 = args(&kv2);
+        let w1 = workload(&a1, &mut StdRng::seed_from_u64(5));
+        let w2 = workload(&a2, &mut StdRng::seed_from_u64(5));
+        assert_eq!(w2.mm_full.len(), w1.mm_full.len());
+        assert!(w1.mm_full.iter().zip(&w2.mm_full).all(|((x, v), (y, u))| x == y && u.len() == 2 * v.len()));
+        assert_eq!((w2.docs.len(), w2.nb), (2 * w1.docs.len(), 2 * w1.nb));
+        // every (document, copy) once; replay copies rotated, not adjacent
+        let set: HashSet<u32> = w2.docs.iter().copied().collect();
+        assert_eq!(set.len(), w2.docs.len());
+        let off0 = w1.docs.iter().max().unwrap() + 1;
+        let rep = &w2.docs[w2.nb..];
+        assert!(rep.chunks(2).all(|p| p[1] != p[0] + off0));
+        let off = w1.docs.iter().max().unwrap() + 1;
+        assert!(w1.docs.iter().all(|d| w2.doc_kw[&(d + off)] == w1.doc_kw[d]));
+        let (c1, c2) = (log_cfg(&a1, &w1), log_cfg(&a2, &w2));
+        assert_eq!(c2.kw_pad, c1.kw_pad);
+        // chunks per keyword: ceil(2v/C) is between 2 ceil(v/C) - 1 and 2 ceil(v/C)
+        assert!(c2.val.mu <= 2 * c1.val.mu + 1 && 10 * c2.val.mu >= 15 * c1.val.mu, "mu {} vs {}", c2.val.mu, c1.val.mu);
+        assert!(c2.ver_cap.abs_diff(2 * c1.ver_cap) <= 66);
+        let s1 = setup_of(&w1, &c1);
+        let mut s2 = setup_of(&w2, &c2);
+        assert_eq!(s2.keywords(), s1.keywords());
+        assert!(s2.val_live_max <= 2 * s1.val_live_max && 10 * s2.val_live_max >= 15 * s1.val_live_max);
+        // replay part of the interleaved stream with removals; verify every keyword
+        let mut rng = StdRng::seed_from_u64(9);
+        let build: HashSet<u32> = w2.docs[..w2.nb].iter().copied().collect();
+        let mut refmm: HashMap<String, Vec<u32>> =
+            w2.mm_full.iter().map(|(w, ids)| (w.clone(), ids.iter().copied().filter(|i| build.contains(i)).collect())).collect();
+        let mut live: Vec<u32> = w2.docs[..w2.nb].to_vec();
+        for &d in w2.docs[w2.nb..].iter().take(200) {
+            for w in &w2.doc_kw[&d] {
+                s2.insert(w, d, 1500, &mut rng);
+                refmm.get_mut(w).unwrap().push(d);
+            }
+            live.push(d);
+            if rng.gen_bool(0.1) {
+                let id = live.swap_remove(rng.gen_range(0..live.len()));
+                s2.delete_doc(id, &mut rng);
+                for w in &w2.doc_kw[&id] {
+                    refmm.get_mut(w).unwrap().retain(|x| *x != id);
+                }
+            }
+        }
+        for (w, want) in &refmm {
+            let mut got = s2.search(w).ids;
+            let mut want = want.clone();
+            got.sort_unstable();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(got, want, "shared scale: search mismatch for {w}");
+        }
+        assert!(s2.batch > 0 && s2.val_rebuilds > 0, "the test should run batches and a rebuild");
+    }
+
+    fn setup_of(wl: &Workload, cfg: &LogCfg) -> MkseLog {
+        let build: HashSet<u32> = wl.docs[..wl.nb].iter().copied().collect();
+        let mm: Vec<(String, Vec<u32>)> = wl
+            .mm_full
+            .iter()
+            .map(|(w, ids)| (w.clone(), ids.iter().copied().filter(|i| build.contains(i)).collect::<Vec<_>>()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let all: Vec<String> = wl.mm_full.iter().map(|(w, _)| w.clone()).collect();
+        MkseLog::setup(cfg.clone(), &mm, &all, &wl.lens, wl.default_len, &mut StdRng::seed_from_u64(3))
+    }
+
+    #[test]
+    fn schedule_options() {
+        let wl = workload(&args(&[("synthetic", "50,300,8")]), &mut StdRng::seed_from_u64(1));
+        // default: E_L = E_V, P̂ = 0
+        let c = log_cfg(&args(&[]), &wl);
+        assert_eq!((c.log_every, c.val_every(), c.pend_cap, c.coupled()), (1_000_000, 1_000_000, 0, true));
+        // rebuild policy: E_V = E_L = r
+        let c = log_cfg(&args(&[("policy", "rebuild"), ("r", "100000")]), &wl);
+        assert_eq!((c.log_every, c.val_every(), c.pend_cap), (100_000, 100_000, 0));
+        // decoupled: auto P̂ = E_V (safe bound); explicit and measure
+        let c = log_cfg(&args(&[("log-every", "1000000"), ("val-every", "4000000")]), &wl);
+        assert_eq!((c.log_every, c.val_every(), c.pend_cap, c.coupled()), (1_000_000, 4_000_000, 4_000_000, false));
+        let c = log_cfg(&args(&[("log-every", "1000000"), ("major-every", "0"), ("pend-cap", "5000")]), &wl);
+        assert_eq!((c.pend_cap, c.pend_measure), (5000, false));
+        let c = log_cfg(&args(&[("log-every", "1000000"), ("major-every", "0"), ("pend-cap", "measure")]), &wl);
+        assert!(c.pend_measure);
+        // static baseline
+        let c = log_cfg(&args(&[("k", "0"), ("major-every", "1000000"), ("log-every", "1000000")]), &wl);
+        assert!(matches!(c.policy, Policy::Batched { k: 0, .. }) && c.pend_cap == 0);
+        // log budget in appends; K dry run
+        let c = log_cfg(&args(&[("age-appends", "100000"), ("k", "measure")]), &wl);
+        assert!(matches!(c.policy, Policy::Batched { b: 10_000, age: 10, .. }) && c.k_measure && c.age_phased);
+        let c = log_cfg(&args(&[("age", "64")]), &wl);
+        assert!(matches!(c.policy, Policy::Batched { age: 64, .. }) && !c.k_measure && !c.age_phased);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple")]
+    fn schedule_must_nest() {
+        let wl = workload(&args(&[("synthetic", "50,300,8")]), &mut StdRng::seed_from_u64(1));
+        let _ = log_cfg(&args(&[("log-every", "300000"), ("major-every", "1000000")]), &wl);
+    }
 }

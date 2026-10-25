@@ -8,6 +8,7 @@
 #   STASH_JOBS=16 PIR_APPENDS=200000 UPSTREAM_REBUILD_ALL=0 PAIRED_PIR=1             # knobs (defaults shown/derived)
 #
 # Stages: selftest stash churn write writepir pir compare ypir spiral paired report   (default: all)
+#         scale   (not part of `all`: ./scripts/eval_all.sh scale report; see stage 8)
 # Restarting: with the default (all), finished work is skipped: design runs whose log
 # has its "done" line, stages that left $OUT/logs/stage_<name>.done, and stash runs
 # with output. Naming a stage reruns it; FORCE=1 reruns everything but the stash runs
@@ -45,10 +46,12 @@ if [[ $QUICK == 1 ]]; then
   # at a rebuild, above the default --val-cap of 0.46 mu (Enron: <= 0.44 mu);
   # 0.5 mu always suffices at --mu-factor 2 (mu counts the full corpus + 10%)
   QCAP=(--val-cap-frac 0.5)
+  DEC_EL=20000                      # log compaction period of main_decoupled (the QUICK replay has ~140K appends)
 else
   if [[ ! -f $DATA/keyword_file_map.json ]]; then echo "no $DATA/keyword_file_map.json (set DATA or QUICK=1)"; exit 1; fi
   SRC=(--data "$DATA"); N=24000000; MFS="2.0 1.5 1.333 1.111"; PIR_ROWS="131072 262144 524288"; DOC_ROWS="2097152 4194304"; TRIALS=2
   QPIR=(); QCAP=()
+  DEC_EL=1000000
 fi
 CLIENTS=100,1000,10000,100000,1000000
 # real-PIR replays measure server time per batch and per search; a prefix of
@@ -64,9 +67,71 @@ design() { # label, extra args...
     log "design $l done before, skipped"; return 0
   fi
   log "design $l"
-  $B design "${SRC[@]}" "${COMMON[@]}" --label "$l" --out-prefix "$OUT/design/$l" "$@" > "$OUT/logs/design_$l.log" 2>&1
-  tail -7 "$OUT/logs/design_$l.log"
+  # explicit status check: errexit is off when a caller runs this inside `|| ...`
+  if ! $B design "${SRC[@]}" "${COMMON[@]}" --label "$l" --out-prefix "$OUT/design/$l" "$@" > "$OUT/logs/design_$l.log" 2>&1; then
+    echo "design $l FAILED; see $OUT/logs/design_$l.log" >&2; grep -m1 "panicked" -A1 "$OUT/logs/design_$l.log" >&2; return 1
+  fi
+  tail -10 "$OUT/logs/design_$l.log"
 }
+# Dry runs that size public caps from the data, for a run given by its label and args:
+#   K  (--k): the dry run with --k measure serves all due work in every batch;
+#      the real run uses K = ceil(K_HEADROOM x most operations a batch needed) + 2
+#      (K_HEADROOM default 1.1). --age-appends phases the deadlines per keyword, so
+#      there is no burst at the first deadline after setup; K_FROM=steady (not the
+#      default) sizes K from the most after the first two age windows instead (the
+#      excess then overflows,
+#      counted in k_overflow_batches; P̂ then comes from a second dry run with that K,
+#      which has the real run's trajectory). Default K_FROM=max (no overflow);
+#   P̂ (--pend-cap), for runs whose log compactions carry pending postings
+#      (E_L < E_V or E_V = 0): the dry run with --pend-cap measure writes unpadded
+#      snapshots; the real run uses ceil(PEND_HEADROOM x the most pending postings
+#      a compaction carried) + 64 (PEND_HEADROOM default 1.1).
+# Batches and snapshot padding have their own randomness, so the dry run and the
+# real run follow the same trajectory (with K >= the dry-run maximum: no K-overflow).
+# The summary reports both the caps and what was needed (k_max_ops_per_batch,
+# pend_max_at_compaction). dry_caps LABEL K|P|KP ARGS... prints "K P" ("-" = not
+# measured); cached in $OUT/logs/caps_<label>.txt, redone when the stage is named.
+dry_caps() {
+  local l=$1 what=$2; shift 2
+  local f="$OUT/logs/caps_$l.txt"
+  if rerun "$CUR" || [[ ! -s $f ]]; then
+    mkdir -p "$OUT/dry"
+    # one dry run: dry_run SUFFIX EXTRA-ARGS... (extra args come last and win)
+    dry_run() {
+      local sfx=$1; shift
+      log "dry run for $l$sfx ($*)" >&2
+      if ! $B design "${SRC[@]}" "${COMMON[@]}" --summary "$OUT/dry/summary_$l$sfx.csv" --label "dry_$l$sfx" \
+           --out-prefix "$OUT/dry/$l$sfx" "${ARGS[@]}" "$@" > "$OUT/logs/dry_$l$sfx.log" 2>&1; then
+        echo "dry run for $l$sfx failed; see $OUT/logs/dry_$l$sfx.log" >&2; tail -5 "$OUT/logs/dry_$l$sfx.log" >&2; return 1
+      fi
+    }
+    val() { sed -n "s/^\[dry_$l$1\] $2 //p" "$OUT/logs/dry_$l$1.log"; }
+    up() { awk -v m="$1" -v h="$2" -v a="$3" 'BEGIN { c = m * h; if (c > int(c)) c = int(c) + 1; printf "%d", c + a }'; }
+    local ARGS=("$@") ex=() K=- P=- km pm sfx=""
+    [[ $what == *K* ]] && ex+=(--k measure)
+    [[ $what == *P* ]] && ex+=(--pend-cap measure)
+    dry_run "" "${ex[@]}" || return 1
+    if [[ $what == *K* ]]; then
+      local kkey=k_max_ops_per_batch; [[ ${K_FROM:-max} == steady ]] && kkey=k_max_ops_steady
+      km=$(val "" $kkey); [[ -n $km ]] || { echo "dry run for $l: no $kkey line" >&2; return 1; }
+      K=$(up "$km" "${K_HEADROOM:-1.1}" 2)
+      # with K below the dry run's maximum the real run overflows and its pending
+      # postings differ: measure P̂ again with that K (same trajectory as the real run)
+      if [[ $what == *P* && ${K_FROM:-max} == steady ]]; then
+        sfx=_k; dry_run "$sfx" --k "$K" --pend-cap measure || return 1
+      fi
+    fi
+    if [[ $what == *P* ]]; then
+      pm=$(val "$sfx" pend_max_at_compaction); [[ -n $pm ]] || { echo "dry run for $l: no pend_max_at_compaction line" >&2; return 1; }
+      P=$(up "$pm" "${PEND_HEADROOM:-1.1}" 64)
+    fi
+    echo "$K $P" > "$f"
+    log "dry run for $l: K $K (from ${km:--}), P̂ $P (from ${pm:--} pending postings at a log compaction)" >&2
+  fi
+  cat "$f"
+}
+pend_cap() { local l=$1; shift; local c; c=$(dry_caps "$l" P "$@") || return 1; echo "${c#* }"; }
+k_cap() { local l=$1; shift; local c; c=$(dry_caps "$l" K "$@") || return 1; echo "${c% *}"; }
 
 # ---------------------------------------------------------------- 0. correctness
 if want selftest; then
@@ -145,17 +210,33 @@ if want write; then
   # encodes exactly --val-cap items (default ceil(0.46 mu) of the reuse-mode
   # table), a DocMap repack leaves rows - --doc-live-cap never-written rows,
   # and a log snapshot has kw_pad + --ver-cap records (see `design --help`).
-  design main           --policy batched
+  # Schedules: log compaction every E_L = --log-every appends, ValMap rebuild
+  # every E_V = --major-every appends (a multiple of E_L). In the runs below
+  # E_L = E_V (the default), so every log compaction is a ValMap rebuild and
+  # snapshots carry no pending postings (P̂ = 0); main_decoupled separates them.
+  design main           --policy batched --log-every 1000000 --major-every 1000000
+  # decoupled: log compaction every DEC_EL (10^6) appends, no ValMap rebuild in
+  # the replay (E_V = 0): snapshots carry every pending posting (P̂ from a dry run)
+  DEC=(--policy batched --log-every $DEC_EL --major-every 0 --mu-factor 2.2)   # no rebuild: tombstones accumulate; 10% larger table keeps live chunks below the cap
+  PC=$(pend_cap main_decoupled "${DEC[@]}")
+  design main_decoupled "${DEC[@]}" --pend-cap "$PC"
+  # log budget 10^5 appends (phased age rule): every posting is committed within 10^5
+  # appends, the uncommitted log tail of static rebuild_100000; K from a dry run;
+  # E_L = E_V = 10^6 as in main
+  AG=(--policy batched --age-appends 100000 --log-every 1000000 --major-every 1000000)
+  KC=$(k_cap main_age_1e5 "${AG[@]}")
+  design main_age_1e5 "${AG[@]}" --k "$KC"
   design main_a10       --policy batched --alpha 10
   # baselines: append-only log, no ValMap writes until a rebuild
   design logonly        --policy rebuild --r 0
   for r in 100000 300000 1000000; do design rebuild_$r --policy rebuild --r $r; done
   # the original design: one ValMap operation per insertion, flush at half a chunk
-  design perop          --policy perop --theta 101 --major-every 0 --search-every 100000
+  design perop          --policy perop --theta 101 --major-every 0 --mu-factor 2.2 --search-every 100000
   # sensitivity around the recommended schedule
   for b in 1000 3000 30000; do design main_b$b --policy batched --b $b; done
   for th in 50 101; do design main_t$th --policy batched --theta $th; done
-  for e in 300000 0; do design main_major$e --policy batched --major-every $e; done
+  design main_major300000 --policy batched --major-every 300000
+  design main_major0 --policy batched --major-every 0 --mu-factor 2.2
   # random walk: its stash holds ~3% of the chunks (thousands), so sigma = 16
   # would halt at setup; this run uses a stash large enough to complete
   design main_rw        --policy batched --evict rw --sigma 8192
@@ -286,6 +367,83 @@ if want paired; then
        --pir-width 32 --pir-search 3 --search-every 50000 "${QPIR[@]}" "${PREFIX[@]}"
   fi
   done_stage paired
+fi
+
+# ---------------------------------------------------------------- 8. scale at equal log budgets (not in `all`)
+# k copies of the corpus (--scale k: id -> id + c(max id + 1)), replayed with the copies'
+# operation streams interleaved round-robin by document, in two modes (SCALE_MODES):
+#   shared:   keywords kept: kappa fixed, every keyword's volume (chunks, mu) k-fold,
+#             the sublinear-vocabulary case (Heaps' law: kappa_A grows slower than N);
+#   disjoint: keyword w -> w~c: kappa, mu, DocMap and every cap k-fold with the same
+#             per-keyword statistics (vocabulary linear in N: the worst case).
+# For each log budget A (every posting committed within A appends):
+#   scale_static_{mode}_k{k}_A{A}: append + rebuild: K = 0, ValMap rebuild and log compaction every A.
+#   scale_uokvs_{mode}_k{k}_A{A}:  batched B = SCALE_B (10^4), theta = C, phased age rule A
+#                           (--age-appends A), K from a dry run (no K-overflow), no ValMap
+#                           rebuild in the replay (E_V = 0), log compaction every
+#                           E_L = SCALE_UOKVS_EL (default A: the same log length bound and
+#                           snapshot schedule as the static run, so the two differ only in
+#                           batches vs rebuilds), P̂ from the same dry run.
+# The ValMap rebuild term of UOKVS for any certified period E_V is mu x row / E_V
+# per append (summary column val_rebuild_bytes = mu x row).
+# Replays stop after SCALE_APPENDS (3 x 10^6) appends: >= 3 windows of the largest A.
+# A in SCALE_AS (10^5, 3 x 10^5, 10^6) for shared and SCALE_AS_DISJOINT (10^5, 10^6:
+# 3 x 10^5 dropped to keep the stage near 3 h on the server) for disjoint.
+# Runs go SCALE_JOBS at a time (default RAM / 90 GB: a k = 16 run needs up to ~70 GB),
+# largest first; each job writes its own summary, merged into $OUT/design_summary*.csv.
+# Run: ./scripts/eval_all.sh scale report      (knobs: SCALE_MODES SCALE_KS SCALE_AS SCALE_AS_DISJOINT SCALE_B
+#      SCALE_APPENDS SCALE_UOKVS_EL SCALE_JOBS K_HEADROOM K_FROM PEND_HEADROOM)
+if named scale; then
+  CUR=scale
+  if [[ $QUICK == 1 ]]; then
+    KS=${SCALE_KS:-"2 1"}; AS=${SCALE_AS:-"5000 20000"}; ASD=${SCALE_AS_DISJOINT:-"5000 20000"}; SB=${SCALE_B:-1000}; SAPP=${SCALE_APPENDS:-0}
+  else
+    KS=${SCALE_KS:-"16 4 1"}; AS=${SCALE_AS:-"100000 300000 1000000"}; ASD=${SCALE_AS_DISJOINT:-"100000 1000000"}; SB=${SCALE_B:-10000}; SAPP=${SCALE_APPENDS:-3000000}
+  fi
+  MODES=${SCALE_MODES:-"shared disjoint"}
+  SUEL=${SCALE_UOKVS_EL:-A}
+  MEM_GB=$(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo 2>/dev/null || echo 8)
+  SCALE_JOBS=${SCALE_JOBS:-$(( MEM_GB / 90 > 1 ? MEM_GB / 90 : 1 ))}
+  SPRE=(); (( SAPP > 0 )) && SPRE=(--max-appends $SAPP)
+  mkdir -p "$OUT/scale"; FAILS="$OUT/logs/scale_failed.txt"; : > "$FAILS"
+  scale_job() { # static|uokvs mode k A
+    local kind=$1 mode=$2 k=$3 A=$4 l="scale_$1_$2_k$3_A$4"
+    local SUM=(--summary "$OUT/scale/summary_$l.csv")
+    rm -f "$OUT/scale/summary_$l.csv" "$OUT/scale/summary_${l}_clients.csv"
+    if [[ $kind == static ]]; then
+      design "$l" --scale "$k" --scale-mode "$mode" --policy batched --k 0 --major-every "$A" --log-every "$A" "${SPRE[@]}" "${SUM[@]}" || return 1
+    else
+      local EL=$A; [[ $SUEL != A ]] && EL=$SUEL
+      local U=(--scale "$k" --scale-mode "$mode" --policy batched --b "$SB" --age-appends "$A" --log-every "$EL" --major-every 0 "${SPRE[@]}")
+      local c; c=$(dry_caps "$l" KP "${U[@]}") || return 1
+      design "$l" "${U[@]}" --k "${c% *}" --pend-cap "${c#* }" "${SUM[@]}" || return 1
+    fi
+  }
+  log "scale: modes {$MODES}, k in {$KS}, A in {$AS} (disjoint {$ASD}), B $SB, appends ${SAPP:-all}, $SCALE_JOBS jobs at a time"
+  for k in $KS; do
+    for mode in $MODES; do
+      As=$AS; [[ $mode == disjoint ]] && As=$ASD
+      for A in $As; do
+        for kind in static uokvs; do
+          while (( $(jobs -rp | wc -l) >= SCALE_JOBS )); do sleep 2; done
+          ( scale_job $kind "$mode" "$k" "$A" || echo "scale_${kind}_${mode}_k${k}_A${A}" >> "$FAILS" ) &
+        done
+      done
+    done
+  done
+  wait
+  # merge the per-run summaries (same column layout as this binary's design_summary.csv)
+  for suf in "" _clients; do
+    tgt="$OUT/design_summary$suf.csv"
+    for f in "$OUT"/scale/summary_scale_*"$suf".csv; do
+      [[ $suf == "" && $f == *_clients.csv ]] && continue
+      [[ -s $f ]] || continue
+      if [[ ! -s $tgt ]]; then cat "$f" > "$tgt"
+      elif [[ $(head -1 "$tgt") == "$(head -1 "$f")" ]]; then tail -n +2 "$f" >> "$tgt"
+      else echo "note: $tgt has another column layout; scale rows left in $OUT/scale/"; break; fi
+    done
+  done
+  if [[ -s $FAILS ]]; then echo "scale: FAILED runs: $(tr '\n' ' ' < "$FAILS")"; exit 1; fi
 fi
 
 # ---------------------------------------------------------------- 7. one report
