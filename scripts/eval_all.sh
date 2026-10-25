@@ -7,7 +7,7 @@
 #   QUICK=1 ./scripts/eval_all.sh                                                   # small sizes, minutes
 #   STASH_JOBS=16 PIR_APPENDS=200000 UPSTREAM_REBUILD_ALL=0 PAIRED_PIR=1             # knobs (defaults shown/derived)
 #
-# Stages: selftest stash churn write writepir pir compare ypir spiral paired report   (default: all)
+# Stages: selftest stash churn write writepir pir compare ypir spiral paired report   (default: all); named only: oppoint scale
 #         scale   (not part of `all`: ./scripts/eval_all.sh scale report; see stage 8)
 # Restarting: with the default (all), finished work is skipped: design runs whose log
 # has its "done" line, stages that left $OUT/logs/stage_<name>.done, and stash runs
@@ -252,6 +252,22 @@ if want write; then
   design logonly_bf05   --policy rebuild --r 0 --build-frac 0.5
   design main_bf05      --policy batched --build-frac 0.5
   done_stage write
+fi
+
+# ---------------------------------------------------------------- 3b. operating point (named stage)
+# The recommended configuration: phased age rule with log budget A, log compaction
+# every 10^6 appends, and no ValMap rebuild within the replay (the certified rebuild
+# period, ~1.8e7 appends, exceeds it). K and P-hat from one dry run. A 10% larger
+# table (mu-factor 2.2) keeps live chunks (tombstones are dropped only at a rebuild)
+# below the cap. Run with: ./scripts/eval_all.sh oppoint report
+if named oppoint; then
+  CUR=oppoint
+  for A in 100000 1000000; do
+    OP=(--policy batched --age-appends $A --log-every 1000000 --major-every 0 --mu-factor 2.2)
+    C=$(dry_caps main_op_$A KP "${OP[@]}") || exit 1
+    design main_op_$A "${OP[@]}" --k "${C% *}" --pend-cap "${C#* }" || exit 1
+  done
+  done_stage oppoint
 fi
 
 # ---------------------------------------------------------------- 3. write path with real FrodoPIR (E2, E3)
