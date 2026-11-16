@@ -1,13 +1,3 @@
-//! FrodoPIR fork vs upstream on the operations UOKVS needs.
-//!
-//! cargo run --release -- --rows 65536 --elem-bytes 8192 --update-rows 10,21 --batches 4,16,64 --out pir_compare.csv
-//!
-//! * setup:   database construction + hint (A * D)
-//! * update:  refreshing the hint after k changed rows; upstream has no
-//!            incremental update and must recompute the hint
-//! * answer:  server time for a batch of k queries (upstream answers one at a time)
-//! * prep:    client per-query preprocessing (s*A and s*hint)
-
 use rand::{Rng, SeedableRng};
 use std::io::Write;
 use std::time::Instant;
@@ -46,7 +36,6 @@ fn main() {
         println!("{imp:9} {m:22} {p:6} {ms:12.2} ms");
     };
 
-    // ------------------------------------------------------------ upstream
     {
         use frodo_up::api::{CommonParams, QueryParams, Response, Shard};
         let t = Instant::now();
@@ -54,7 +43,6 @@ fn main() {
         let setup = t.elapsed().as_secs_f64() * 1e3;
         rec(&mut w, "upstream", "setup", 0, setup);
         for &k in &updates {
-            // no incremental hint update upstream: rebuilding the shard is the only option
             let ms = if skip_up_update {
                 setup
             } else {
@@ -95,7 +83,6 @@ fn main() {
         }
     }
 
-    // ------------------------------------------------------------ fork
     {
         use frodo_fork::api::{BatchedQueryParams8, QueryParams};
         use frodo_fork::db::{BaseParams, CommonParams, Database};

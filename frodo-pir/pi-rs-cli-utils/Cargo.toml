@@ -1,0 +1,8 @@
+[package]
+name = "pi-rs-cli-utils"
+version = "0.1.0"
+description = "Private Information Retrieval example"
+edition = "2018"
+
+[dependencies]
+clap = { version = "4.3.1", features = ["derive"] }

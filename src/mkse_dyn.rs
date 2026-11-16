@@ -1,18 +1,3 @@
-//! Dynamic MKSE from three UOKVS instances (Figure `fig:composition`), with
-//! insertions, deletions (tombstones), and document updates.
-//!
-//! * VolMap: stash-only map (mu = 0), keyword -> number of flushed chunks.
-//! * ValMap: hierarchical map, (keyword, j) -> chunk of postings. New postings
-//!   are buffered in the ValMap stash ("pending" slots) and flushed into a fresh
-//!   chunk key once `flush_at` postings are pending for that keyword
-//!   (default: half a chunk). Every MKSE operation makes the same number of
-//!   ValMap accesses: a flush is an insertion, otherwise a dummy operation.
-//! * DocMap: hierarchical map, (id, c) -> c-th chunk of the document.
-//!
-//! Deletions add a tombstone posting through the same pending path;
-//! deleting a document also turns its DocMap chunks into tombstones with an
-//! invalidation-mode update.
-
 use crate::uokvs::{derive, Key, OpOut, OwnerKeys, Params, Table, UpdateMode, K32};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -21,19 +6,16 @@ use std::collections::{HashMap, HashSet};
 pub struct MkseCfg {
     pub val: Params,
     pub doc: Params,
-    /// capacity of the stash-only VolMap
+    // capacity of the stash-only VolMap
     pub vol_sigma: usize,
-    /// pending-posting slots in the ValMap stash
+    // pending-posting slots in the ValMap stash
     pub pend_sigma: usize,
-    /// bytes per posting: id (4) + chunk count (2) + flags (1) + DocMap capability (32) + pad
     pub posting_bytes: usize,
-    /// flush threshold in postings
+    // flush threshold in postings
     pub flush_at: usize,
-    /// optional cap on pending postings: when exceeded, the keyword with the
-    /// most pending postings is flushed as a partial chunk (one flush per op)
     pub pend_budget: Option<usize>,
     pub update_mode: UpdateMode,
-    /// bytes per DocMap chunk (= doc.val_len)
+    // bytes per DocMap chunk (= doc.val_len)
     pub doc_chunk_bytes: usize,
 }
 
@@ -65,17 +47,16 @@ pub enum OpKind {
     UpdateDoc,
 }
 
-/// Server-visible effect of one MKSE operation plus owner counters.
+// Server-visible effect of one MKSE operation plus owner counters.
 #[derive(Clone, Debug)]
 pub struct MkseOp {
     pub kind: OpKind,
-    /// ValMap operations (one per posting added: a flush insertion or a dummy)
     pub val: Vec<OpOut>,
-    /// DocMap operations (insertions or updates of chunks)
+    // DocMap operations (insertions or updates of chunks)
     pub doc: Vec<OpOut>,
     pub flushes: usize,
     pub new_doc: bool,
-    /// number of VolMap / ValMap-stash refreshes
+    // number of VolMap / ValMap-stash refreshes
     pub stash_refreshes: usize,
 }
 
@@ -95,9 +76,9 @@ impl MkseOp {
 pub struct SearchOut {
     pub ids: Vec<u32>,
     pub chunks: usize,
-    /// ValMap PIR positions (s per chunk)
+    // ValMap PIR positions (s per chunk)
     pub val_queries: Vec<usize>,
-    /// DocMap PIR positions (s per document chunk)
+    // DocMap PIR positions (s per document chunk)
     pub doc_queries: Vec<usize>,
     pub pending_seen: usize,
 }
@@ -125,8 +106,6 @@ fn enc_postings(ps: &[Posting], pb: usize) -> Vec<u8> {
         v.extend_from_slice(&p.id.to_le_bytes());
         v.extend_from_slice(&p.nch.to_le_bytes());
         v.push(p.tomb as u8);
-        // capability placeholder (the real capability is derivable by the owner;
-        // its bytes only matter for size)
         v.resize(start + pb, 0);
     }
     v
@@ -157,8 +136,6 @@ impl Mkse {
         ((len + self.cfg.doc_chunk_bytes - 1) / self.cfg.doc_chunk_bytes).max(1) as u16
     }
 
-    /// Setup: every keyword's postings are written as chunks (the last one may
-    /// be partial).
     pub fn setup<R: Rng>(
         cfg: MkseCfg,
         mm: &[(String, Vec<u32>)],
@@ -228,8 +205,6 @@ impl Mkse {
                 .collect();
             let mut j = 0u32;
             let mut rest = &ps[..];
-            // Setup is a joint encoding, so the remainder becomes a (partial)
-            // chunk too; only postings inserted later wait in the stash.
             while !rest.is_empty() {
                 let take = rest.len().min(cap);
                 let k = Key::sub(w.as_bytes(), j as u64);
@@ -350,7 +325,7 @@ impl Mkse {
         r
     }
 
-    /// Replaces a document's content (same number of chunks).
+    // Replaces a document's content (same number of chunks).
     pub fn update_doc<R: Rng>(&mut self, id: u32, rng: &mut R) -> MkseOp {
         let mut r = MkseOp::new(OpKind::UpdateDoc);
         let Some(d) = self.docs.get(&id).cloned() else { return r };
@@ -367,7 +342,6 @@ impl Mkse {
         r
     }
 
-    /// Client search (plaintext simulation of Figure `fig:composition`).
     pub fn search(&self, w: &str) -> SearchOut {
         let mut out = SearchOut::default();
         let (vlk, _) = self.vol_keys(w);
@@ -420,7 +394,6 @@ impl Mkse {
         out
     }
 
-    /// Bytes the owner uploads for an operation (buckets + refreshed stashes).
     pub fn upload_bytes(&self, r: &MkseOp) -> usize {
         let vb = self.cfg.val.bucket_bytes();
         let db = self.cfg.doc.bucket_bytes();
@@ -435,8 +408,6 @@ impl Mkse {
         crate::uokvs::NONCE + self.cfg.posting_bytes + crate::uokvs::META + crate::uokvs::CHECK
     }
 
-    /// Bytes a client downloads in a search besides PIR answers: the VolMap
-    /// stash, the ValMap stash (overflow chunks + pending slots), the DocMap stash.
     pub fn search_stash_bytes(&self) -> usize {
         self.vol.prm.stash_bytes()
             + self.cfg.val.stash_bytes()

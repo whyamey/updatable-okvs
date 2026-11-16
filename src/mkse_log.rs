@@ -1,83 +1,3 @@
-//! The full dynamic MKSE design (revised Section 4).
-//!
-//! Per owner:
-//! * **ValMap**: UOKVS (Cuckoo, p = 1). A bucket is a chunk of up to C
-//!   postings. Chunk keys are versioned by their length: `(w, i, len)`, so a
-//!   rewrite of the partial last chunk is an insertion of a fresh key and the
-//!   old copy is freed in owner state only (it becomes stale = free).
-//! * **Log**: append-only, stash-only map that clients copy incrementally.
-//!   Every record has the same size: a PRF tag and an encrypted body.
-//!     - posting record, tag F(k_w, "post", epoch, n): w's n-th posting
-//!       (or a tombstone)
-//!     - flush record, tag F(k_w, "flush", epoch, m): w's committed volume v_c
-//!     - document version record, tag F(cap_id, "ver", epoch, m, part)
-//!   Every log compaction starts a new log epoch ε_L, so tags never repeat
-//!   across epochs. ValMap chunk keys carry the ValMap epoch ε_V, a separate
-//!   counter that only a ValMap rebuild advances.
-//! * **DocMap**: either rows addressed by number (`DocLayout::Rows`; the row
-//!   numbers live in the document version records, chunks are written to
-//!   never-used rows, freed rows are reused only after a DocMap compaction)
-//!   or a UOKVS keyed by `(id, ver, j)` (`DocLayout::Cuckoo`, for comparison).
-//!
-//! Schedules (all public; they depend only on the number of log appends):
-//! * `Policy::Batched{b, k, theta, age}`: every `b` appends the owner runs
-//!   exactly `k` ValMap operations (dummies pad), executed in a uniformly
-//!   random order, and appends exactly `k` flush records (dummies pad), also
-//!   in a uniformly random order. Keyword w is due once it has `theta` pending
-//!   postings or its oldest pending posting is `age` batches old; due keywords
-//!   are served first-due-first. Whether w is due depends only on w's own
-//!   history; serving more than `k` operations in one batch is a K-overflow
-//!   (counted) and delays the rest. Log budget: a posting appended after
-//!   batch j is due at batch j + `age` at the latest, i.e. within `age * b`
-//!   appends, so with no K-overflow every posting is committed (and the
-//!   uncommitted log tail spans) fewer than `age * b` appends.
-//!   Phased (`age_phased`, the bench's `--age-appends`): keyword w has a
-//!   phase φ(w) in [0, age) from a PRF under an owner-only key (never
-//!   delegated) of its keyword index, and is due by age at
-//!   batch t if it has pending postings and (t + φ(w)) mod age = 0. Every
-//!   pending posting is still committed within `age * b` appends, and the
-//!   deadlines of different keywords are spread over the batches, so there is
-//!   no synchronized burst (e.g. right after setup). Whether w is due depends
-//!   only on w's own history and its hidden phase.
-//!   `b = 1, k = 1` is the old one-operation-per-insertion design.
-//! * `Policy::Rebuild{r}`: no flushes; a ValMap rebuild every `r` appends
-//!   (the static-PIR-plus-rebuild baseline; the same as `Batched` with
-//!   `k = 0` and `major_every = r`).
-//! * Two public schedules on the append counter t (absolute: a forced
-//!   compaction does not shift them):
-//!     - **ValMap rebuild** when t is a multiple of E_V (`major_every`, or `r`;
-//!       0 = never). It commits every pending posting, re-encodes ValMap
-//!       under epoch ε_V + 1, and is always accompanied by a log compaction.
-//!     - **Log compaction** when t is a multiple of E_L (`log_every`, 0 = only
-//!       with ValMap rebuilds). E_V must be a multiple of E_L, so a scheduled
-//!       ValMap rebuild coincides with a scheduled log compaction.
-//!   Otherwise only on a public counter: the DocMap has fewer never-written
-//!   rows than a write needs (rows layout: an early log compaction with a
-//!   repack; with `pend_cap = 0`, which keeps pending postings out of
-//!   snapshots, it is a full rebuild as well), or the version map of the
-//!   stateless DocMap has no slot left for an edit or removal (fixed layout:
-//!   a full rebuild). A stash overflow never triggers a rebuild: it is a
-//!   public failure and the structure halts.
-//!   Compactions reveal nothing beyond this schedule:
-//!     - ValMap (rebuilds only): exactly `val_cap` items are encoded (live chunks plus filler
-//!       items under fresh random keys, in one uniformly random order); reuse
-//!       mode frees the fillers right after the Encode, keep mode keeps them.
-//!       Chunk keys carry the epoch, so every lookup key is fresh per epoch.
-//!     - DocMap (rows; at log compactions only, since only version records
-//!       carry row numbers): a repack re-places live chunks at random rows and
-//!       reserves `doc_live_cap - live` rows, so exactly `doc_rows -
-//!       doc_live_cap` never-written rows remain. A repack happens when a
-//!       write lacks never-written rows, or at a scheduled compaction when
-//!       fewer than `doc_repack_below` remain.
-//!     - DocMap (fixed, stateless; at ValMap rebuilds): re-encoded under the
-//!       new epoch with exactly `doc_live_cap` items (fillers as for ValMap).
-//!     - Log: a snapshot of exactly `kw_pad` flush records (each keyword's
-//!       committed count v^c), `pend_cap` posting records (the postings not
-//!       yet committed to ValMap, under epoch-(ε_L + 1) tags with their old
-//!       posting numbers n in [v^c, v), so a search is unchanged; dummies
-//!       pad) and `ver_cap` version records (current versions of live
-//!       documents, dummies pad), in one uniformly random order.
-
 use crate::pir_backend::{frodo_hint_bytes, frodo_row_delta_bytes};
 use crate::uokvs::{derive, Key, OpOut, OwnerKeys, Params, Table, CHECK, K32, META, NONCE};
 use rand::rngs::StdRng;
@@ -99,97 +19,61 @@ pub enum Policy {
 pub enum DocLayout {
     Rows,
     Cuckoo,
-    /// UOKVS keyed `(id, (epoch, u, j))` without version records in the log
-    /// (the stateless client model): version u = 0 of every live document is
-    /// encoded at each rebuild; an edit inserts the new version's chunks under
-    /// fresh keys (reuse mode frees the old ones), a removal frees them, and
-    /// both record (id, u, n_id | deleted) in a padded stash-only version map
-    /// that clients download with every search.
     Fixed,
 }
 
 #[derive(Clone, Debug)]
 pub struct LogCfg {
-    /// ValMap table (p = 1; val_len = chunk plaintext bytes)
+    // ValMap table (p = 1; val_len = chunk plaintext bytes)
     pub val: Params,
     pub posting_bytes: usize,
     pub policy: Policy,
-    /// E_V: a ValMap rebuild when the append counter is a multiple of this
-    /// (0 = never; `Policy::Rebuild{r}` uses r instead). A rebuild commits all
-    /// postings (tombstones applied) and comes with a log compaction.
     pub major_every: usize,
-    /// E_L: a log compaction when the append counter is a multiple of this
-    /// (0 = only together with ValMap rebuilds). E_V must be a multiple of E_L.
     pub log_every: usize,
-    /// P̂: posting records in every log snapshot (pending postings, dummies
-    /// pad); more pending postings at a compaction is a capacity failure.
-    /// 0 is allowed only when every compaction is a ValMap rebuild (E_L = E_V
-    /// or E_L = 0); forced compactions then rebuild ValMap too.
     pub pend_cap: usize,
-    /// dry runs only: snapshots carry the pending postings without padding
-    /// (data-dependent size) so that `pend_snap_max` can size `pend_cap`
     pub pend_measure: bool,
-    /// dry runs only: batches serve all due work without padding (K is then
-    /// not public); `max_batch_ops` sizes K for the real run
     pub k_measure: bool,
-    /// age rule with per-keyword phases (see the module docs)
+    // per-keyword phases for the age rule
     pub age_phased: bool,
     pub doc_layout: DocLayout,
-    /// DocMap table for `DocLayout::Cuckoo` (val_len = doc row bytes)
+    // DocMap table for `DocLayout::Cuckoo` (val_len = doc row bytes)
     pub doc: Params,
-    /// plaintext bytes per DocMap row
+    // plaintext bytes per DocMap row
     pub doc_row_bytes: usize,
-    /// rows of the row-addressed DocMap
+    // rows of the row-addressed DocMap
     pub doc_rows: usize,
-    /// bytes of a log record body (>= posting_bytes, >= 16)
+    // bytes of a log record body (>= posting_bytes, >= 16)
     pub record_body: usize,
-    /// public padding of a compacted log: number of keywords
+    // public padding of a compacted log: number of keywords
     pub kw_pad: usize,
-    /// true: a superseded chunk is freed at once (its bucket can be reused;
-    /// needs the invalidation discipline, Theorem `thm:oblivious ops`).
-    /// false: superseded chunks stay until the next major compaction and
-    /// batches pad with filler insertions instead of dummy operations, so
-    /// every ValMap operation is an insertion of a fresh key (Theorem 1).
     pub reuse_freed: bool,
-    /// Stateless clients: no synced log. A search downloads the stash-only
-    /// VolMap (`kw_pad` entries, refreshed by the owner after each batch) and
-    /// the pending-posting stash (padded to `pend_pad`). DocMap is `Fixed`.
     pub stateless: bool,
     pub pend_pad: usize,
-    /// public number of ValMap items encoded at every rebuild (live chunks +
-    /// fillers); more live chunks than this is a capacity failure (panic)
     pub val_cap: usize,
-    /// public cap on live DocMap chunks at a repack/rebuild (rows layout: the
-    /// repack leaves `doc_rows - doc_live_cap` never-written rows; fixed
-    /// layout: the DocMap Encode has exactly this many items)
     pub doc_live_cap: usize,
-    /// rows layout: a scheduled rebuild also repacks the DocMap when fewer
-    /// never-written rows than this remain (0 = only when a write needs it)
     pub doc_repack_below: usize,
-    /// public number of document version records in a log snapshot
+    // public number of document version records in a log snapshot
     pub ver_cap: usize,
-    /// fixed layout: slots of the padded version map (one per edit or removal
-    /// in an epoch); a rebuild runs when an edit or removal finds it full
     pub vmap_pad: usize,
 }
 
 impl LogCfg {
-    /// E_V, the effective ValMap rebuild period (0 = never)
+    // E_V, the effective ValMap rebuild period (0 = never)
     pub fn val_every(&self) -> usize {
         match self.policy {
             Policy::Rebuild { r } => r,
             Policy::Batched { .. } => self.major_every,
         }
     }
-    /// every scheduled log compaction is a ValMap rebuild
+    // every scheduled log compaction is a ValMap rebuild
     pub fn coupled(&self) -> bool {
         self.log_every == 0 || self.log_every == self.val_every()
     }
-    /// forced compactions (DocMap repacks) are log compactions, not rebuilds
+    // forced compactions (DocMap repacks) are log compactions, not rebuilds
     pub fn pending_in_snapshots(&self) -> bool {
         self.pend_cap > 0 || self.pend_measure
     }
-    /// public size of a log snapshot, in records (not in measure mode)
+    // public size of a log snapshot, in records (not in measure mode)
     pub fn snapshot_records(&self) -> usize {
         self.kw_pad + self.pend_cap + self.ver_cap
     }
@@ -199,7 +83,7 @@ impl LogCfg {
     pub fn record_bytes(&self) -> usize {
         TAG + NONCE + self.record_body + CHECK
     }
-    /// row numbers carried by one document version record
+    // row numbers carried by one document version record
     pub fn rows_per_record(&self) -> usize {
         ((self.record_body - 8) / 4).max(1)
     }
@@ -219,16 +103,12 @@ impl LogCfg {
             DocLayout::Cuckoo | DocLayout::Fixed => self.doc.bucket_bytes(),
         }
     }
-    /// What a stateless client downloads besides PIR answers: VolMap and the
-    /// pending stash (each record has the log record size).
     pub fn volmap_bytes(&self) -> usize {
         self.kw_pad * self.record_bytes()
     }
     pub fn pending_stash_bytes(&self) -> usize {
         self.pend_pad * self.record_bytes()
     }
-    /// The padded version map of the fixed DocMap layout (one record per slot),
-    /// downloaded with every search.
     pub fn vmap_bytes(&self) -> usize {
         if self.doc_layout == DocLayout::Fixed {
             self.vmap_pad * self.record_bytes()
@@ -253,8 +133,6 @@ enum Body {
     Dummy,
 }
 
-/// One planned ValMap chunk write of a batch: an insertion of a fresh key
-/// and, in reuse mode, the owner-local Free of the chunk it supersedes.
 struct ChunkWrite {
     free: Option<Key>,
     key: Key,
@@ -272,16 +150,15 @@ struct Kw {
     name: String,
     cap_val: (K32, K32),
     cap_log: K32,
-    /// committed postings, in order (owner copy of the chunks)
+    // committed postings, in order (owner copy of the chunks)
     committed: Vec<Posting>,
-    /// pending postings with the batch in which each was appended
+    // pending postings with the batch in which each was appended
     pend: Vec<(Posting, u64)>,
-    /// posting records appended in total (= volume v, tombstones included)
+    // posting records appended in total (= volume v, tombstones included)
     n: u32,
-    /// flush records in the current epoch
+    // flush records in the current epoch
     m: u32,
     due_since: Option<u64>,
-    /// phase of the phased age rule: owner-only PRF of the keyword index, in [0, 2^32)
     phase: u32,
 }
 
@@ -291,16 +168,14 @@ pub struct Doc {
     pub nch: u16,
     rows: Vec<u32>,
     pub deleted: bool,
-    /// version records in the current epoch
+    // version records in the current epoch
     m: u32,
     keywords: Vec<u32>,
-    /// fixed layout: the DocMap keys of the current version are
-    /// `(id, (dk_ep, u, j))`; `u` counts versions within epoch `dk_ep`
     u: u32,
     dk_ep: u32,
 }
 
-/// What one owner action did, for accounting.
+// What one owner action did, for accounting.
 #[derive(Clone, Debug, Default)]
 pub struct Action {
     pub appends: usize,
@@ -308,14 +183,14 @@ pub struct Action {
     pub doc_rows_written: Vec<usize>,
     pub doc_ops: Vec<OpOut>,
     pub batches: Vec<BatchOut>,
-    /// log compactions (with or without a ValMap rebuild)
+    // log compactions (with or without a ValMap rebuild)
     pub compactions: usize,
-    /// ValMap rebuilds (owner ms each); each comes with a log compaction
+    // ValMap rebuilds (owner ms each); each comes with a log compaction
     pub rebuilds: Vec<f64>,
-    /// owner ms of log compactions without a ValMap rebuild
+    // owner ms of log compactions without a ValMap rebuild
     pub log_only_ms: Vec<f64>,
     pub doc_compactions: usize,
-    /// fixed layout: refreshes of the padded version map (edits, removals)
+    // fixed layout: refreshes of the padded version map (edits, removals)
     pub vmap_refreshes: usize,
 }
 
@@ -324,7 +199,7 @@ pub struct BatchOut {
     pub index: u64,
     pub real_ops: usize,
     pub dummy_ops: usize,
-    /// flush records appended (K, or the keywords served in measure mode)
+    // flush records appended (K, or the keywords served in measure mode)
     pub records: usize,
     pub keywords_served: usize,
     pub postings_flushed: usize,
@@ -343,13 +218,13 @@ pub struct SearchOut {
     pub chunks_queried: usize,
     pub val_queries: Vec<usize>,
     pub doc_queries: Vec<usize>,
-    /// DocMap queries of each returned document, in result order
+    // DocMap queries of each returned document, in result order
     pub doc_queries_per_doc: Vec<usize>,
     pub tag_probes: usize,
 }
 
 impl SearchOut {
-    /// DocMap queries needed to fetch only the first `cap` documents.
+    // DocMap queries needed to fetch only the first `cap` documents.
     pub fn doc_queries_capped(&self, cap: usize) -> usize {
         self.doc_queries_per_doc.iter().take(cap).sum()
     }
@@ -359,7 +234,7 @@ pub struct MkseLog {
     pub cfg: LogCfg,
     ki: OwnerKeys,
     kl: OwnerKeys,
-    /// owner-only PRF key of the age phases
+    // owner-only PRF key of the age phases
     kphase: K32,
     kd: OwnerKeys,
     pub val: Table,
@@ -383,21 +258,12 @@ pub struct MkseLog {
     // schedule
     pub batch: u64,
     since_batch: usize,
-    /// randomness of snapshot padding and order only, so that the rest of a
-    /// run (and its random workload) does not depend on `pend_cap`: a dry run
-    /// with `pend_measure` sees exactly the pending counts of the real run
     srng: StdRng,
-    /// randomness of batch execution (see `run_batch`)
+    // randomness of batch execution (see `run_batch`)
     brng: StdRng,
-    /// most real ValMap operations a batch needed (to size K)
+    // most real ValMap operations a batch needed (to size K)
     pub max_batch_ops: usize,
-    /// the same over batches after the first two age windows (age rule):
-    /// leaves out the burst when the postings of the first batch interval
-    /// after setup all come due together
     pub max_batch_ops_steady: usize,
-    /// kappa_A statistics: windows of this many appends (0 = off; set by the
-    /// caller): distinct keywords that got a posting record, and that were
-    /// committed by a batch, per complete window
     pub kappa_window: usize,
     win_active: HashSet<u32>,
     win_committed: HashSet<u32>,
@@ -406,7 +272,7 @@ pub struct MkseLog {
     // counters
     pub log_compactions: usize,
     pub val_rebuilds: usize,
-    /// largest number of pending postings a log snapshot had to carry
+    // largest number of pending postings a log snapshot had to carry
     pub pend_snap_max: usize,
     pub total_appends: usize,
     pub k_overflow_batches: usize,
@@ -414,31 +280,20 @@ pub struct MkseLog {
     pub pend_total: usize,
     pub pend_peak: usize,
     pub max_pend_age: u64,
-    /// stateless: batches after which more postings were pending than the
-    /// padded pending stash holds (the pad would have to grow: a leak)
     pub pend_pad_overflow: usize,
-    /// filler insertions and superseded chunks kept (reuse_freed = false)
+    // filler insertions and superseded chunks kept (reuse_freed = false)
     pub fillers: u64,
     pub superseded: u64,
-    /// fixed layout: version map (id -> (u, n_id, deleted)) of the documents
-    /// edited or removed in the current epoch, and the slots used (one per
-    /// edit or removal, a public count)
     vmap: HashMap<u32, (u32, u16, bool)>,
     pub vmap_ops: usize,
     pub vmap_peak: usize,
-    /// a public failure (stash overflow of a table, or more pending postings
-    /// than the padded pending stash holds) halted the structure
     pub halted: bool,
     pub halt_reason: String,
-    /// largest number of live items a rebuild had to encode / place / write
-    /// (to check the public caps val_cap, doc_live_cap, ver_cap)
     pub val_live_max: usize,
-    /// live (committed, current) ValMap chunks now: sum over keywords of
-    /// ceil(committed / C); capped by val_cap at all times
     pub val_live: usize,
     pub doc_live_max: usize,
     pub ver_max: usize,
-    /// items passed to the last padded Encode (= its public cap)
+    // items passed to the last padded Encode (= its public cap)
     pub last_encode: usize,
 }
 
@@ -478,7 +333,6 @@ pub fn dec_postings(b: &[u8], pb: usize) -> Vec<Posting> {
 }
 
 impl MkseLog {
-    // ------------------------------------------------------------ keys
 
     fn chunk_key(&self, w: &str, i: usize, len: usize) -> Key {
         Key::sub(w.as_bytes(), ((self.val_epoch as u64) << 48) | ((i as u64) << 16) | len as u64)
@@ -489,7 +343,7 @@ impl MkseLog {
     fn doc_key(id: u32, ver: u32, j: u16) -> Key {
         Key::sub(&id.to_le_bytes(), ((ver as u64) << 16) | j as u64)
     }
-    /// fixed layout: chunk j of version u (within epoch ep) of document id
+    // fixed layout: chunk j of version u (within epoch ep) of document id
     fn doc_key_fixed(id: u32, ep: u32, u: u32, j: u16) -> Key {
         assert!(ep < 1 << 16, "too many epochs for the key encoding");
         Key::sub(&id.to_le_bytes(), ((ep as u64) << 48) | ((u as u64) << 16) | j as u64)
@@ -500,7 +354,6 @@ impl MkseLog {
             self.halt_reason = why;
         }
     }
-    /// A table whose stash overflowed has halted; so does the whole structure.
     fn check_tables(&mut self) {
         if self.val.halted {
             self.halt(format!("ValMap stash overflow (more than sigma = {} items) after {} appends", self.val.prm.sigma, self.total_appends));
@@ -513,7 +366,7 @@ impl MkseLog {
     fn assert_live(&self) {
         assert!(!self.halted, "the structure halted after a public failure: {}", self.halt_reason);
     }
-    /// Fresh random filler item (fresh random keys; never looked up).
+    // Fresh random filler item (fresh random keys; never looked up).
     fn filler<R: Rng>(&mut self, rng: &mut R) -> (Key, (K32, K32), Vec<u8>) {
         self.fillers += 1;
         let key = Key::sub(b"\0filler", self.fillers);
@@ -523,10 +376,6 @@ impl MkseLog {
         rng.fill(&mut dk);
         (key, (lk, dk), vec![])
     }
-    /// Encode of a rebuilt table with exactly `cap` items: the live entries
-    /// padded with fillers, all in one uniformly random order. Reuse mode
-    /// frees the fillers (owner-local) right after the Encode; keep mode keeps
-    /// them, so the occupancy stays public all epoch.
     fn encode_padded<R: Rng>(&mut self, prm: Params, mut entries: Vec<(Key, (K32, K32), Vec<u8>)>, cap: usize, what: &str, rng: &mut R) -> Table {
         let live = entries.len();
         assert!(live <= cap, "{what} capacity exceeded: {live} live items at a rebuild > public cap {cap}");
@@ -550,8 +399,6 @@ impl MkseLog {
     pub fn doc_nch(&self, len: usize) -> u16 {
         ((len + self.cfg.doc_row_bytes - 1) / self.cfg.doc_row_bytes).clamp(1, u16::MAX as usize) as u16
     }
-
-    // ------------------------------------------------------------ log
 
     fn push_rec(&mut self, tag: Tag, body: Body) {
         let i = self.log.len();
@@ -599,9 +446,7 @@ impl MkseLog {
         self.docs.get_mut(&id).unwrap().m += 1;
     }
 
-    // ------------------------------------------------------------ setup
-
-    /// `mm`: keyword -> ids at setup; `doc_len`: id -> bytes.
+    // `mm`: keyword -> ids at setup; `doc_len`: id -> bytes.
     pub fn setup<R: Rng>(
         cfg: LogCfg,
         mm: &[(String, Vec<u32>)],
@@ -747,7 +592,6 @@ impl MkseLog {
             kw.n = ps.len() as u32;
             kw.committed = ps;
         }
-        // the same padded Encode (exactly val_cap items) as at every rebuild
         s.val_live_max = s.val_live_max.max(entries.len());
         s.val_live = entries.len();
         let (prm, cap) = (s.cfg.val.clone(), s.cfg.val_cap);
@@ -783,7 +627,7 @@ impl MkseLog {
         i
     }
 
-    /// Snapshot padding: a dummy record with a random tag (from `srng`).
+    // Snapshot padding: a dummy record with a random tag (from `srng`).
     fn snap_dummies(&mut self, n: usize) {
         for _ in 0..n {
             let mut t = [0u8; TAG];
@@ -792,14 +636,6 @@ impl MkseLog {
         }
     }
 
-    /// Writes a fresh log for the current epoch: exactly `kw_pad` flush
-    /// records (one per keyword with postings, holding its committed count
-    /// v^c; dummies pad), exactly `pend_cap` posting records (the pending
-    /// postings v^c, ..., v - 1 of every keyword under the new epoch's tags
-    /// with their old posting numbers; dummies pad; none right after a ValMap
-    /// rebuild) and exactly `ver_cap` version records (the current version of
-    /// every live document; removed documents are dropped; dummies pad), all
-    /// in a uniformly random order. Its size is public.
     fn write_snapshot(&mut self) {
         self.log.clear();
         self.tag_ix.clear();
@@ -855,7 +691,6 @@ impl MkseLog {
             self.cfg.ver_cap
         );
         self.snap_dummies(self.cfg.ver_cap - ver_records);
-        // one uniformly random order; clients find records by tag
         self.log.shuffle(&mut self.srng);
         self.tag_ix.clear();
         for (i, r) in self.log.iter().enumerate() {
@@ -869,8 +704,6 @@ impl MkseLog {
         self.compacted_records = self.log.len();
         self.log_live_since_compaction = 0;
     }
-
-    // ------------------------------------------------------------ owner ops
 
     fn tick<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
         self.total_appends += 1;
@@ -889,7 +722,6 @@ impl MkseLog {
                 }
             }
         }
-        // kappa_A: distinct keywords with a posting record / committed per window
         if self.kappa_window > 0 && self.total_appends % self.kappa_window == 0 {
             self.kappa_active.push(self.win_active.len());
             self.kappa_committed.push(self.win_committed.len());
@@ -905,15 +737,11 @@ impl MkseLog {
         }
     }
 
-    /// ValMap rebuild (with a log compaction): rebuild ValMap (all postings,
-    /// tombstones applied, padded to `val_cap`), repack the DocMap if fewer
-    /// than `doc_repack_below` never-written rows remain (rows layout) or
-    /// re-encode it (fixed layout), and rewrite the log in a new epoch.
     pub fn major<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
         self.major_inner(false, act, rng);
     }
 
-    /// `repack`: the DocMap lacks never-written rows for a write (public).
+    // `repack`: the DocMap lacks never-written rows for a write (public).
     fn major_inner<R: Rng>(&mut self, repack: bool, act: &mut Action, rng: &mut R) {
         let t = Instant::now();
         if self.cfg.doc_layout == DocLayout::Rows && (repack || self.virgin.len() < self.cfg.doc_repack_below) {
@@ -932,9 +760,6 @@ impl MkseLog {
         act.compactions += 1;
     }
 
-    /// Log compaction without a ValMap rebuild: repack the DocMap if fewer
-    /// than `doc_repack_below` never-written rows remain (rows layout), and
-    /// write a snapshot in a new log epoch that carries the pending postings.
     pub fn log_compaction<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
         self.log_compaction_inner(false, act, rng);
     }
@@ -950,12 +775,6 @@ impl MkseLog {
         act.compactions += 1;
     }
 
-    /// Rows layout: before a write of `n` chunks, compact the log early (with
-    /// a DocMap repack) if fewer than `n` never-written rows remain. Both
-    /// counts are public: every write reveals its chunk count, and a repack
-    /// resets the never-written rows to `doc_rows - doc_live_cap`. With
-    /// `pend_cap = 0` (snapshots never carry pending postings) the forced
-    /// compaction also rebuilds ValMap.
     fn ensure_doc_rows<R: Rng>(&mut self, n: usize, act: &mut Action, rng: &mut R) {
         if self.cfg.doc_layout == DocLayout::Rows && self.virgin.len() < n {
             if self.cfg.pending_in_snapshots() {
@@ -971,8 +790,6 @@ impl MkseLog {
         }
     }
 
-    /// Fixed layout: an edit or removal takes a version-map slot; rebuild
-    /// first if none is left (the slot count is public).
     fn ensure_vmap_slot<R: Rng>(&mut self, act: &mut Action, rng: &mut R) {
         if self.cfg.doc_layout == DocLayout::Fixed {
             if self.vmap_ops >= self.cfg.vmap_pad {
@@ -1010,7 +827,7 @@ impl MkseLog {
         self.tick(act, rng);
     }
 
-    /// Inserts posting (w, id); a new id also inserts the document.
+    // Inserts posting (w, id); a new id also inserts the document.
     pub fn insert<R: Rng>(&mut self, w: &str, id: u32, doc_len: usize, rng: &mut R) -> Action {
         self.assert_live();
         let mut act = Action::default();
@@ -1080,8 +897,6 @@ impl MkseLog {
                     let (lk, dk) = derive(&cap, k.idx);
                     act.doc_ops.push(t.insert(&k, lk, dk, vec![(ver % 251) as u8; 1], rng));
                 }
-                // version 0 of an epoch is the default; later ones (edits, a
-                // re-insertion after a removal in this epoch) are announced
                 if u > 0 {
                     self.set_vmap(id, (u, nch, false), act);
                 }
@@ -1107,8 +922,6 @@ impl MkseLog {
                     t.remove(&Self::doc_key(id, ver, j));
                 }
             }
-            // owner-local Free of the old version (reuse mode); keep mode
-            // leaves it until the next rebuild
             DocLayout::Fixed => {
                 if self.cfg.reuse_freed {
                     let t = self.doc_table.as_mut().unwrap();
@@ -1138,7 +951,7 @@ impl MkseLog {
         }
     }
 
-    /// Replaces a document's content (new length `len`).
+    // Replaces a document's content (new length `len`).
     pub fn update_doc<R: Rng>(&mut self, id: u32, len: usize, rng: &mut R) -> Action {
         self.assert_live();
         let mut act = Action::default();
@@ -1163,9 +976,6 @@ impl MkseLog {
         act
     }
 
-    /// Deletes a document: a version record (or, fixed layout, a version-map
-    /// entry) marks it deleted, its postings get tombstones, its chunks are
-    /// freed (no server-visible write).
     pub fn delete_doc<R: Rng>(&mut self, id: u32, rng: &mut R) -> Action {
         self.assert_live();
         let mut act = Action::default();
@@ -1195,13 +1005,6 @@ impl MkseLog {
         act
     }
 
-    // ------------------------------------------------------------ batches
-
-    /// One batch. Its randomness (operation order, dummy and filler
-    /// operations, eviction walks, flush-record order) comes from `brng`, so
-    /// the rest of the run, including the random workload of the bench, does
-    /// not depend on K: a dry run with `k_measure` serves exactly the due work
-    /// of the real run as long as the real K is at least its maximum.
     fn run_batch(&mut self) -> BatchOut {
         let t = Instant::now();
         self.batch += 1;
@@ -1232,7 +1035,6 @@ impl MkseLog {
         }
         due.sort_unstable();
         let mut out = BatchOut { index: now, due: due.len(), ..Default::default() };
-        // 1. plan the K operations (owner state advances; nothing is executed yet)
         let mut plan: Vec<Option<ChunkWrite>> = Vec::with_capacity(k.min(1 << 20));
         let mut served: Vec<u32> = Vec::new();
         for &(_, w) in &due {
@@ -1264,7 +1066,6 @@ impl MkseLog {
             plan.push(None);
             out.dummy_ops += 1;
         }
-        // 2. execute them in a uniformly random order
         let mut br = std::mem::replace(&mut self.brng, StdRng::seed_from_u64(0));
         plan.shuffle(&mut br);
         for op in plan {
@@ -1285,7 +1086,6 @@ impl MkseLog {
             };
             out.accessed.extend_from_slice(&o.accessed);
         }
-        // 3. exactly K flush records (dummies pad), in a uniformly random order
         out.keywords_served = served.len();
         let nrec = if self.cfg.k_measure { served.len() } else { k };
         assert!(served.len() <= nrec);
@@ -1301,7 +1101,6 @@ impl MkseLog {
         }
         self.brng = br;
         if self.cfg.stateless && self.pend_total > self.cfg.pend_pad {
-            // the padded pending stash cannot grow: a public failure
             self.pend_pad_overflow += 1;
             self.halt(format!(
                 "pending stash overflow ({} pending postings > pend_pad = {}) after {} appends",
@@ -1326,10 +1125,6 @@ impl MkseLog {
         out
     }
 
-    /// Plans the commit of w's pending postings with at most `budget` ValMap
-    /// operations (appended to `plan`): first the partial last chunk (a fresh
-    /// key (w, i, len'); reuse mode frees the old one), then new chunks.
-    /// Returns (operations, postings committed).
     fn flush_kw(&mut self, w: u32, budget: usize, plan: &mut Vec<Option<ChunkWrite>>) -> (usize, usize) {
         let c = self.cfg.chunk_cap();
         let mut ops = 0;
@@ -1370,21 +1165,13 @@ impl MkseLog {
         (ops, moved)
     }
 
-    // ------------------------------------------------------------ compaction
-
-    /// Starts log epoch ε_L + 1 with a snapshot (see `write_snapshot`).
+    // Starts log epoch ε_L + 1 with a snapshot (see `write_snapshot`).
     pub fn compact<R: Rng>(&mut self, _rng: &mut R) {
         self.epoch += 1;
         self.log_compactions += 1;
         self.write_snapshot();
     }
 
-    /// Repack (only inside a log compaction): re-places every live document chunk at
-    /// uniformly random rows, all rows are rewritten (clients take a fresh
-    /// DocMap hint), and `doc_live_cap - live` further rows are reserved as
-    /// unusable until the next repack, so exactly `doc_rows - doc_live_cap`
-    /// never-written rows remain (a public number). The caller then writes a
-    /// log snapshot so version records carry the new row numbers.
     pub fn compact_docmap<R: Rng>(&mut self, rng: &mut R) {
         let n = self.doc_rows.len();
         let cap = self.cfg.doc_live_cap;
@@ -1410,16 +1197,12 @@ impl MkseLog {
             }
             d.rows = rows;
         }
-        // reserve cap - live rows: never written, but not usable before the next repack
         perm.truncate(n - cap);
         self.virgin = perm;
         self.doc_freed = 0;
         debug_assert_eq!(self.virgin.len(), n - cap);
     }
 
-    /// Rebuild of ValMap: every keyword's postings, with tombstones applied,
-    /// re-chunked canonically under the new epoch's chunk keys, padded with
-    /// fillers to exactly `val_cap` items (one uniformly random order).
     pub fn rebuild_val<R: Rng>(&mut self, rng: &mut R) {
         self.val_epoch += 1;
         let c = self.cfg.chunk_cap();
@@ -1452,10 +1235,6 @@ impl MkseLog {
         self.val = self.encode_padded(prm, entries, cap, "ValMap (--val-cap)", rng);
     }
 
-    /// Fixed layout: re-encode the DocMap under the new epoch (call after
-    /// `rebuild_val`): every live document at version u = 0 with its current
-    /// chunk count, padded with fillers to exactly `doc_live_cap` items; the
-    /// version map is cleared.
     fn rebuild_doc<R: Rng>(&mut self, rng: &mut R) {
         let ep = self.val_epoch;
         let mut ids: Vec<u32> = self.docs.keys().copied().collect();
@@ -1481,11 +1260,6 @@ impl MkseLog {
         self.vmap_ops = 0;
     }
 
-    // ------------------------------------------------------------ client
-
-    /// Search for w by a client holding w's delegation keys and a synced copy
-    /// of the log. Uses only tags it can derive, the log, and the tables'
-    /// public lookup procedure.
     pub fn search(&self, w: &str) -> SearchOut {
         let mut out = SearchOut::default();
         let Some(&wi) = self.kw_ix.get(w) else { return out };
@@ -1526,7 +1300,6 @@ impl MkseLog {
         out.volume = v;
         out.committed = vc;
         out.pending = v - vc;
-        // 3. chunks: ceil(v / C) queries, the last ones dummies if not yet committed
         let mut all: Vec<Posting> = Vec::with_capacity(v);
         let committed_chunks = (vc + c - 1) / c;
         let total_chunks = (v + c - 1) / c;
@@ -1539,7 +1312,6 @@ impl MkseLog {
             all.extend(dec_postings(&val, self.cfg.posting_bytes));
         }
         for _ in committed_chunks..total_chunks {
-            // padding query: s uniformly random positions
             out.val_queries.extend((0..self.val.prm.s).map(|j| (j * 7919 + v) % self.val.prm.mu.max(1)));
         }
         out.chunks_queried = total_chunks;
@@ -1557,9 +1329,6 @@ impl MkseLog {
             let d = &self.docs[&id];
             let before = out.doc_queries.len();
             if self.cfg.doc_layout == DocLayout::Fixed {
-                // the version map (downloaded with the search) names the
-                // version of a document edited or removed in this epoch;
-                // otherwise it is version 0 with the posting's chunk count
                 let (u, n) = match self.vmap.get(&id) {
                     Some(&(u, n, del)) => {
                         assert!(!del, "search returned a removed document");
@@ -1629,8 +1398,6 @@ impl MkseLog {
         out
     }
 
-    // ------------------------------------------------------------ sizes
-
     pub fn log_bytes(&self) -> usize {
         self.log.len() * self.cfg.record_bytes()
     }
@@ -1670,11 +1437,11 @@ impl MkseLog {
     pub fn doc_delta_bytes(&self, packed: bool) -> usize {
         frodo_row_delta_bytes(self.cfg.doc_row_cipher_bytes(), packed)
     }
-    /// Bytes of the ValMap stash a client downloads (padded to sigma).
+    // Bytes of the ValMap stash a client downloads (padded to sigma).
     pub fn val_stash_bytes(&self) -> usize {
         self.cfg.val.stash_bytes()
     }
-    /// Encrypted DocMap row (rows layout) for PIR.
+    // Encrypted DocMap row (rows layout) for PIR.
     pub fn doc_row_cipher<R: Rng>(&self, r: usize, rng: &mut R) -> Vec<u8> {
         let mut v = vec![0u8; self.cfg.doc_row_cipher_bytes()];
         rng.fill(&mut v[..]);
@@ -1686,7 +1453,7 @@ impl MkseLog {
     }
 }
 
-/// Live ids of a posting sequence: the latest record for an id wins.
+// Live ids of a posting sequence: the latest record for an id wins.
 pub fn apply_tombstones(ps: &[Posting]) -> Vec<u32> {
     let mut order: Vec<u32> = Vec::new();
     let mut live: HashSet<u32> = HashSet::new();
@@ -1702,17 +1469,11 @@ pub fn apply_tombstones(ps: &[Posting]) -> Vec<u32> {
     order
 }
 
-// ------------------------------------------------------------ client profiles
-
-/// The PIR used for one map in the paired evaluation.
+// The PIR used for one map in the paired evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PirKind {
-    /// FrodoPIR (our fork): client hint, refreshed by row deltas or anew
     Frodo,
-    /// Spiral (our fast server): no hint; public parameters once
     Spiral,
-    /// YPIR+SP (our fast server, ypir_fast): no hint; packing keys per client key,
-    /// several records per row (`ypir_shape`)
     Ypir,
 }
 
@@ -1734,15 +1495,9 @@ pub fn pir_name(k: PirKind) -> &'static str {
     }
 }
 
-/// YPIR+SP packing keys (11 x 3 polynomials x 2048 x 7 bytes), one set per client key.
 pub const YPIR_PP_BYTES: usize = 473_088;
-/// Queries that share one client key (the server keeps this many public seeds;
-/// ypir_fast `--seeds`). 1 = a fresh key, and packing keys, with every query.
 pub const YPIR_SEEDS: usize = 1;
 
-/// ypir_fast's `Shape::auto`: records per row minimizing query (7 B per row, rows a
-/// power of two >= 2048) plus response (12,288 B per 3,584 B of row). Returns
-/// (rows, instances).
 pub fn ypir_shape(records: usize, record_bytes: usize) -> (usize, usize) {
     (1..=256usize)
         .map(|k| {
@@ -1754,27 +1509,21 @@ pub fn ypir_shape(records: usize, record_bytes: usize) -> (usize, usize) {
         .unwrap()
 }
 
-/// Packing-key bytes for `queries` YPIR queries of one search.
+// Packing-key bytes for `queries` YPIR queries of one search.
 pub fn ypir_pp_bytes(queries: usize) -> usize {
     (queries + YPIR_SEEDS - 1) / YPIR_SEEDS * YPIR_PP_BYTES
 }
 
-/// Spiral query size (bytes): one seeded ciphertext, independent of the table
-/// (measured with the Blyss client at nu1 = 9).
 pub const SPIRAL_QUERY_BYTES: usize = 16_416;
-/// Spiral public parameters (expansion and conversion keys), downloaded once.
 pub const SPIRAL_PP_BYTES: usize = 1_700_000;
 
-/// Spiral response size for records of `row_bytes` (n = 1 holds 2 KB, n = 2
-/// holds 8 KB): instances * (q2_bits * n + q1_bits * n^2) * 2048 bits with
-/// q2_bits = 22 and q1_bits = 10.
 pub fn spiral_response_bytes(row_bytes: usize) -> usize {
     let n = if row_bytes <= 2048 { 1 } else { 2 };
     let inst = (row_bytes + n * n * 2048 - 1) / (n * n * 2048);
     inst * (22 * n + 10 * n * n) * 2048 / 8
 }
 
-/// Per-query sizes of one map under each PIR.
+// Per-query sizes of one map under each PIR.
 #[derive(Clone, Copy, Debug)]
 pub struct MapPir {
     pub frodo_query: usize,
@@ -1813,7 +1562,7 @@ impl MkseLog {
     pub fn doc_pir(&self) -> MapPir {
         MapPir::new(self.doc_mu(), self.cfg.doc_row_cipher_bytes())
     }
-    /// Bytes a new client downloads before its first search, per PIR choice.
+    // Bytes a new client downloads before its first search, per PIR choice.
     pub fn join_bytes(&self, val: PirKind, doc: PirKind) -> usize {
         let state = if self.cfg.stateless { 0 } else { self.compacted_bytes() };
         let h = |k: PirKind, hint: usize| match k {
@@ -1825,15 +1574,6 @@ impl MkseLog {
     }
 }
 
-/// A client that searches every `interval` appends and refreshes its state
-/// only then. Costs are kept in two parts so that every pairing of PIRs
-/// (ValMap, DocMap) can be costed from one run:
-/// * the **keyword lookup**: sync (new log records or the compacted log, or for
-///   stateless clients VolMap plus the pending stash), the ValMap stash, the
-///   ValMap hint refresh (FrodoPIR only), and the ValMap queries and answers;
-/// * **document retrieval**: the DocMap stash, the DocMap hint refresh
-///   (FrodoPIR only), and the DocMap queries and answers, both for fetching
-///   every matching document and for fetching at most `doc_cap` of them.
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub interval: usize,
@@ -1858,8 +1598,6 @@ pub struct Profile {
     pub docs: usize,
     pub docs_capped: usize,
     pub full_hint_refreshes: usize,
-    /// per pairing in PIR_COMBOS order (lookup depends on the ValMap PIR,
-    /// documents on the DocMap PIR, but both are kept per pairing for clarity)
     pub lookup: [usize; N_COMBOS],
     pub lookup_max: [usize; N_COMBOS],
     pub lookup_hist: [Vec<usize>; N_COMBOS],
@@ -1902,7 +1640,7 @@ impl Profile {
         }
     }
 
-    /// Feeds one owner action; returns true if the client searches now.
+    // Feeds one owner action; returns true if the client searches now.
     pub fn observe(&mut self, m: &MkseLog, act: &Action) -> bool {
         let vcap = m.val_hint_bytes() / m.val_delta_bytes(true) + 1;
         let dcap = m.doc_hint_bytes() / m.doc_delta_bytes(true) + 1;
@@ -1957,7 +1695,7 @@ impl Profile {
         false
     }
 
-    /// The client refreshes and runs the search `sr`.
+    // The client refreshes and runs the search `sr`.
     pub fn sync(&mut self, m: &MkseLog, sr: &SearchOut) {
         let qv = sr.val_queries.len();
         let qd = sr.doc_queries.len();
@@ -1972,7 +1710,7 @@ impl Profile {
             if self.dirty { m.cfg.volmap_bytes() + m.cfg.pending_stash_bytes() } else { 0 }
         } else {
             self.log_bytes
-        } + m.cfg.vmap_bytes(); // fixed DocMap layout: the padded version map, with every search
+        } + m.cfg.vmap_bytes();
         let (vp, dp) = (m.val_pir(), m.doc_pir());
         for (c, &(kv, kd)) in PIR_COMBOS.iter().enumerate() {
             let pp = |k: PirKind, q: usize| if k == PirKind::Ypir { ypir_pp_bytes(q) } else { 0 };
@@ -2008,7 +1746,7 @@ impl Profile {
     }
 }
 
-/// Median of a list of byte counts.
+// Median of a list of byte counts.
 pub fn median(v: &[usize]) -> usize {
     let mut h = v.to_vec();
     h.sort_unstable();
@@ -2028,7 +1766,7 @@ mod tests {
         Params { mu, p: 1, s: 4, alpha: 20, sigma, evict: Evict::Bfs, disc: Discipline::Paper, bfs_max_branch: 2, bfs_max_depth: 64, val_len }
     }
 
-    /// 40 keywords over 300 documents (setup: the first 200).
+    // 40 keywords over 300 documents (setup: the first 200).
     fn data(rng: &mut StdRng) -> (Vec<(String, Vec<u32>)>, Vec<(String, u32)>, Vec<String>) {
         let kws: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
         let mut mm: HashMap<String, Vec<u32>> = HashMap::new();
@@ -2104,8 +1842,6 @@ mod tests {
     }
 
     impl Run {
-        /// one insertion, then with some probability a posting deletion, an
-        /// edit, or a removal
         fn step(&mut self, w: &str, d: u32, rng: &mut StdRng) {
             self.m.insert(w, d, 300 + (d as usize * 37) % 2000, rng);
             self.refmm.entry(w.to_string()).or_default().push(d);
@@ -2162,7 +1898,6 @@ mod tests {
                     r.check();
                 }
             }
-            // removed documents left the snapshot: the needed records changed, the size did not
             assert!(r.m.docs.values().any(|d| d.deleted));
             r.check();
         }
@@ -2228,7 +1963,6 @@ mod tests {
                 // pend_cap = 0: the forced compaction is a full rebuild
                 assert_ne!(r.m.val_epoch, vbefore);
                 repacks += 1;
-                // the write that triggered it then took its rows from the never-written ones
                 assert!(r.m.virgin_rows() <= mu_d - cap);
             }
         }
@@ -2256,7 +1990,7 @@ mod tests {
             if !reuse {
                 c.doc = prm(6000, DOC_ROW, 32);
             }
-            c.vmap_pad = 25; // full every ~25 edits/removals: forces rebuilds
+            c.vmap_pad = 25;
             let cap = c.doc_live_cap;
             let (mut r, later, mut rng) = setup(c, 13);
             let mut vmap_rebuilds = 0;
@@ -2265,7 +1999,6 @@ mod tests {
                 let ops = r.m.vmap_ops;
                 r.step(w, *d, &mut rng);
                 if r.m.val_epoch != before {
-                    // the DocMap Encode (after the ValMap one) has exactly doc_live_cap items
                     assert_eq!(r.m.last_encode, cap);
                     if ops >= 24 {
                         vmap_rebuilds += 1;
@@ -2304,8 +2037,6 @@ mod tests {
         assert!(res.is_err(), "a halted structure must refuse operations");
     }
 
-    /// batched with a high theta (postings stay pending), log compaction every
-    /// `le` appends, ValMap rebuild every `ve` (0 = never), P̂ = `cap`
     fn decoupled(layout: DocLayout, le: usize, ve: usize, cap: usize) -> LogCfg {
         let mut c = cfg(layout, true, false);
         c.policy = Policy::Batched { b: 20, k: 3, theta: 15, age: usize::MAX / 4 };
@@ -2332,7 +2063,6 @@ mod tests {
                     let mut act = Action::default();
                     r.m.log_compaction(&mut act, &mut rng);
                     assert_eq!((r.m.val_epoch, r.m.epoch, act.compactions, act.rebuilds.len()), (ve, le + 1, 1, 0));
-                    // the snapshot alone (nothing appended yet) has exactly κ̂ + P̂ + V̂ records
                     assert_eq!(r.m.log.len(), want);
                     assert_eq!(r.m.pend_total, pend, "a log compaction commits nothing");
                     if pend > 0 {
@@ -2376,7 +2106,6 @@ mod tests {
         assert!(rebuilds >= 2 && logs >= 4 * rebuilds);
         assert_eq!((r.m.val_rebuilds, r.m.log_compactions), (rebuilds, logs));
         assert!(r.m.pend_snap_max > 0);
-        // a rebuild commits everything: its snapshot has only dummy posting records
         let mut act = Action::default();
         r.m.major(&mut act, &mut rng);
         assert_eq!(r.m.pend_total, 0);
@@ -2408,7 +2137,7 @@ mod tests {
         }
     }
 
-    /// K = 0: no ValMap writes between rebuilds; the log carries everything
+    // K = 0: no ValMap writes between rebuilds; the log carries everything
     #[test]
     fn static_baseline_k0() {
         for (le, ve, cap) in [(150, 150, 0), (100, 300, 300)] {
@@ -2433,7 +2162,6 @@ mod tests {
         }
     }
 
-    /// With pend_cap > 0 a forced compaction (DocMap repack) is a log compaction only.
     #[test]
     fn forced_compaction_keeps_valmap() {
         let mut c = decoupled(DocLayout::Rows, 0, 0, 3000);
@@ -2457,8 +2185,6 @@ mod tests {
         r.check();
     }
 
-    /// A dry run (`pend_measure`) follows exactly the trajectory of the real
-    /// run, so its largest pending count sizes `pend_cap` for that run.
     #[test]
     fn measure_mode_matches_real_run() {
         let real = decoupled(DocLayout::Rows, 60, 0, 3000);
@@ -2480,7 +2206,7 @@ mod tests {
         b.check();
     }
 
-    /// age rule (log budget): age 3 batches of 20 appends, theta high
+    // age rule (log budget): age 3 batches of 20 appends, theta high
     fn aged(k: usize, measure: bool) -> LogCfg {
         aged_p(k, measure, false)
     }
@@ -2492,9 +2218,6 @@ mod tests {
         c
     }
 
-    /// A K dry run (`k_measure`) serves all due work; with K = its maximum the
-    /// real run has no K-overflow and the same trajectory (batches have their
-    /// own randomness), so every posting is committed within age * b appends.
     #[test]
     fn k_measure_sizes_k_and_age_bounds_the_tail() {
         for phased in [false, true] {
@@ -2530,8 +2253,6 @@ mod tests {
         assert_eq!(r.m.max_batch_ops, kmax);
         assert!(r.m.max_pend_age <= 3);
         assert_eq!(r.refmm, d.refmm);
-        // kappa_A: committed keywords per window, at most the active ones of
-        // this and the previous windows, and the same as in the dry run
         assert!(!r.m.kappa_committed.is_empty());
         assert_eq!(r.m.kappa_committed, d.m.kappa_committed);
         assert_eq!(r.m.kappa_active, d.m.kappa_active);
@@ -2540,7 +2261,6 @@ mod tests {
         d.check();
     }
 
-    /// With K below the need, batches overflow (counted) but stay exactly K wide.
     #[test]
     fn small_k_overflows_but_stays_padded() {
         let (mut r, later, mut rng) = setup(aged(1, false), 43);
@@ -2555,7 +2275,6 @@ mod tests {
         r.check();
     }
 
-    /// val_live tracks the live chunks exactly; more than val_cap halts.
     #[test]
     fn live_chunks_capped_at_all_times() {
         let (mut r, later, mut rng) = setup(decoupled(DocLayout::Rows, 60, 0, 3000), 47);
@@ -2567,7 +2286,6 @@ mod tests {
             assert!(r.m.val_live_max >= live && r.m.val_live <= r.m.cfg.val_cap);
             assert_eq!(r.m.val.len(), live, "reuse mode: the table holds exactly the live chunks");
         }
-        // a cap just above the setup chunks: the first batches that add chunks halt it
         let mut c2 = decoupled(DocLayout::Rows, 60, 0, 3000);
         let (probe, _, _) = setup(c2.clone(), 47);
         c2.val_cap = probe.m.val_live;

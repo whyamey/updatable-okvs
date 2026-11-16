@@ -1,5 +1,3 @@
-//! spiral_bench check            correctness: byte-identical responses vs the Blyss server
-//! spiral_bench bench N,NU1,NU2 [--impl blyss|fast] [--batches 1,8,32] [--threads T]
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use spiral_fast::*;
 use spiral_rs::{arith::*, client::*, params::*};
@@ -14,7 +12,6 @@ fn random_item(params: &Params, rng: &mut impl RngCore) -> Vec<u8> {
     v
 }
 
-/// The record stored at `idx` in the fast benchmark (regenerated to check answers).
 fn item_for(params: &Params, idx: usize) -> Vec<u8> {
     random_item(params, &mut StdRng::seed_from_u64(0x5eed_0000 ^ idx as u64))
 }
@@ -88,14 +85,12 @@ fn bench(args: &[String]) {
         for &b in &batches {
             for _ in 0..trials {
                 let qs: Vec<Query> = (0..b).map(|_| client.generate_query(rng.gen_range(0..items))).collect();
-                // sequential (one query at a time, each using the server's own parallelism)
                 let t = Instant::now();
                 for q in &qs {
                     let _ = process_query(&params, &pp, q, &db);
                 }
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 println!("impl=blyss,shape={shape},records={items},record_bytes={},threads={tt},batch={b},total_ms={ms:.1},per_query_ms={:.1},load_s={load_s:.1}", params.db_item_size, ms / b as f64);
-                // concurrent (all queries in parallel, as a loaded server would run them)
                 if b > 1 {
                     use rayon::prelude::*;
                     let t = Instant::now();

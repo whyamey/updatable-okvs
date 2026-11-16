@@ -1,13 +1,3 @@
-//! PIR backends behind one interface, so the UOKVS benchmarks can swap them.
-//!
-//! The requirements for the PIR in our setting are:
-//!   R1 single server; R2 many clients without per-client server state;
-//!   R3 the owner updates rows continuously and clients' state is cheap to
-//!      refresh; R4 records of a few KB; R5 batches of 4..800 queries.
-//! `FrodoPir` wraps the optimized FrodoPIR fork used in the paper. YPIR and
-//! other schemes are measured through their own Rust CLIs (see
-//! `scripts/run_ypir.sh`) because their APIs do not expose row updates.
-
 use base64::{engine::general_purpose, Engine as _};
 use frodo_pir::api::{
     BatchedQuery8, BatchedQueryParams16, BatchedQueryParams32, BatchedQueryParams64, BatchedQueryParams8,
@@ -20,15 +10,14 @@ use std::time::Instant;
 pub const LWE_DIM: usize = 1288;
 pub const PT_BITS: usize = 9;
 
-/// FrodoPIR matrix width (u32 entries per row) for rows of `elem_bytes`.
+// FrodoPIR matrix width (u32 entries per row) for rows of `elem_bytes`.
 pub fn frodo_width(elem_bytes: usize) -> usize {
     (elem_bytes * 8 + PT_BITS - 1) / PT_BITS
 }
-/// Client hint size (bytes) for rows of `elem_bytes`; independent of the row count.
 pub fn frodo_hint_bytes(elem_bytes: usize) -> usize {
     LWE_DIM * frodo_width(elem_bytes) * 4
 }
-/// Bytes a client downloads to refresh its hint for one changed row.
+// Bytes a client downloads to refresh its hint for one changed row.
 pub fn frodo_row_delta_bytes(elem_bytes: usize, packed: bool) -> usize {
     let w = frodo_width(elem_bytes);
     if packed {
@@ -38,7 +27,7 @@ pub fn frodo_row_delta_bytes(elem_bytes: usize, packed: bool) -> usize {
     }
 }
 
-/// Body of a batched query of width N (8 is `query_batch`).
+// Body of a batched query of width N (8 is `query_batch`).
 macro_rules! batched_impl {
     ($self:ident, $idx:ident, $n:expr, $bqp:ident, $eval:ident) => {{
         let mut c = QueryCost { queries: $idx.len(), ..Default::default() };
@@ -103,19 +92,17 @@ pub struct UpdateCost {
     pub rows: usize,
     pub server_db_ms: f64,
     pub server_hint_ms: f64,
-    /// bytes a client must download to refresh its hint if the server sends
-    /// the raw row differences (width x u32 per row), as the fork does
     pub client_bytes_raw: usize,
-    /// same, with differences packed into ceil(log2(2^pt)+1) bits per entry
+    // same, with differences packed into ceil(log2(2^pt)+1) bits per entry
     pub client_bytes_packed: usize,
-    /// client CPU to apply the refresh (it recomputes A's column per row)
+    // client CPU to apply the refresh (it recomputes A's column per row)
     pub client_apply_ms: f64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryCost {
     pub queries: usize,
-    /// per-query client preprocessing (s*A, s*hint); can be done offline
+    // per-query client preprocessing (s*A, s*hint); can be done offline
     pub client_prep_ms: f64,
     pub client_query_ms: f64,
     pub server_ms: f64,
@@ -133,7 +120,7 @@ pub struct FrodoPir {
 }
 
 impl FrodoPir {
-    /// Builds the database and the hint; returns the server setup time (ms).
+    // Builds the database and the hint; returns the server setup time (ms).
     pub fn new(rows: &[Vec<u8>], elem_bytes: usize) -> (Self, f64) {
         let t = Instant::now();
         let strs: Vec<String> = rows.iter().map(|r| {
@@ -151,11 +138,11 @@ impl FrodoPir {
     pub fn width(&self) -> usize {
         self.db.get_matrix_width_self()
     }
-    /// Client hint (the matrix M = A * D): dim x width u32.
+    // Client hint (the matrix M = A * D): dim x width u32.
     pub fn hint_bytes(&self) -> usize {
         LWE_DIM * self.width() * 4
     }
-    /// Size of one query (b~ in Z_q^m) and one response (Z_q^width).
+    // Size of one query (b~ in Z_q^m) and one response (Z_q^width).
     pub fn query_bytes(&self) -> usize {
         self.rows * 4
     }
@@ -163,7 +150,7 @@ impl FrodoPir {
         self.width() * 4
     }
 
-    /// Applies a batch of row updates (one UOKVS operation's accesses).
+    // Applies a batch of row updates (one UOKVS operation's accesses).
     pub fn update_rows(&mut self, rows: &[(usize, Vec<u8>)]) -> UpdateCost {
         let t = Instant::now();
         let mut pend = Vec::with_capacity(rows.len());
@@ -196,8 +183,6 @@ impl FrodoPir {
         self.cp.as_ref().unwrap()
     }
 
-    /// Runs PIR queries in groups of `w` (8, 16, 32 or 64) per database pass,
-    /// using the fork's `BatchedQueryParams{w}` and `eval_batched_{w}`.
     pub fn query_batch_w(&mut self, idx: &[usize], w: usize) -> (QueryCost, Vec<Vec<u8>>) {
         if idx.is_empty() {
             return (QueryCost::default(), vec![]);
@@ -211,7 +196,7 @@ impl FrodoPir {
         }
     }
 
-    /// Runs a batch of PIR queries in groups of 8 and returns the rows.
+    // Runs a batch of PIR queries in groups of 8 and returns the rows.
     pub fn query_batch(&mut self, idx: &[usize]) -> (QueryCost, Vec<Vec<u8>>) {
         let mut c = QueryCost { queries: idx.len(), ..Default::default() };
         let rows = self.rows;
@@ -228,8 +213,6 @@ impl FrodoPir {
             let mut queries = Vec::with_capacity(8);
             for k in 0..8 {
                 let i = *chunk.get(k).unwrap_or(&chunk[0]);
-                // FrodoPIR rejects a query whose indicator addition overflows;
-                // like the original bench, retry with fresh parameters.
                 let q = match qps[k].generate_query(i) {
                     Ok(q) => q,
                     Err(_) => loop {
@@ -273,8 +256,7 @@ impl FrodoPir {
     }
 }
 
-
-/// Random database rows for microbenchmarks.
+// Random database rows for microbenchmarks.
 pub fn random_rows<R: Rng>(n: usize, elem_bytes: usize, rng: &mut R) -> Vec<Vec<u8>> {
     (0..n)
         .map(|_| {
@@ -285,13 +267,6 @@ pub fn random_rows<R: Rng>(n: usize, elem_bytes: usize, rng: &mut R) -> Vec<Vec<
         .collect()
 }
 
-
-// ---------------------------------------------------------------- Spiral
-
-/// Spiral (hintless) through our faster server (`spiral_fast`) and the Blyss
-/// client. Rows of up to 2 KB use n = 1, up to 8 KB n = 2; the table is padded
-/// to 2^(9 + nu2) records. The client keeps only its public parameters, so a
-/// row update costs it nothing.
 pub struct SpiralPir {
     pub params: &'static spiral_rs::params::Params,
     client: spiral_rs::client::Client<'static>,
@@ -328,7 +303,6 @@ impl SpiralPir {
         UpdateCost { rows: rows.len(), server_db_ms: t.elapsed().as_secs_f64() * 1e3, ..Default::default() }
     }
 
-    /// Answers queries in batches of `w` that share one pass over the database.
     pub fn query_batch_w(&mut self, idx: &[usize], w: usize) -> (QueryCost, Vec<Vec<u8>>) {
         let mut c = QueryCost { queries: idx.len(), ..Default::default() };
         let mut outs = Vec::with_capacity(idx.len());
@@ -352,7 +326,7 @@ impl SpiralPir {
     }
 }
 
-/// One PIR database of either kind.
+// One PIR database of either kind.
 pub enum Pir {
     Frodo(FrodoPir),
     Spiral(SpiralPir),
@@ -383,7 +357,6 @@ impl Pir {
             Pir::Spiral(p) => p.query_batch_w(idx, w),
         }
     }
-    /// Client state that depends on the database (FrodoPIR hint) or not (Spiral public parameters).
     pub fn client_state_bytes(&self) -> usize {
         match self {
             Pir::Frodo(p) => p.hint_bytes(),

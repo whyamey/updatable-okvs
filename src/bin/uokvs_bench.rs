@@ -1,14 +1,3 @@
-//! Experiments for the revision. Subcommands:
-//!
-//!   selftest   correctness checks (all eviction variants, encryption, MKSE, PIR)
-//!   stash      stash size vs load for RW/BFS x {paper, legacy, noinv} (E5)
-//!   ops        insertions / deletions / updates on the MKSE (E1, E3)
-//!   pir        FrodoPIR microbenchmarks: setup, hint, row updates, batches (E2c)
-//!   design     the full dynamic design (log + batched versioned flushes +
-//!              row-addressed DocMap) and its baselines (per-op, rebuild)
-//!
-//! Run `uokvs_bench <cmd> --help` for options. Outputs are CSV files.
-
 use mkse::mkse_dyn::{Mkse, MkseCfg, MkseOp, OpKind};
 use mkse::mkse_log::{median, pir_name, Action, DocLayout, LogCfg, MkseLog, Policy, Profile, PIR_COMBOS};
 use mkse::pir_backend::{random_rows, FrodoPir, Pir, SpiralPir};
@@ -24,8 +13,6 @@ use std::time::Instant;
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-// ------------------------------------------------------------------ args
 
 struct Args(HashMap<String, String>);
 impl Args {
@@ -176,8 +163,6 @@ report --dir results [--out results/REPORT.md]
 selftest
 "#;
 
-// ------------------------------------------------------------------ selftest
-
 fn small_params(evict: Evict, disc: Discipline, p: usize) -> Params {
     Params {
         mu: 400,
@@ -313,7 +298,6 @@ fn selftest(_a: &Args) {
     assert_eq!(best.1, b"value2", "updated value not retrieved through PIR");
     println!("ok  encryption + FrodoPIR retrieval before and after an update");
 
-    // 2b. the same retrieval through Spiral (our server), before and after an update
     let rows = t.encrypt_all(&mut rng);
     let (mut sp, _) = Pir::new("spiral", &rows, prm.bucket_bytes());
     let found_val = |got: &[Vec<u8>], t: &Table| -> Option<Vec<u8>> {
@@ -408,8 +392,6 @@ fn selftest(_a: &Args) {
     println!("selftest passed");
 }
 
-// ------------------------------------------------------------------ stash
-
 fn stash(a: &Args) {
     let n = a.u("n", 1_000_000);
     let prm = Params {
@@ -471,8 +453,6 @@ fn stash(a: &Args) {
     println!("{out}: n={n} load={:.3} stash={} ({:.2}s)", t.load(), t.stash_len(), t0.elapsed().as_secs_f64());
 }
 
-/// Stash under churn at constant load (not covered by the stash theorems,
-/// which bound insertions into an empty table).
 fn churn(a: &Args) {
     let n = a.u("n", 1_000_000);
     let prm = Params {
@@ -510,7 +490,6 @@ fn churn(a: &Args) {
     for (k, lk) in &slots {
         t.insert(k, *lk, [0u8; 32], vec![], &mut rng);
     }
-    // Zipf(zipf) over record ranks (a random permutation decouples rank from slot order)
     let cdf: Vec<f64> = if zipf > 0.0 {
         let mut c = Vec::with_capacity(n);
         let mut acc = 0.0;
@@ -569,7 +548,6 @@ fn churn(a: &Args) {
         }
         smax = smax.max(t.stash_len());
         if rebuild_every > 0 && (i + 1) % rebuild_every == 0 {
-            // a rebuild re-inserts the live keys into a fresh table: every key gets s fresh states
             let mut nt = Table::new(prm.clone(), &mut rng);
             for (k, lk) in &slots {
                 nt.insert(k, *lk, [0u8; 32], vec![], &mut rng);
@@ -590,9 +568,7 @@ fn churn(a: &Args) {
     );
 }
 
-// ------------------------------------------------------------------ data
-
-/// keyword -> ids, sorted by id within a keyword; ids are the file names.
+// keyword -> ids, sorted by id within a keyword; ids are the file names.
 fn load_data(dir: &str) -> (Vec<(String, Vec<u32>)>, HashMap<u32, usize>) {
     let buf = std::fs::read_to_string(Path::new(dir).join("keyword_file_map.json")).expect("keyword_file_map.json");
     let v: sonic_rs::Value = sonic_rs::from_str(&buf).expect("json");
@@ -622,8 +598,6 @@ fn load_data(dir: &str) -> (Vec<(String, Vec<u32>)>, HashMap<u32, usize>) {
     (mm, lens)
 }
 
-/// Zipf-like synthetic multimap: `kw` keywords over `docs` documents with
-/// `per_doc` keywords per document on average.
 fn synthetic(kw: usize, docs: usize, per_doc: usize, rng: &mut StdRng) -> (Vec<(String, Vec<u32>)>, usize) {
     let weights: Vec<f64> = (1..=kw).map(|r| 1.0 / r as f64).collect();
     let total: f64 = weights.iter().sum();
@@ -652,8 +626,6 @@ fn mk_cfg(a: &Args, evict: Evict, postings: usize, doc_chunks: usize, keywords: 
     let flush_at = ((a.f("flush-frac", 0.5) * cap as f64) as usize).max(1);
     let alpha = a.u("alpha", if evict == Evict::Rw { 10 } else { 20 });
     let disc = disc_of(&a.s("disc", "paper"));
-    // expected chunks: one partial chunk per keyword plus one per flush; with a
-    // pending budget, flushes are smaller, so allow an explicit override
     let mu_val = match a.s("val-mu", "auto").as_str() {
         "auto" => ((a.f("mu-factor", 2.0) * (postings / flush_at + keywords) as f64).ceil() as usize).max(16),
         x => parse_num(x) as usize,
@@ -706,8 +678,6 @@ fn mk_cfg(a: &Args, evict: Evict, postings: usize, doc_chunks: usize, keywords: 
         doc_chunk_bytes: doc_chunk,
     }
 }
-
-// ------------------------------------------------------------------ ops
 
 fn ops(a: &Args) {
     let mut rng = StdRng::seed_from_u64(a.u("seed", 1) as u64);
@@ -948,8 +918,6 @@ fn ops(a: &Args) {
     println!("outputs: {pre}_ops.csv {pre}_snap.csv {pre}_search.csv");
 }
 
-// ------------------------------------------------------------------ pir
-
 fn pir(a: &Args) {
     let mut rng = StdRng::seed_from_u64(a.u("seed", 1) as u64);
     let rows = a.u("rows", 1 << 18);
@@ -1011,8 +979,6 @@ fn pir(a: &Args) {
     println!("{out}: rows={rows} elem={eb}B hint={:.1}MB setup={:.1}s", fp.hint_bytes() as f64 / 1e6, setup_ms / 1e3);
 }
 
-// ------------------------------------------------------------------ design
-
 struct Workload {
     mm_full: Vec<(String, Vec<u32>)>,
     lens: HashMap<u32, usize>,
@@ -1062,17 +1028,6 @@ fn workload(a: &Args, rng: &mut StdRng) -> Workload {
     scale_workload(wl, a.u("scale", 1).max(1), shared)
 }
 
-/// `--scale k`: k copies of the corpus. Copy c renames document id to
-/// `id + c * (max id + 1)`. `--scale-mode disjoint` (default) also renames
-/// keyword w to `w~c` (copy 0 keeps the original names), so keywords,
-/// postings, documents and DocMap chunks grow k-fold with the same
-/// per-keyword statistics (vocabulary linear in the corpus: the worst case).
-/// `--scale-mode shared` keeps the keywords: kappa stays fixed and every
-/// keyword's volume (and so its chunks, and mu) grows k-fold. The document order
-/// interleaves the copies round-robin (d1 of every copy, then d2, ...), so
-/// the setup holds all copies of the first `nb` documents and the replay
-/// interleaves the k operation streams: each keyword sees appends at the same
-/// rate per original document, and appends per original document scale by k.
 fn scale_workload(wl: Workload, k: usize, shared: bool) -> Workload {
     if k == 1 {
         return wl;
@@ -1102,12 +1057,6 @@ fn scale_workload(wl: Workload, k: usize, shared: bool) -> Workload {
             lens.insert(cid(id, c), l);
         }
     }
-    // setup: all copies of the first nb documents. Replay: round-robin over the
-    // copies; in shared mode copy c replays the original stream rotated by
-    // c R / k, so the k copies of one document are not adjacent and a window of
-    // A appends sees as many distinct documents (and so keywords) as at k = 1,
-    // drawn from k parts of the corpus (with adjacent copies a window would hold
-    // only A / k distinct documents and shrink kappa_A)
     let (setup, replay) = wl.docs.split_at(wl.nb);
     let r = replay.len().max(1);
     let mut docs: Vec<u32> = setup.iter().flat_map(|&d| (0..k).map(move |c| cid(d, c))).collect();
@@ -1133,7 +1082,6 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
     let val_len = bucket - slot_over;
     let c = val_len / pb;
     let evict = evict_of(&a.s("evict", "bfs"));
-    // design default: BFS with alpha = 20 (with sigma = 16; Theorem intro-bfs)
     let alpha = a.u("alpha", 20);
     // ValMap: canonical chunks of the full dataset, inflated by --mu-factor
     let del = a.f("del-frac", 0.02) + a.f("docdel-frac", 0.002) * 40.0;
@@ -1147,9 +1095,6 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         "auto" => mu_of(a.f("mu-factor", 2.0)),
         x => parse_num(x) as usize,
     };
-    // public ValMap rebuild size: ceil(0.46 mu) of the reuse-mode table (keep
-    // mode, --no-reuse, takes mu at --reuse-mu-factor, default 2.0, so its
-    // larger table absorbs the fillers and superseded chunks of an epoch)
     let val_cap = match a.s("val-cap", "auto").as_str() {
         "auto" => {
             let mu_r = if a.b("no-reuse") { mu_of(a.f("reuse-mu-factor", 2.0)) } else { mu_val };
@@ -1166,18 +1111,12 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
     let edits = a.f("upd-frac", 0.02) * wl.doc_kw.values().map(|v| v.len()).sum::<usize>() as f64 * (1.0 - a.f("build-frac", 0.8));
     let avg = doc_chunks as f64 / wl.docs.len().max(1) as f64;
     let doc_rows = ((doc_chunks as f64 + edits * avg) * (1.0 + a.f("doc-spare", 0.2))).ceil() as usize + 64;
-    // public cap on live DocMap chunks at a repack / rebuild: the expected
-    // content (all documents of the data set + edits) without the spare rows,
-    // so a repack leaves doc_rows - doc_live_cap ~ doc-spare * doc_live_cap + 64
-    // never-written rows
     let doc_live_cap = match a.s("doc-live-cap", "auto").as_str() {
         "auto" => (doc_chunks as f64 + edits * avg).ceil() as usize,
         x => parse_num(x) as usize,
     };
     let stateless = a.b("stateless");
     let policy = match a.s("policy", "batched").as_str() {
-        // stateless clients: every batch commits everything pending (theta = 1),
-        // so the pending stash stays below 2B and VolMap is refreshed per batch
         "batched" if stateless => {
             let b = a.u("b", 100);
             let k = match a.s("k", "auto").as_str() {
@@ -1187,7 +1126,6 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
             Policy::Batched { b, k, theta: a.u("theta", 1).max(1), age: usize::MAX / 4 }
         }
         "batched" => {
-            // recommended schedule: large batches, flush a keyword once a full chunk is pending
             let b = a.u("b", 10_000);
             let theta = a.u("theta", c).max(1);
             let k = match a.s("k", "auto").as_str() {
@@ -1196,8 +1134,6 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
                 "measure" => 1,
                 x => parse_num(x) as usize,
             };
-            // log budget: --age in batches, or --age-appends A (= A / B batches;
-            // every posting is then committed within A appends unless K overflows)
             let age = match (a.s("age-appends", "").as_str(), a.s("age", "inf").as_str()) {
                 ("", "inf") => usize::MAX / 4,
                 ("", x) => parse_num(x) as usize,
@@ -1224,9 +1160,6 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         Policy::Batched { b, .. } => 2 * b,
         _ => 0,
     };
-    // public number of version records in a log snapshot: those of every
-    // document of the data set at its original length, plus --ver-spare
-    // (default 10%) headroom for edits, plus 64
     let record_body = a.u("record-body", pb.max(40));
     let rpr = ((record_body - 8) / 4).max(1);
     let ver_cap = match a.s("ver-cap", "auto").as_str() {
@@ -1247,16 +1180,11 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         }
         x => parse_num(x) as usize,
     };
-    // fixed DocMap layout: version-map slots per epoch (one per edit or
-    // removal): 1.2 x the expected edits and removals between scheduled rebuilds
-    // E_V (ValMap rebuild period): --major-every, or its alias --val-every
     let major_every = a.u("val-every", a.u("major-every", 1_000_000));
     let val_every = match policy {
         Policy::Rebuild { r } => r,
         Policy::Batched { .. } => major_every,
     };
-    // E_L (log compaction period): default E_V, i.e. every log compaction is a
-    // ValMap rebuild (10^6 by default; 0 = never)
     let log_every = match a.s("log-every", "auto").as_str() {
         "auto" => val_every,
         x => parse_num(x) as usize,
@@ -1266,11 +1194,6 @@ fn log_cfg(a: &Args, wl: &Workload) -> LogCfg {
         "--major-every (E_V = {val_every}) must be a multiple of --log-every (E_L = {log_every})"
     );
     let coupled = log_every == 0 || log_every == val_every;
-    // P̂, posting records in every log snapshot. auto: 0 when every log
-    // compaction is a ValMap rebuild (nothing is pending then); otherwise
-    // E_V, the safe public bound (pending postings <= appends since the last
-    // ValMap rebuild < E_V), which is large: give --pend-cap N, e.g. from a
-    // dry run with --pend-cap measure (eval_all.sh does that).
     let (pend_cap, pend_measure) = match a.s("pend-cap", "auto").as_str() {
         "auto" if coupled => (0, false),
         "auto" if val_every > 0 => (val_every, false),
@@ -1338,7 +1261,6 @@ fn policy_cols(p: &Policy, k_measure: bool) -> String {
 }
 
 fn append_csv(path: &str, header: &str) -> BufWriter<File> {
-    // an existing file with another column layout (an older version) is moved aside
     if let Ok(old) = std::fs::read_to_string(path) {
         if old.lines().next().map_or(false, |l| l != header) {
             let aside = format!("{path}.old-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
@@ -1382,8 +1304,6 @@ fn design(a: &Args) {
     );
     let t = Instant::now();
     let mut m = MkseLog::setup(cfg.clone(), &mm_build, &all_kw, &wl.lens, wl.default_len, &mut rng);
-    // kappa_A windows: --kappa-window, default the log budget A (age x B), else
-    // E_V, else E_L, else 10^6 appends
     let age_appends = match cfg.policy {
         Policy::Batched { b, age, .. } if age < usize::MAX / 8 => age * b,
         _ => 0,
@@ -1398,8 +1318,6 @@ fn design(a: &Args) {
         setup_ms / 1e3, m.val.len(), m.val.load(), m.log_bytes() as f64 / 1e6, m.val_hint_bytes() as f64 / 1e6, m.doc_hint_bytes() as f64 / 1e6
     );
 
-    // optional PIR
-    // --pir runs real PIR databases; --val-pir / --doc-pir pick FrodoPIR or Spiral per map
     let use_pir = a.b("pir");
     let doc_pir = use_pir && !a.b("no-doc-pir");
     let width = a.u("pir-width", 32);
@@ -1440,7 +1358,6 @@ fn design(a: &Args) {
     let mut we = csv(&format!("{pre}_events.csv"), "appends,event,ms,bytes");
 
     let intervals = a.list("clients", "100,1000,10000,100000");
-    // a search fetches at most this many documents in the capped cost (all of them in the full cost)
     let doc_cap = a.u("max-docs-fetched", 100);
     let mut profiles: Vec<Profile> = intervals.iter().map(|&i| Profile::new(i, doc_cap)).collect();
 
@@ -1458,8 +1375,8 @@ fn design(a: &Args) {
     // accounting; owner upload split by what is uploaded
     let mut owner_upload: usize = 0;
     let mut up_log = 0usize; // log records of the update operations
-    let mut up_batch = 0usize; // batch rows, flush records, ValMap stash (stateless: VolMap + pending stash)
-    let mut up_docw = 0usize; // DocMap writes of documents (rows or Cuckoo ops, DocMap stash, version map)
+    let mut up_batch = 0usize;
+    let mut up_docw = 0usize;
     let mut up_snap = 0usize; // log snapshots
     let mut up_valrb = 0usize; // ValMap rebuilds
     let mut up_docrp = 0usize; // DocMap repacks / re-encodes
@@ -1472,8 +1389,6 @@ fn design(a: &Args) {
     let mut compactions = 0usize;
     let mut doc_compactions = 0usize;
     let mut log_peak = m.log_bytes();
-    // server persistent storage: ValMap (mu rows + stash), DocMap (rows or
-    // buckets + stash + version map), log (snapshot + records since)
     let val_store = |m: &MkseLog| m.val.prm.mu * m.cfg.val_row_bytes() + m.val_stash_bytes();
     let doc_store = |m: &MkseLog| {
         m.doc_mu() * m.cfg.doc_row_cipher_bytes()
@@ -1482,8 +1397,6 @@ fn design(a: &Args) {
     };
     let mut snap_peak = m.compacted_bytes();
     let mut storage_peak = val_store(&m) + doc_store(&m) + m.log_bytes();
-    // copy-on-write model: while a rebuild / repack / compaction is installed the
-    // server also holds the old ValMap / DocMap / log (the log as of the previous action)
     let mut storage_peak_cow = storage_peak;
     let mut last_log = m.log_bytes();
     let mut last_snap = 0usize;
@@ -1504,7 +1417,6 @@ fn design(a: &Args) {
             val_rows_total += b.accessed.len();
             up_batch += distinct.len() * m.cfg.val_row_bytes() + b.records * m.cfg.record_bytes() + m.val_stash_bytes();
             if m.cfg.stateless {
-                // VolMap and the pending stash are re-encrypted and resent after each batch
                 up_batch += m.cfg.volmap_bytes() + m.cfg.pending_stash_bytes();
             }
             let (mut enc_ms, mut db_ms, mut hint_ms) = (0.0, 0.0, 0.0);
@@ -1595,7 +1507,6 @@ fn design(a: &Args) {
         stash_peak_seen = stash_peak_seen.max(m.val.stash_len());
         for p in profiles.iter_mut() {
             if p.observe(m, &act) {
-                // the client's search: a uniformly random keyword
                 let w = &all_kw[rng.gen_range(0..all_kw.len())];
                 let sr = m.search(w);
                 p.sync(m, &sr);
@@ -1655,9 +1566,7 @@ fn design(a: &Args) {
         do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
     }
     let t_replay = Instant::now();
-    // --max-appends N: stop the replay after N log appends (a prefix of the workload)
     let max_appends = a.u("max-appends", 0);
-    // a structure that halted already at setup (stash overflow of its Encode) replays nothing
     let replay_docs = if m.halted { &wl.docs[..0] } else { &wl.docs[wl.nb..] };
     'replay: for &d in replay_docs {
         let len = wl.lens.get(&d).copied().unwrap_or(wl.default_len);
@@ -1711,9 +1620,6 @@ fn design(a: &Args) {
                     break 'replay;
                 }
                 deleted.insert(id);
-                // the reference lists holding id are those of its keywords (setup
-                // and replay postings both come from doc_kw); scanning every list
-                // would cost O(all postings) per removal, quadratic under --scale
                 for w in &wl.doc_kw[&id] {
                     if let Some(list) = refmm.get_mut(w) {
                         list.retain(|x| *x != id);
@@ -1734,7 +1640,6 @@ fn design(a: &Args) {
     let replay_s = t_replay.elapsed().as_secs_f64();
     snap(&m, &mut ws);
     if m.halted {
-        // a public failure (stash overflow): the structure stopped; counted in the summary
         println!("[{label}] HALTED after {} appends: {}", m.total_appends, m.halt_reason);
     } else {
         do_search(&m, &refmm, &mut rng, &mut pv, &mut pd, &mut wq);
@@ -1752,8 +1657,6 @@ fn design(a: &Args) {
     );
     let mean = |v: &[usize]| if v.is_empty() { 0.0 } else { v.iter().sum::<usize>() as f64 / v.len() as f64 };
     let per = |x: usize| format!("{:.1}", x as f64 / appends as f64);
-    // ValMap rebuild upload per append if ValMap is rebuilt every E_V appends,
-    // computed (mu rows / E_V) rather than measured: E_V can exceed the replay
     let val_every = cfg.val_every();
     let valrb_analytic = if val_every > 0 { (m.val.prm.mu * cfg.val_row_bytes()) as f64 / val_every as f64 } else { 0.0 };
     writeln!(
@@ -1927,8 +1830,6 @@ fn design(a: &Args) {
     }
 }
 
-// ------------------------------------------------------------------ selftest of the full design
-
 fn selftest_design() {
     let mut rng = StdRng::seed_from_u64(11);
     for (policy, layout) in [
@@ -1939,16 +1840,12 @@ fn selftest_design() {
         ("batched", "cuckoo"),
         ("perop", "rows"),
         ("rebuild", "rows"),
-        // log compaction every 300 appends, ValMap rebuild every 1200 (P̂ auto = 1200)
         ("decoupled", "rows"),
-        // static OKVS baseline: K = 0, ValMap rebuild and log compaction every 700
         ("static", "rows"),
-        // static with log compactions between rebuilds (the log carries everything pending)
         ("static_dec", "rows"),
         // two disjoint copies of the corpus, interleaved
         ("scale2", "rows"),
         ("shared2", "rows"),
-        // log budget 120 appends (age 3 batches of 40), K dry run (serves all due work)
         ("aged", "rows"),
     ] {
         let mut m = HashMap::new();
@@ -2084,8 +1981,6 @@ fn selftest_design() {
     }
 }
 
-// ------------------------------------------------------------------ report
-
 fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let s = std::fs::read_to_string(path).ok()?;
     let mut lines = s.lines().filter(|l| !l.trim().is_empty());
@@ -2097,7 +1992,6 @@ fn read_csv(path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     Some((header, rows))
 }
 
-/// Keep the last row for each key (a rerun appends new rows for the same run).
 fn dedup_last(h: &[String], rows: Vec<Vec<String>>, keys: &[&str]) -> Vec<Vec<String>> {
     let ix: Vec<usize> = keys.iter().filter_map(|k| h.iter().position(|x| x == k)).collect();
     let key = |r: &Vec<String>| ix.iter().map(|&i| r[i].as_str()).collect::<Vec<_>>().join("\u{1}");
@@ -2130,7 +2024,7 @@ fn human(b: f64) -> String {
     }
 }
 
-/// Collects every CSV under --dir into one markdown report.
+// Collects every CSV under --dir into one markdown report.
 fn report(a: &Args) {
     let dir = a.s("dir", "results");
     let out = a.s("out", &format!("{dir}/REPORT.md"));
@@ -2424,8 +2318,6 @@ mod tests {
         Args(kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
     }
 
-    /// `--scale 2`: twice the keywords, postings, documents, chunks and caps,
-    /// with the same per-keyword statistics, and the copies interleaved.
     #[test]
     fn scale_doubles_the_corpus() {
         let base = [("synthetic", "200,1500,10"), ("bucket-bytes", "1024"), ("doc-row", "512"), ("default-doc-len", "1500")];
@@ -2447,7 +2339,6 @@ mod tests {
         v1.sort_unstable();
         v2.sort_unstable();
         assert_eq!(v1, v2);
-        // round-robin interleave: copy 0 and copy 1 of each document are adjacent
         let off = w1.docs.iter().max().unwrap() + 1;
         for (i, &d) in w1.docs.iter().enumerate() {
             assert_eq!((w2.docs[2 * i], w2.docs[2 * i + 1]), (d, d + off));
@@ -2464,7 +2355,6 @@ mod tests {
         assert!(c2.doc_rows.abs_diff(2 * c1.doc_rows) <= 66);
         assert!(c2.doc_live_cap.abs_diff(2 * c1.doc_live_cap) <= 1);
         assert!(c2.ver_cap.abs_diff(2 * c1.ver_cap) <= 66);
-        // the batch schedule does not change with the scale (K auto depends on B and theta)
         assert_eq!(format!("{:?}", c1.policy), format!("{:?}", c2.policy));
         // setup: twice the live ValMap chunks
         let s1 = setup_of(&w1, &c1);
@@ -2473,8 +2363,6 @@ mod tests {
         assert_eq!(s2.keywords(), 2 * s1.keywords());
     }
 
-    /// `--scale-mode shared`: same keywords, twice the postings and chunks,
-    /// and a replay with removals verified against the reference multimap.
     #[test]
     fn shared_scale_keeps_keywords() {
         let base = [("synthetic", "200,1500,10"), ("bucket-bytes", "1024"), ("doc-row", "512"), ("default-doc-len", "1500"), ("sigma", "64"), ("b", "200"), ("major-every", "1000")];
@@ -2497,14 +2385,12 @@ mod tests {
         assert!(w1.docs.iter().all(|d| w2.doc_kw[&(d + off)] == w1.doc_kw[d]));
         let (c1, c2) = (log_cfg(&a1, &w1), log_cfg(&a2, &w2));
         assert_eq!(c2.kw_pad, c1.kw_pad);
-        // chunks per keyword: ceil(2v/C) is between 2 ceil(v/C) - 1 and 2 ceil(v/C)
         assert!(c2.val.mu <= 2 * c1.val.mu + 1 && 10 * c2.val.mu >= 15 * c1.val.mu, "mu {} vs {}", c2.val.mu, c1.val.mu);
         assert!(c2.ver_cap.abs_diff(2 * c1.ver_cap) <= 66);
         let s1 = setup_of(&w1, &c1);
         let mut s2 = setup_of(&w2, &c2);
         assert_eq!(s2.keywords(), s1.keywords());
         assert!(s2.val_live_max <= 2 * s1.val_live_max && 10 * s2.val_live_max >= 15 * s1.val_live_max);
-        // replay part of the interleaved stream with removals; verify every keyword
         let mut rng = StdRng::seed_from_u64(9);
         let build: HashSet<u32> = w2.docs[..w2.nb].iter().copied().collect();
         let mut refmm: HashMap<String, Vec<u32>> =

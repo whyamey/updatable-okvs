@@ -1,26 +1,3 @@
-//! Faster YPIR+SP server for the UOKVS tables.
-//!
-//! YPIR+SP (Menon-Wu, USENIX Security 2024) is SimplePIR with the hint moved to the server: the
-//! client sends an RLWE-encoded one-hot vector over the database rows, the server multiplies it
-//! with the database and then ring-packs the resulting LWE ciphertexts. The packing of the
-//! hint-dependent part is precomputed offline. The reference code
-//! (github.com/menonsamir/ypir, a73e550) is single-threaded, answers one query per pass, has no
-//! row updates, and stores exactly one record per row. Here:
-//!
-//!  * **Several records per row** (`Shape::per_row`). There is no client hint, so the row width
-//!    is free: wider rows shrink the query (7 bytes per row) and grow the response
-//!    (12 KB per 3.5 KB of row), and `Shape::auto` picks the balance.
-//!  * **Row updates** (`update_records`). The hint is linear in the database, so an update adds
-//!    `a_rho * delta` for each touched block of 2048 rows only; the packing precomputation
-//!    (nonlinear) is then recomputed for every output in parallel. The reference has no update
-//!    path, so an update is a full offline rebuild.
-//!  * **Batched, parallel online pass** (`answer`). All queries of a batch share one pass over the
-//!    database (the reference AVX-512 kernel, run on column tiles in parallel), and packing runs
-//!    in parallel over (query, output) pairs.
-//!  * **Several public seeds** (`seeds`). Queries under one client key must use distinct public
-//!    matrices, otherwise their difference leaks. With `S` seeds the server keeps `S` hints and a
-//!    client's packing keys (~473 KB) are shared by up to `S` queries of one search instead of
-//!    being sent with every query.
 #![allow(stable_features)]
 #![feature(stdarch_x86_avx512)]
 use std::arch::x86_64::*;
@@ -52,18 +29,14 @@ use ypir::server::{generate_fake_pack_pub_params, generate_y_constants, YServer}
 
 pub const POLY_LEN: usize = 2048;
 pub const PT_BITS: usize = 14;
-/// response bytes per output ciphertext (q'_1 = 2^20, q_2 = 28 bits)
+// response bytes per output ciphertext (q'_1 = 2^20, q_2 = 28 bits)
 pub const RESP_BYTES_PER_OUTPUT: usize = (20 + 28) * POLY_LEN / 8;
-/// query bytes per database row (56-bit modulus)
+// query bytes per database row (56-bit modulus)
 pub const QUERY_BYTES_PER_ROW: usize = 7;
-/// the client's packing keys: 11 key-switching rows x t_exp_left = 3 polynomials x 2048 x 7 B
 pub const PP_BYTES: usize = 11 * 3 * POLY_LEN * 7;
 
-/// Packing precomputation for one output: the result's first row and, for each of the 2047
-/// merges, the gadget-decomposed ciphertext in condensed NTT form, stored compactly
-/// (`t_exp_left x poly_len` words; the reference keeps them in full-size matrices, twice the memory).
 pub type Pc = (PolyMatrixNTT<'static>, Vec<u64>);
-/// the reference representation (for the comparison runs)
+// the reference representation (for the comparison runs)
 pub type RefPc = (PolyMatrixNTT<'static>, Vec<PolyMatrixNTT<'static>>, Vec<Vec<usize>>);
 
 pub struct RefState {
@@ -77,9 +50,9 @@ pub struct Shape {
     pub records: usize,
     pub record_bytes: usize,
     pub per_row: usize,
-    /// database rows (a power of two, at least 2048)
+    // database rows (a power of two, at least 2048)
     pub rows: usize,
-    /// output ciphertexts per answer (2048 elements of 14 bits each)
+    // output ciphertexts per answer (2048 elements of 14 bits each)
     pub instances: usize,
 }
 
@@ -90,7 +63,6 @@ impl Shape {
         let instances = (row_bits + POLY_LEN * PT_BITS - 1) / (POLY_LEN * PT_BITS);
         Shape { records, record_bytes, per_row, rows, instances }
     }
-    /// per_row minimizing query + response bytes (packing keys are a fixed cost per client)
     pub fn auto(records: usize, record_bytes: usize) -> Shape {
         (1..=256)
             .map(|k| Shape::new(records, record_bytes, k))
@@ -123,7 +95,7 @@ impl Shape {
     }
 }
 
-/// pack bytes LSB-first into 14-bit elements
+// pack bytes LSB-first into 14-bit elements
 pub fn bytes_to_elems(bytes: &[u8], out: &mut [u16]) {
     out.fill(0);
     let mask = (1u64 << PT_BITS) - 1;
@@ -161,9 +133,8 @@ pub fn elems_to_bytes(elems: &[u64], n_bytes: usize) -> Vec<u8> {
 
 struct SeedState {
     seed: u8,
-    /// public query polynomials (negacyclic-permuted, NTT), one per block of 2048 rows
     aq: Vec<PolyMatrixNTT<'static>>,
-    /// poly_len x cols, mod q
+    // poly_len x cols, mod q
     hint: Vec<u64>,
     precomp: Vec<Pc>,
 }
@@ -199,10 +170,8 @@ pub struct YpirServer {
     y_constants: (Vec<PolyMatrixNTT<'static>>, Vec<PolyMatrixNTT<'static>>),
     fake_pp: Vec<PolyMatrixNTT<'static>>,
     seeds: Vec<SeedState>,
-    /// NTT-domain automorphism tables (the reference recomputes them for every output)
     tables: Vec<Vec<usize>>,
     pub setup: SetupTiming,
-    /// bumped by every update (prepared packing is only valid within one epoch)
     pub epoch: u64,
 }
 
@@ -311,7 +280,6 @@ impl YpirServer {
         precompute_pack_par(self.params, prep, &self.fake_pp, &self.y_constants)
     }
 
-    /// The parallel precomputation equals the reference `precompute_pack` (seed j, output i).
     pub fn precomp_matches_reference(&self, j: usize, i: usize) -> bool {
         let n = POLY_LEN;
         let cols = self.shape.cols();
@@ -335,7 +303,7 @@ impl YpirServer {
             })
     }
 
-    /// Bytes held per seed: hint plus packing precomputation.
+    // Bytes held per seed: hint plus packing precomputation.
     pub fn bytes_per_seed(&self) -> usize {
         let st = &self.seeds[0];
         let pc: usize = st
@@ -350,7 +318,7 @@ impl YpirServer {
         (0..self.shape.instances).into_par_iter().map(|i| self.precomp_output(hint, i)).collect()
     }
 
-    /// The elements of one database row.
+    // The elements of one database row.
     pub fn row_elems(&self, r: usize) -> Vec<u16> {
         let db = self.server.db();
         let rows = self.shape.rows;
@@ -365,8 +333,6 @@ impl YpirServer {
         row[off..off + s.record_bytes].to_vec()
     }
 
-    /// Replace records; the hint is updated for the touched blocks of 2048 rows and the packing
-    /// precomputation is redone (all seeds).
     pub fn update_records(&mut self, updates: &[(usize, Vec<u8>)]) -> UpdateTiming {
         let t0 = Instant::now();
         let s = self.shape;
@@ -380,7 +346,6 @@ impl YpirServer {
         }
         let rs: Vec<usize> = by_row.keys().copied().collect();
         let nr = rs.len();
-        // old elements, column-major (c * nr + k): one pass over each touched column
         let mut old_t = vec![0u16; cols * nr];
         {
             let db = self.server.db();
@@ -391,7 +356,6 @@ impl YpirServer {
                 }
             });
         }
-        // new rows: decode, apply the record writes, re-encode (parallel over rows)
         let groups: Vec<&Vec<(usize, &[u8])>> = by_row.values().collect();
         let new_rows: Vec<Vec<u16>> = (0..nr)
             .into_par_iter()
@@ -472,7 +436,6 @@ impl YpirServer {
             });
             hint_ms += ms(t);
             let t = Instant::now();
-            // (a serving system would double-buffer; here the old state is dropped first)
             self.seeds[j].precomp = Vec::new();
             let pc = self.all_precomp(&self.seeds[j].hint);
             self.seeds[j].precomp = pc;
@@ -489,14 +452,11 @@ impl YpirServer {
         }
     }
 
-    /// Recompute the hint of seed `j` from scratch (for checking the incremental update).
     pub fn hint_matches_full(&self, j: usize) -> bool {
         let st = &self.seeds[j];
         self.full_hint(&st.aq, st.seed) == st.hint
     }
 
-    /// Answer a batch. `queries[q] = (seed index j, packed query (rows u64), client's packing keys)`.
-    /// Returns per query one response ciphertext (bytes) per output.
     pub fn answer(
         &self,
         queries: &[(usize, &[u64], &[PolyMatrixNTT<'static>])],
@@ -528,7 +488,6 @@ impl YpirServer {
         (out, AnswerTiming { first_ms, pack_ms, total_ms: ms(t0) })
     }
 
-    /// Packing work for a client's keys under seed `j` (before its query arrives).
     pub fn prepare(&self, j: usize, pp: &[PolyMatrixNTT<'static>]) -> Prepared {
         let row1 = (0..self.shape.instances)
             .into_par_iter()
@@ -540,7 +499,7 @@ impl YpirServer {
         Prepared { seed_j: j, epoch: self.epoch, row1 }
     }
 
-    /// Prepare many (client, seed) pairs at once, parallel over all outputs.
+    // Prepare many (client, seed) pairs at once, parallel over all outputs.
     pub fn prepare_many(&self, reqs: &[(usize, &[PolyMatrixNTT<'static>])]) -> Vec<Prepared> {
         let n_out = self.shape.instances;
         let flat: Vec<PolyMatrixNTT<'static>> = (0..reqs.len() * n_out)
@@ -558,7 +517,6 @@ impl YpirServer {
             .collect()
     }
 
-    /// First pass for a batch: per query, `cols` LWE bodies.
     fn first_pass(&self, qv: &[&[u64]]) -> Vec<Vec<u64>> {
         let rows = self.shape.rows;
         let cols = self.shape.cols();
@@ -607,7 +565,6 @@ impl YpirServer {
         inter
     }
 
-    /// Online answer for queries whose packing was prepared: one pass plus the LWE bodies.
     pub fn answer_prepared(&self, queries: &[(&Prepared, &[u64])]) -> (Vec<Vec<Vec<u8>>>, AnswerTiming) {
         let t0 = Instant::now();
         for (p, _) in queries {
@@ -635,7 +592,6 @@ impl YpirServer {
         (out, AnswerTiming { first_ms, pack_ms: ms(t1), total_ms: ms(t0) })
     }
 
-    /// The reference offline precomputation for seed 0, single-threaded (YPIR's code).
     pub fn offline_reference(&self) -> RefState {
         let t = Instant::now();
         let aq = self.server.generate_pseudorandom_query(0);
@@ -663,8 +619,6 @@ impl YpirServer {
         RefState { hint_ms, precomp_ms: ms(t), precomp }
     }
 
-    /// The reference single-query path (YPIR's `perform_online_computation_simplepir`: one pass
-    /// and one packing per query, single-threaded).
     pub fn answer_reference(
         &self,
         st: &RefState,
@@ -712,7 +666,6 @@ impl YpirServer {
     }
 }
 
-/// `res = sum_k w[k] * g[k]` (no reduction), `w` a condensed 1 x t matrix, `g` compact condensed.
 fn mul_condensed(res: &mut PolyMatrixNTT, w: &PolyMatrixNTT, g: &[u64]) {
     let n = POLY_LEN;
     let t = w.cols;
@@ -739,8 +692,6 @@ fn mul_condensed(res: &mut PolyMatrixNTT, w: &PolyMatrixNTT, g: &[u64]) {
     }
 }
 
-/// YPIR's `precompute_pack` with each level's (independent) merges run in parallel and the
-/// automorphism tables left out (they do not depend on the data).
 pub fn precompute_pack_par(
     params: &'static Params,
     rlwe_cts: Vec<PolyMatrixNTT<'static>>,
@@ -825,9 +776,6 @@ pub fn precompute_pack_par(
 
 type YConst = (Vec<PolyMatrixNTT<'static>>, Vec<PolyMatrixNTT<'static>>);
 
-/// The query-independent part of YPIR's online packing (`pack_using_precomp_vals` up to the
-/// point where the LWE bodies enter): it depends only on the client's packing keys and the
-/// precomputation, so it can run before the query arrives.
 pub fn pack_row1(
     params: &'static Params,
     pub_params: &[PolyMatrixNTT<'static>],
@@ -889,7 +837,6 @@ pub fn pack_row1(
     row1
 }
 
-/// The query-dependent rest: put the LWE bodies in and switch moduli.
 pub fn pack_finish(
     params: &'static Params,
     precomp_res: &PolyMatrixNTT<'static>,
@@ -907,11 +854,10 @@ pub fn pack_finish(
             out_raw.data[idx] -= params.modulus;
         }
     }
-    // the reference converts to NTT and back before switching; the raw form is the same
     out_raw.switch(params.get_q_prime_1(), params.get_q_prime_2())
 }
 
-/// A client's packing work for one seed, done before its query arrives.
+// A client's packing work for one seed, done before its query arrives.
 pub struct Prepared {
     pub seed_j: usize,
     pub epoch: u64,
@@ -933,7 +879,7 @@ fn row_bytes<F: Fn(usize) -> Vec<u8>>(s: &Shape, r: usize, record: &F) -> Vec<u8
     out
 }
 
-/// One client key; queries under it must use distinct seeds.
+// One client key; queries under it must use distinct seeds.
 pub struct YpirClient {
     params: &'static Params,
     shape: Shape,
@@ -962,7 +908,7 @@ impl YpirClient {
         YpirClient { params, shape, y, pp }
     }
 
-    /// Packed query for record `idx` under public seed `seed`.
+    // Packed query for record `idx` under public seed `seed`.
     pub fn query(&self, seed: u8, idx: usize) -> AlignedMemory64 {
         let row = idx / self.shape.per_row;
         let q = self.y.generate_query(seed, self.params.db_dim_1, true, row);

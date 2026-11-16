@@ -1,23 +1,3 @@
-//! Updatable oblivious key-value store (UOKVS): Cuckoo hashing with invalidation.
-//!
-//! This module implements the construction of the paper (Figures 5-7 and
-//! Algorithm 1) together with the variants needed for ablations:
-//!
-//! * `Discipline::Paper`: the invalidation discipline of Lemma `lem:fresh`.
-//!   States `(key, j)` are tracked by index, a candidate position is evaluated
-//!   only when the walk visits it, every state is used at most once (on visit
-//!   for random walk, on pop for BFS), BFS accesses every popped position, and
-//!   every operation makes exactly `alpha` (RW) or `alpha + 1` (BFS) accesses.
-//! * `Discipline::Legacy`: what the original `dip.rs` does (first-fit over all
-//!   candidates, no invalidation for RW, invalidation of moved states only for
-//!   BFS, BFS accesses only the eviction chain).
-//! * `Discipline::NoInvalidation`: the Paper access pattern without invalidation.
-//!
-//! Buckets hold up to `p` slots. `p = 1` is exactly the model of the stash
-//! analysis; `p > 1` is a bucketized table. Every slot is encrypted under the
-//! decryption key of its item (ChaCha20 with a 16-byte zero check), so the
-//! server-visible array can be materialized and fed to the PIR backend.
-
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use rand::seq::SliceRandom;
@@ -27,9 +7,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub type K32 = [u8; 32];
 
 pub const NONCE: usize = 12;
-/// value length (u16) + version (u32) + flags (u8)
+// value length (u16) + version (u32) + flags (u8)
 pub const META: usize = 7;
-/// trailing zero check used by the trial-decryption in Figure `cons:flex basic`
 pub const CHECK: usize = 16;
 const NOCUR: u8 = u8::MAX;
 const NONE: u32 = u32::MAX;
@@ -49,31 +28,29 @@ pub enum Discipline {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateMode {
-    /// Write the new version through a fresh state (Figure 6, default).
     Invalidation,
-    /// Overwrite in place (leaks the update pattern).
+    // Overwrite in place (leaks the update pattern).
     InPlace,
 }
 
 #[derive(Clone, Debug)]
 pub struct Params {
-    /// number of buckets (0 = stash-only map)
+    // number of buckets (0 = stash-only map)
     pub mu: usize,
-    /// slots per bucket
+    // slots per bucket
     pub p: usize,
-    /// candidate positions per key (<= 8)
+    // candidate positions per key (<= 8)
     pub s: usize,
-    /// walk length (RW) or maximum number of expanded pops (BFS)
+    // walk length (RW) or maximum number of expanded pops (BFS)
     pub alpha: usize,
-    /// stash capacity (slots)
+    // stash capacity (slots)
     pub sigma: usize,
     pub evict: Evict,
     pub disc: Discipline,
-    /// BFS: occupants of a popped bucket that are expanded (matters for p > 1)
     pub bfs_max_branch: usize,
-    /// BFS: maximum depth of the search tree
+    // BFS: maximum depth of the search tree
     pub bfs_max_depth: usize,
-    /// plaintext bytes per slot value
+    // plaintext bytes per slot value
     pub val_len: usize,
 }
 
@@ -98,7 +75,6 @@ impl Params {
     }
 }
 
-/// Owner PRF keys for one map (Construction `cons:auth from sym`).
 #[derive(Clone)]
 pub struct OwnerKeys {
     kl: K32,
@@ -121,14 +97,12 @@ impl OwnerKeys {
         rng.fill(&mut kd);
         Self { kl, kd }
     }
-    /// Delegation key of a label (`Cap`).
+    // Delegation key of a label (`Cap`).
     pub fn cap(&self, label: &[u8]) -> (K32, K32) {
         (kh(&self.kl, b"cap", label), kh(&self.kd, b"cap", label))
     }
 }
 
-/// `Derive`: flat keys use the delegation key itself; hierarchical keys
-/// `(g, i)` apply the second-level PRF.
 pub fn derive(cap: &(K32, K32), idx: Option<u64>) -> (K32, K32) {
     match idx {
         None => *cap,
@@ -139,7 +113,7 @@ pub fn derive(cap: &(K32, K32), idx: Option<u64>) -> (K32, K32) {
     }
 }
 
-/// A map key: a label and, for hierarchical maps, an index.
+// A map key: a label and, for hierarchical maps, an index.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
     pub label: Vec<u8>,
@@ -187,29 +161,27 @@ struct Item {
     val: Vec<u8>,
     ver: u32,
     tomb: bool,
-    /// index of the candidate the item currently occupies
+    // index of the candidate the item currently occupies
     cur: u8,
-    /// bitmask of used states (key, j)
+    // bitmask of used states (key, j)
     used: u8,
     stale: bool,
     alive: bool,
     at: At,
-    /// stash slot in `0..sigma` while the item is in the stash (`PutStash`
-    /// picks a uniformly random dummy slot; the item keeps it until it leaves)
     slot: usize,
 }
 
-/// What the server sees for one operation, plus owner-side counters.
+// What the server sees for one operation, plus owner-side counters.
 #[derive(Clone, Debug, Default)]
 pub struct OpOut {
-    /// bucket positions accessed (and re-encrypted), in order
+    // bucket positions accessed (and re-encrypted), in order
     pub accessed: Vec<usize>,
     pub to_stash: bool,
     pub overflow: bool,
     pub moves: usize,
-    /// candidate positions evaluated by the owner
+    // candidate positions evaluated by the owner
     pub evaluated: usize,
-    /// whether the op was a dummy (padding only)
+    // whether the op was a dummy (padding only)
     pub dummy: bool,
 }
 
@@ -221,16 +193,12 @@ pub struct Table {
     items: Vec<Item>,
     free: Vec<u32>,
     index: HashMap<Vec<u8>, u32>,
-    /// occupied stash slots (owner state)
+    // occupied stash slots (owner state)
     stash_occ: HashSet<usize>,
-    /// insertions that found no dummy stash slot (each one halts the structure)
     pub overflow: usize,
-    /// set by the first overflow: the structure has output a public failure
-    /// and halts (the encrypted stash never grows beyond sigma)
     pub halted: bool,
     pub stash_peak: usize,
     pub stale_count: usize,
-    /// set by `encode_joint` (initial entries outside Lemma `lem:fresh`)
     pub joint_built: bool,
 }
 
@@ -269,10 +237,6 @@ impl Table {
         }
     }
 
-    // ------------------------------------------------------------ basics
-
-    /// `H(key, j)`: evaluates only the j-th candidate (keyed BLAKE3 with the
-    /// public DIP key, applied to the pseudorandom lookup key).
     pub fn hpos(&self, lk: &K32, j: u8) -> usize {
         let mut h = blake3::Hasher::new_keyed(&self.kdip);
         h.update(lk);
@@ -282,7 +246,7 @@ impl Table {
         (v % self.prm.mu as u64) as usize
     }
 
-    /// Candidate positions a client queries for a lookup key.
+    // Candidate positions a client queries for a lookup key.
     pub fn candidates(&self, lk: &K32) -> Vec<usize> {
         if self.prm.mu == 0 {
             return vec![];
@@ -318,7 +282,7 @@ impl Table {
             .map(|i| Slot::At(i as u16))
     }
 
-    /// Frees a stale item occupying `slot` before it is overwritten.
+    // Frees a stale item occupying `slot` before it is overwritten.
     fn claim(&mut self, pos: usize, slot: Slot) {
         if let Slot::At(i) = slot {
             let old = self.buckets[pos][i as usize];
@@ -345,12 +309,6 @@ impl Table {
         it.cur = j;
     }
 
-    /// `PutStash`: the item takes a uniformly random dummy slot of the
-    /// sigma-slot stash. If none is left (an overflow), the operation outputs
-    /// a public failure and the structure halts: `halted` is set, the
-    /// overflow is counted, and `encrypt_stash` refuses to run. The item is
-    /// still recorded (without a slot) so that the owner state stays
-    /// consistent for diagnostics; callers must stop using the structure.
     fn put_stash<R: Rng>(&mut self, h: u32, rng: &mut R, out: &mut OpOut) {
         out.to_stash = true;
         let slot = if self.stash.len() >= self.prm.sigma {
@@ -359,7 +317,6 @@ impl Table {
             self.halted = true;
             usize::MAX
         } else {
-            // rejection sampling: a uniformly random slot among the dummies
             loop {
                 let r = rng.gen_range(0..self.prm.sigma);
                 if !self.stash_occ.contains(&r) {
@@ -396,8 +353,6 @@ impl Table {
         }
     }
 
-    // ------------------------------------------------------------ public API
-
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -407,7 +362,7 @@ impl Table {
     pub fn stash_capacity(&self) -> usize {
         self.prm.sigma
     }
-    /// fraction of bucket slots holding live (non-stale) items
+    // fraction of bucket slots holding live (non-stale) items
     pub fn load(&self) -> f64 {
         if self.prm.mu == 0 {
             return 0.0;
@@ -437,8 +392,6 @@ impl Table {
         }
     }
 
-    /// `Encode`: places entries one at a time with the same walk, without
-    /// padding or messages, recording used states (rule 4 of the discipline).
     pub fn encode<R: Rng>(&mut self, entries: Vec<(Key, (K32, K32), Vec<u8>)>, rng: &mut R) {
         for (key, (lk, dk), val) in entries {
             let mut out = OpOut::default();
@@ -446,11 +399,6 @@ impl Table {
         }
     }
 
-    /// Joint build used for the "jointly prepared" curves of the paper: a
-    /// first-fit random walk with walk length `alpha_build` and no
-    /// invalidation. Later operations use `self.prm`. Under the discipline,
-    /// every candidate a joint build evaluates would have to be marked used;
-    /// this function does not, so it is outside Lemma `lem:fresh`.
     pub fn encode_joint<R: Rng>(
         &mut self,
         entries: Vec<(Key, (K32, K32), Vec<u8>)>,
@@ -503,7 +451,7 @@ impl Table {
         self.place_new(h, record, rng, out);
     }
 
-    /// `Update`; a deletion is an update to a tombstone.
+    // `Update`; a deletion is an update to a tombstone.
     pub fn update<R: Rng>(
         &mut self,
         key: &Key,
@@ -534,7 +482,6 @@ impl Table {
                     out.accessed.push(pos as usize);
                 }
                 self.finish_padding(rng, &mut out);
-                // move the real access to a uniformly random index
                 if !out.accessed.is_empty() {
                     let k = rng.gen_range(0..out.accessed.len());
                     out.accessed.swap(0, k);
@@ -569,9 +516,6 @@ impl Table {
         out
     }
 
-    /// Frees a key without any server-visible access: a bucket copy becomes
-    /// stale (and counts as free for later walks), a stash copy is dropped
-    /// at the next stash refresh. Used when a versioned key supersedes it.
     pub fn remove(&mut self, key: &Key) -> bool {
         let kb = key.bytes();
         let Some(h) = self.index.remove(&kb) else { return false };
@@ -589,19 +533,18 @@ impl Table {
         true
     }
 
-    /// Value of a key from the owner state (for rewriting a chunk).
+    // Value of a key from the owner state (for rewriting a chunk).
     pub fn owner_value(&self, key: &Key) -> Option<&[u8]> {
         self.index.get(&key.bytes()).map(|&h| self.items[h as usize].val.as_slice())
     }
 
-    /// Whether a key currently sits in the stash (owner state).
+    // Whether a key currently sits in the stash (owner state).
     pub fn in_stash(&self, key: &Key) -> bool {
         self.index
             .get(&key.bytes())
             .map_or(false, |&h| self.items[h as usize].at == At::Stash)
     }
 
-    /// A dummy operation: uniformly random re-encryptions only.
     pub fn dummy<R: Rng>(&mut self, rng: &mut R) -> OpOut {
         let mut out = OpOut { dummy: true, ..Default::default() };
         self.finish_padding(rng, &mut out);
@@ -626,10 +569,6 @@ impl Table {
         }
     }
 
-    // ------------------------------------------------------------ random walk
-
-    /// Figure 7: one access per step; invalidated states go to the stash
-    /// without being evaluated.
     fn rw_paper<R: Rng>(&mut self, mut h: u32, mut j: u8, record: bool, rng: &mut R, out: &mut OpOut) {
         let a = self.prm.alpha;
         let inval = self.prm.disc == Discipline::Paper;
@@ -665,8 +604,6 @@ impl Table {
         }
     }
 
-    /// The original code: check all candidates first-fit, otherwise evict at a
-    /// uniformly random candidate; no invalidation.
     fn rw_legacy<R: Rng>(&mut self, mut h: u32, record: bool, rng: &mut R, out: &mut OpOut) {
         let s = self.prm.s as u8;
         for _ in 0..self.prm.alpha {
@@ -698,12 +635,6 @@ impl Table {
         self.put_stash(h, rng, out);
     }
 
-    // ------------------------------------------------------------ BFS
-
-    /// Algorithm 1. `Paper`: pop invalidation, positions evaluated at pop,
-    /// every popped position accessed. `Legacy`: first-fit, moved-state
-    /// invalidation, only the chain accessed. `NoInvalidation`: Paper access
-    /// pattern without invalidation.
     fn bfs<R: Rng>(&mut self, root: u32, disc: Discipline, record: bool, rng: &mut R, out: &mut OpOut) {
         struct Node {
             item: u32,
@@ -757,7 +688,7 @@ impl Table {
             }
             let (it, j) = (nodes[ni].item, nodes[ni].j);
             if check_used && self.items[it as usize].used & (1 << j) != 0 {
-                continue; // used state: neither evaluated nor accessed
+                continue;
             }
             if !legacy && check_used {
                 self.items[it as usize].used |= 1 << j; // pop invalidation
@@ -850,11 +781,6 @@ impl Table {
         }
     }
 
-    // ------------------------------------------------------------ client view
-
-    /// Client-side lookup on plaintext state: scans the s candidates and the
-    /// stash and keeps the highest version (stale copies have lower versions).
-    /// Returns (value, tombstone) of the newest copy.
     pub fn lookup(&self, key: &Key, lk: &K32) -> Option<(Vec<u8>, bool)> {
         let kb = key.bytes();
         let mut best: Option<&Item> = None;
@@ -875,15 +801,12 @@ impl Table {
         best.map(|it| (it.val.clone(), it.tomb))
     }
 
-    /// Stash contents visible to a client holding `dk` (plaintext simulation).
     pub fn stash_items(&self) -> impl Iterator<Item = (&[u8], &[u8], bool)> {
         self.stash.iter().map(move |&h| {
             let it = &self.items[h as usize];
             (it.key.as_slice(), it.val.as_slice(), it.tomb)
         })
     }
-
-    // ------------------------------------------------------------ encryption
 
     fn enc_slot<R: Rng>(&self, it: &Item, rng: &mut R, out: &mut Vec<u8>) {
         let mut nonce = [0u8; NONCE];
@@ -900,7 +823,7 @@ impl Table {
         out.extend_from_slice(&pt);
     }
 
-    /// Fresh ciphertext of a bucket (what `Reencrypt` sends).
+    // Fresh ciphertext of a bucket (what `Reencrypt` sends).
     pub fn encrypt_bucket<R: Rng>(&self, pos: usize, rng: &mut R) -> Vec<u8> {
         let sb = self.prm.slot_bytes();
         let mut out = Vec::with_capacity(self.prm.bucket_bytes());
@@ -917,10 +840,6 @@ impl Table {
         out
     }
 
-    /// Owner view of the sigma stash slots: the item handle in each slot
-    /// (`None` = dummy). With buckets (mu > 0) every item keeps the slot
-    /// `PutStash` gave it; a stash-only map (mu = 0) is stored in a fresh
-    /// uniformly random order at every refresh.
     fn stash_layout<R: Rng>(&self, rng: &mut R) -> Vec<Option<u32>> {
         assert!(
             !self.halted && self.stash.len() <= self.prm.sigma,
@@ -943,13 +862,11 @@ impl Table {
         slots
     }
 
-    /// Slot index of each stash item, in slot order (tests and diagnostics).
+    // Slot index of each stash item, in slot order (tests and diagnostics).
     pub fn stash_slots<R: Rng>(&self, rng: &mut R) -> Vec<Option<Vec<u8>>> {
         self.stash_layout(rng).into_iter().map(|x| x.map(|h| self.items[h as usize].key.clone())).collect()
     }
 
-    /// Fresh ciphertext of the whole stash: exactly sigma slots (items in
-    /// their slots, dummies elsewhere). Panics if the structure has halted.
     pub fn encrypt_stash<R: Rng>(&self, rng: &mut R) -> Vec<u8> {
         let sb = self.prm.slot_bytes();
         let layout = self.stash_layout(rng);
@@ -967,7 +884,7 @@ impl Table {
         out
     }
 
-    /// Trial decryption of one slot (client side).
+    // Trial decryption of one slot (client side).
     pub fn decrypt_slot(&self, slot: &[u8], dk: &K32) -> Option<(Vec<u8>, u32, bool)> {
         let (nonce, ct) = slot.split_at(NONCE);
         let mut pt = ct.to_vec();
@@ -983,17 +900,17 @@ impl Table {
         Some((pt[..len].to_vec(), ver, pt[o + 6] != 0))
     }
 
-    /// Bytes of an operation sent by the owner: accessed buckets + stash.
+    // Bytes of an operation sent by the owner: accessed buckets + stash.
     pub fn op_upload_bytes(&self, out: &OpOut) -> usize {
         out.accessed.len() * self.prm.bucket_bytes() + self.prm.stash_bytes()
     }
 
-    /// Initial server array (all buckets encrypted).
+    // Initial server array (all buckets encrypted).
     pub fn encrypt_all<R: Rng>(&self, rng: &mut R) -> Vec<Vec<u8>> {
         (0..self.prm.mu).map(|pos| self.encrypt_bucket(pos, rng)).collect()
     }
 
-    /// Consistency check of the owner state (tests).
+    // Consistency check of the owner state (tests).
     pub fn check_invariants(&self) {
         for (pos, b) in self.buckets.iter().enumerate() {
             assert!(b.len() <= self.prm.p);

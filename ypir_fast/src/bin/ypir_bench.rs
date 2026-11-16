@@ -1,6 +1,3 @@
-//! ypir_bench check
-//! ypir_bench bench --records N --record-bytes B [--per-row K|auto] [--seeds S]
-//!                  [--batches 1,8,16,32] [--updates 1,100,1000] [--trials 3] [--ref]
 use std::time::Instant;
 
 use rand::{Rng, SeedableRng};
@@ -32,7 +29,6 @@ fn list(s: &str) -> Vec<usize> {
     s.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().unwrap()).collect()
 }
 
-/// Build `nq` queries for random records: clients hold `seeds` queries each (seed = slot).
 fn make_queries(
     srv: &YpirServer,
     nq: usize,

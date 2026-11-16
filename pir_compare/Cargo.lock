@@ -101,20 +101,6 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 [[package]]
 name = "frodo-pir"
 version = "0.0.1"
-source = "git+https://github.com/whyamey/frodo-pir?rev=1557396#1557396058e2bf89a5aad8fc82adccb0d7141454"
-dependencies = [
- "base64",
- "bincode",
- "rand",
- "rand_core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "frodo-pir"
-version = "0.0.1"
-source = "git+https://github.com/whyamey/frodo-pir?rev=c008122#c008122174975e897a77e938aca763cee3c58a2a"
 dependencies = [
  "base64",
  "bincode",
@@ -124,6 +110,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "frodo-pir"
+version = "0.0.1"
+source = "git+https://github.com/brave-experiments/frodo-pir?rev=1557396#1557396058e2bf89a5aad8fc82adccb0d7141454"
+dependencies = [
+ "base64",
+ "bincode",
+ "rand",
+ "rand_core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -170,8 +169,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bincode",
- "frodo-pir 0.0.1 (git+https://github.com/whyamey/frodo-pir?rev=1557396)",
- "frodo-pir 0.0.1 (git+https://github.com/whyamey/frodo-pir?rev=c008122)",
+ "frodo-pir 0.0.1",
+ "frodo-pir 0.0.1 (git+https://github.com/brave-experiments/frodo-pir?rev=1557396)",
  "rand",
 ]
 

@@ -663,7 +663,6 @@ dependencies = [
 [[package]]
 name = "frodo-pir"
 version = "0.0.1"
-source = "git+https://github.com/whyamey/frodo-pir#c008122174975e897a77e938aca763cee3c58a2a"
 dependencies = [
  "base64 0.13.1",
  "bincode",

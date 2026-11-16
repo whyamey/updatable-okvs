@@ -1,30 +1,3 @@
-//! A faster Spiral PIR server for the UOKVS tables.
-//!
-//! Same scheme, parameters, client, and wire format as the Blyss Spiral server
-//! (`blyssprivacy/sdk`, `lib/server`); responses are byte-identical. Changes:
-//!
-//! 1. **Dense database, coefficient-major.** The Blyss server keeps every
-//!    record polynomial in a hash map (it is built for sparse key-value
-//!    stores) and walks records in the outer loop. Our tables are full, so
-//!    the database is one array per (instance, trial) in layout
-//!    `[z][j][i]` (NTT coefficient, first-dimension index, further index).
-//!    For one coefficient `z`, a query contributes `dim0 x 2` words (8 KB),
-//!    which stay in L1 while the database streams once.
-//! 2. **Batched first dimension.** `k` queries share one pass over the
-//!    database: each database word is loaded once and multiplied into the
-//!    accumulators of all `k` queries. Accumulators are reduced lazily
-//!    (`x = lo32(x) + hi32(x) * (2^32 mod q)` every 128 terms), so the inner
-//!    loop is plain 32x32->64 multiply-adds that vectorize.
-//! 3. **Parallel everywhere.** The first dimension is split into blocks of
-//!    16 coefficients (128 tasks per (instance, trial) array) instead of the
-//!    Blyss server's `instances x n^2` tasks (4 for 8 KB records). Query
-//!    expansion and folding run in parallel across queries.
-//! 5. **AVX-512 kernel.** For each 8 records and up to 4 queries, the 16
-//!    accumulators stay in zmm registers for the whole first dimension
-//!    (runtime-detected; a portable kernel is used otherwise).
-//! 4. **Row updates.** `update_item` re-encodes one record (its `n^2` chunk
-//!    polynomials) in place: what one UOKVS bucket write costs the server.
-
 use rayon::prelude::*;
 use spiral_rs::{arith::barrett_coeff_u64, client::*, params::*, poly::*};
 use spiral_server::compute::{fold::*, pack::*, query_expansion::*};
@@ -32,9 +5,9 @@ use spiral_server::db::loading::{convert_pt_to_poly, pack_ntt_poly};
 use spiral_server::server::encode;
 use std::time::Instant;
 
-/// Coefficients per first-dimension task.
+// Coefficients per first-dimension task.
 pub const Z_BLOCK: usize = 16;
-/// Terms accumulated between lazy reductions (products are < 2^56).
+// Terms accumulated between lazy reductions (products are < 2^56).
 const LAZY_EVERY: usize = 128;
 
 pub struct DenseDb {
@@ -42,7 +15,6 @@ pub struct DenseDb {
     pub num_per: usize,
     pub poly_len: usize,
     pub chunks: usize,
-    /// one array per (instance, trial), layout [z][j][i], packed crt0 | crt1 << 32
     pub data: Vec<Vec<u64>>,
 }
 
@@ -60,8 +32,6 @@ impl DenseDb {
         (z * self.dim0 + j) * self.num_per + i
     }
 
-    /// Sets record `idx` from its plaintext bytes (at most `instances * n^2 *
-    /// bytes_per_chunk`), exactly as the Blyss server's `update_item_raw`.
     pub fn update_item(&mut self, params: &Params, idx: usize, data: &[u8]) {
         let per = params.bytes_per_chunk();
         let mut bucket = vec![0u8; self.chunks * per];
@@ -84,11 +54,9 @@ impl DenseDb {
     }
 }
 
-/// Query vector of the first dimension in layout [z][j][4].
+// Query vector of the first dimension in layout [z][j][4].
 fn reorient(params: &Params, v_reg: &[u64], dim0: usize) -> Vec<u64> {
     let pl = params.poly_len;
-    // [z][j][4]: row-0 word, its high half, row-1 word, its high half (the
-    // multiplies use the low 32 bits of each 64-bit lane)
     let mut out = vec![0u64; pl * dim0 * 4];
     for j in 0..dim0 {
         for r in 0..2 {
@@ -108,8 +76,6 @@ fn lazy(x: u64, r: u64) -> u64 {
     (x & 0xffff_ffff) + (x >> 32) * r
 }
 
-/// First-dimension pass of `k` queries over one (instance, trial) array for
-/// coefficients `z0..z1`. Returns accumulators [z - z0][q][4][i] reduced mod q.
 fn firstdim_block(params: &Params, db: &DenseDb, chunk: usize, qs: &[Vec<u64>], z0: usize, z1: usize) -> Vec<u64> {
     let (dim0, np, k) = (db.dim0, db.num_per, qs.len());
     let (m0, m1) = (params.moduli[0], params.moduli[1]);
@@ -165,11 +131,6 @@ fn firstdim_block(params: &Params, db: &DenseDb, chunk: usize, qs: &[Vec<u64>], 
     out
 }
 
-
-// ---------------------------------------------------------------- AVX-512 kernel
-
-/// Queries per register block: 4 accumulators per query x QG queries stay in
-/// zmm registers while j runs over the whole first dimension.
 const QG: usize = 4;
 
 #[cfg(target_arch = "x86_64")]
@@ -214,7 +175,7 @@ unsafe fn block_avx512<const Q: usize>(
     }
 }
 
-/// AVX-512 version of `firstdim_block` (needs num_per a multiple of 8).
+// AVX-512 version of `firstdim_block` (needs num_per a multiple of 8).
 #[cfg(target_arch = "x86_64")]
 fn firstdim_block_avx512(params: &Params, db: &DenseDb, chunk: usize, qs: &[Vec<u64>], z0: usize, z1: usize) -> Vec<u64> {
     let (dim0, np, k) = (db.dim0, db.num_per, qs.len());
@@ -279,14 +240,13 @@ fn firstdim_dispatch(params: &Params, db: &DenseDb, chunk: usize, qs: &[Vec<u64>
 pub struct Timing {
     pub expand_ms: f64,
     pub firstdim_ms: f64,
-    /// of which the multiply-accumulate kernel (the rest is assembling outputs)
     pub firstdim_kernel_ms: f64,
     pub fold_ms: f64,
     pub pack_encode_ms: f64,
     pub total_ms: f64,
 }
 
-/// Answers a batch of queries with one pass over the database.
+// Answers a batch of queries with one pass over the database.
 pub fn process_queries<'a>(params: &'a Params, pp: &PublicParameters<'a>, queries: &[Query<'a>], db: &DenseDb) -> (Vec<Vec<u8>>, Timing) {
     let t0 = Instant::now();
     let mut tm = Timing::default();
@@ -314,8 +274,6 @@ pub fn process_queries<'a>(params: &'a Params, pp: &PublicParameters<'a>, querie
     let mut inter: Vec<Vec<Vec<PolyMatrixNTT>>> = (0..k)
         .map(|_| (0..db.chunks).map(|_| (0..np).map(|_| PolyMatrixNTT::zero(params, 2, 1)).collect()).collect())
         .collect();
-    // one (instance, trial) array at a time, so the block outputs stay small;
-    // within it, blocks of coefficients run in parallel
     for c in 0..db.chunks {
         let tk = Instant::now();
         let z0s: Vec<usize> = (0..pl).step_by(Z_BLOCK).collect();
@@ -377,8 +335,6 @@ pub fn process_queries<'a>(params: &'a Params, pp: &PublicParameters<'a>, querie
     (out, tm)
 }
 
-/// Spiral parameters used for the UOKVS tables (the Blyss server's test
-/// parameters with one instance): records of n^2 * 2048 bytes, 2^(nu1 + nu2) records.
 pub fn table_params(n: usize, nu1: usize, nu2: usize) -> Params {
     let cfg = format!(
         r#"{{"n": {n}, "nu_1": {nu1}, "nu_2": {nu2}, "p": 256, "q2_bits": 22, "t_gsw": 7,
