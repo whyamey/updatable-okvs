@@ -88,7 +88,7 @@ dry_caps() {
       P=$(up "$pm" "${PEND_HEADROOM:-1.1}" 64)
     fi
     echo "$K $P" > "$f"
-    log "dry run for $l: K $K (from ${km:--}), P̂ $P (from ${pm:--} pending postings at a log compaction)" >&2
+    log "dry run for $l: K $K (from ${km:--}), P-hat $P (from ${pm:--} pending postings at a log compaction)" >&2
   fi
   cat "$f"
 }

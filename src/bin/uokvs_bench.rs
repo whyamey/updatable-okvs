@@ -134,7 +134,7 @@ design --data DIR | --synthetic K,D,PER  --policy batched|perop|rebuild
        --major-every 1000000 (alias --val-every; E_V: ValMap rebuild every E_V appends, 0 = never;
        --policy rebuild uses --r) --log-every auto (E_L: log compaction every E_L appends;
        auto = E_V, so every log compaction is a ValMap rebuild; E_V must be a multiple of E_L)
-       --pend-cap auto|measure|N (P̂: pending-posting records in every log snapshot; auto = 0
+       --pend-cap auto|measure|N (P-hat: pending-posting records in every log snapshot; auto = 0
        when E_L = E_V, else E_V, a safe but large bound; measure = dry run with unpadded
        snapshots, prints pend_max_at_compaction); --k 0 with E_L = E_V = R is the static
        OKVS baseline; --scale 1 (k copies of the corpus, interleaved round-robin) --scale-mode
@@ -2036,7 +2036,7 @@ fn report(a: &Args) {
     if let Some((h, rows)) = read_csv(&sp) {
         let rows = dedup_last(&h, rows, &["label"]);
         md.push_str("## Write path: schedules and DocMap layouts\n\n");
-        md.push_str("| run | policy | b | k | θ | r | DocMap | α | appends | K-overflow batches | pending peak | log peak | ValMap rows / append | DocMap rows / append | owner upload / append | owner ms / append | hint update ms / batch | rebuilds (mean ms) | stash peak | ValMap load | halted (stash overflow) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+        md.push_str("| run | policy | b | k | theta | r | DocMap | alpha | appends | K-overflow batches | pending peak | log peak | ValMap rows / append | DocMap rows / append | owner upload / append | owner ms / append | hint update ms / batch | rebuilds (mean ms) | stash peak | ValMap load | halted (stash overflow) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
         for r in &rows {
             let g = |n: &str| r[col(&h, n)].clone();
             md.push_str(&format!(
@@ -2050,7 +2050,7 @@ fn report(a: &Args) {
         }
         md.push('\n');
         if h.contains(&"pend_max_at_compaction".to_string()) {
-            md.push_str("## Log compaction vs ValMap rebuild schedules, scale\n\nE_L = log compaction period, E_V = ValMap rebuild period (appends; 0 = never). A log snapshot (the join download besides hints) has κ̂ flush + P̂ pending-posting + V̂ version records; P̂ is shown next to the most pending postings a snapshot had to carry. Owner upload per append, split by what is uploaded. *Analytic* = ValMap rebuild upload μ·row/E_V per append, and the total with it in place of the measured rebuilds (E_V may exceed the replay).\n\n| run | scale | K | E_L | E_V | appends | log compactions | ValMap rebuilds | snapshot | P̂ (needed) | log records | batches | doc writes | snapshots | ValMap rebuilds | DocMap repacks | total | rebuilds, analytic | total, analytic |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            md.push_str("## Log compaction vs ValMap rebuild schedules, scale\n\nE_L = log compaction period, E_V = ValMap rebuild period (appends; 0 = never). A log snapshot (the join download besides hints) has kappa-hat flush + P-hat pending-posting + V-hat version records; P-hat is shown next to the most pending postings a snapshot had to carry. Owner upload per append, split by what is uploaded. *Analytic* = ValMap rebuild upload mu x row/E_V per append, and the total with it in place of the measured rebuilds (E_V may exceed the replay).\n\n| run | scale | K | E_L | E_V | appends | log compactions | ValMap rebuilds | snapshot | P-hat (needed) | log records | batches | doc writes | snapshots | ValMap rebuilds | DocMap repacks | total | rebuilds, analytic | total, analytic |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
             for r in &rows {
                 let g = |n: &str| r[col(&h, n)].clone();
                 let b = |n: &str| human(fnum(&g(n)));
@@ -2065,7 +2065,7 @@ fn report(a: &Args) {
             md.push('\n');
         }
         if h.contains(&"kappa_committed_mean".to_string()) {
-            md.push_str("## Equal log budgets: UOKVS (age rule) vs append + rebuild\n\nLog budget A: UOKVS commits every posting within A appends (a keyword is due once its oldest pending posting is A appends old; K from a dry run), the static baseline (K = 0) rebuilds ValMap every A appends. Max pending = the uncommitted log tail. κ_A = distinct keywords per A-append window that got a posting record (active) / that a batch committed. Upload per append. μ·row = upload of one ValMap rebuild: add μ·row / E_V per append for UOKVS with a rebuild every E_V appends. Server storage: ValMap (μ rows + stash), DocMap, log peak (snapshot + records since), and the total peak, also with the old ValMap / DocMap / log kept while a rebuild, repack or compaction is installed (copy-on-write). ValMap live chunks are capped by ℓ̂ at all times (more is a halt).\n\n| run | scale | A (κ window) | K | K needed (max / after 2A / mean) | K-overflow batches | E_L | E_V | appends | max pending | snapshot | log records | batches | snapshots | ValMap rebuilds | DocMap writes + repacks | total | κ_A active | κ_A committed | stash peak | μ·row | ValMap live max / ℓ̂ | rebuilds | server: ValMap | DocMap | log peak | snapshot peak | total peak | total peak, copy-on-write |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            md.push_str("## Equal log budgets: UOKVS (age rule) vs append + rebuild\n\nLog budget A: UOKVS commits every posting within A appends (a keyword is due once its oldest pending posting is A appends old; K from a dry run), the static baseline (K = 0) rebuilds ValMap every A appends. Max pending = the uncommitted log tail. kappa_A = distinct keywords per A-append window that got a posting record (active) / that a batch committed. Upload per append. mu x row = upload of one ValMap rebuild: add mu x row / E_V per append for UOKVS with a rebuild every E_V appends. Server storage: ValMap (mu rows + stash), DocMap, log peak (snapshot + records since), and the total peak, also with the old ValMap / DocMap / log kept while a rebuild, repack or compaction is installed (copy-on-write). ValMap live chunks are capped by l-hat at all times (more is a halt).\n\n| run | scale | A (kappa window) | K | K needed (max / after 2A / mean) | K-overflow batches | E_L | E_V | appends | max pending | snapshot | log records | batches | snapshots | ValMap rebuilds | DocMap writes + repacks | total | kappa_A active | kappa_A committed | stash peak | mu x row | ValMap live max / l-hat | rebuilds | server: ValMap | DocMap | log peak | snapshot peak | total peak | total peak, copy-on-write |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
             for r in &rows {
                 let g = |n: &str| r[col(&h, n)].clone();
                 let b = |n: &str| human(fnum(&g(n)));
@@ -2230,7 +2230,7 @@ fn report(a: &Args) {
         let mut files: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "csv")).collect();
         files.sort();
         if !files.is_empty() {
-            md.push_str("## Stash vs load (final checkpoint of each run)\n\n| run | evict | disc | p | α | joint | n | load | stash | stash / n |\n|---|---|---|---|---|---|---|---|---|---|\n");
+            md.push_str("## Stash vs load (final checkpoint of each run)\n\n| run | evict | disc | p | alpha | joint | n | load | stash | stash / n |\n|---|---|---|---|---|---|---|---|---|---|\n");
             for f in files {
                 if let Some((h, rows)) = read_csv(&f) {
                     if let Some(r) = rows.last() {
@@ -2253,7 +2253,7 @@ fn report(a: &Args) {
         let mut files: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "csv")).collect();
         files.sort();
         if !files.is_empty() {
-            md.push_str("## Stash under churn (constant load, 4n operations after the fill)\n\n`replace` frees a key and inserts a new one (versioned keys, as in `mkse_log`); `update` rewrites the same key by an invalidation-mode update. Targets uniform (z0) or Zipf(1) (z1); `rebuild` = re-insert every live key into a fresh table every R operations (0 = never). Stash as a fraction of the n live keys.\n\n| run | evict | disc | α | load target | mode | zipf | rebuild | stash after fill | stash at n ops | stash at 4n ops | max stash | final load |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+            md.push_str("## Stash under churn (constant load, 4n operations after the fill)\n\n`replace` frees a key and inserts a new one (versioned keys, as in `mkse_log`); `update` rewrites the same key by an invalidation-mode update. Targets uniform (z0) or Zipf(1) (z1); `rebuild` = re-insert every live key into a fresh table every R operations (0 = never). Stash as a fraction of the n live keys.\n\n| run | evict | disc | alpha | load target | mode | zipf | rebuild | stash after fill | stash at n ops | stash at 4n ops | max stash | final load |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
             for f in files {
                 let Some((h, rows)) = read_csv(&f) else { continue };
                 let (Some(first), Some(last)) = (rows.first(), rows.last()) else { continue };

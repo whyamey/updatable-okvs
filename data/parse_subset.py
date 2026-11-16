@@ -24,7 +24,7 @@ def generate_query_keywords(input_path, output_path, target_doc_count, num_keywo
         keyword_counts.sort(key=lambda x: abs(x[1] - target_doc_count))
         eligible_keywords = [k for k, _ in keyword_counts[:num_keywords]]
         print(
-            f"Warning: Could not find enough keywords with approximately {target_doc_count} documents (±10%)."
+            f"Warning: Could not find enough keywords with approximately {target_doc_count} documents (+/-10%)."
         )
         print("Selected closest matching keywords instead:")
         for k in eligible_keywords:
