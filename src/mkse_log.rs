@@ -1165,7 +1165,7 @@ impl MkseLog {
         (ops, moved)
     }
 
-    // Starts log epoch ε_L + 1 with a snapshot (see `write_snapshot`).
+    // Starts the next log epoch with a snapshot (see `write_snapshot`).
     pub fn compact<R: Rng>(&mut self, _rng: &mut R) {
         self.epoch += 1;
         self.log_compactions += 1;

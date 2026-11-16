@@ -92,9 +92,9 @@ Results go to `results/` (set `OUT` to change it) and logs to `results/logs/`. T
 | Stage | What it runs |
 |---|---|
 | `selftest` | correctness checks (see above) |
-| `stash` | stash size vs. load for RW (α=10) and BFS (α=10, 20), with the analyzed invalidation rule (`paper`), the original code (`legacy`) and no invalidation, built from scratch and from an 80% joint build; n = 24M, s = 4, p = 1, plus the p = 256 layout |
+| `stash` | stash size vs. load for RW (alpha = 10) and BFS (alpha = 10 and 20), with the analyzed invalidation rule (`paper`), the original code (`legacy`) and no invalidation, built from scratch and from an 80% joint build; n = 24M, s = 4, p = 1, plus the p = 256 layout |
 | `churn` | stash under churn at constant load: fill to 10^6 keys, then 4n replace or update operations, uniform or Zipf(1) targets, with and without periodic rebuilds |
-| `write` | the write path on Enron without PIR: 80% setup, then a replay of the remaining 20% with 2% posting deletes, 2% edits and 0.2% document removals. Compares the append-only log, rebuild every 10^5/3·10^5/10^6 appends, one ValMap operation per insertion, and batched flushes over B, θ, α, the age rule, RW vs BFS, row vs Cuckoo DocMap, and a 50% build |
+| `write` | the write path on Enron without PIR: 80% setup, then a replay of the remaining 20% with 2% posting deletes, 2% edits and 0.2% document removals. Compares the append-only log, rebuild every 10^5, 3x10^5 or 10^6 appends, one ValMap operation per insertion, and batched flushes with different batch sizes (B), flush thresholds (theta) and alpha, the age rule, RW vs BFS, row vs Cuckoo DocMap, and a 50% build |
 | `writepir` | the main `write` variants with real FrodoPIR databases kept up to date (row and hint updates per batch), with measured search times |
 | `pir` | FrodoPIR fork microbenchmarks at the ValMap (8 KB rows) and DocMap (1059 B rows) shapes: setup, hint size, row updates, query batches of width 8 to 64 |
 | `compare` | FrodoPIR fork vs. upstream FrodoPIR (setup, hint refresh after k changed rows, batched answers, client preprocessing) |
@@ -122,7 +122,7 @@ Environment variables read by `eval_all.sh`:
 - `SPIRAL_DOC=0`: skip the full-size DocMap in `spiral`.
 - `YPIR_SEEDS`: public seeds for shared packing keys in `ypir` (default 8).
 - `scale` stage: `SCALE_MODES` ("shared disjoint"), `SCALE_KS` ("16 4 1"), `SCALE_AS` ("100000 300000 1000000"), `SCALE_AS_DISJOINT` ("100000 1000000"), `SCALE_B` (10000), `SCALE_APPENDS` (3000000, 0 = full replay), `SCALE_UOKVS_EL`, `SCALE_JOBS` (default RAM/90 GB).
-- `K_HEADROOM`, `PEND_HEADROOM`: headroom over the dry-run maximum for K and P̂ (default 1.1).
+- `K_HEADROOM`, `PEND_HEADROOM`: headroom over the dry-run maximum for K and the pending cap P-hat (default 1.1).
 
 ### Resources
 

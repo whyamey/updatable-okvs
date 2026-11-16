@@ -2436,13 +2436,13 @@ mod tests {
     #[test]
     fn schedule_options() {
         let wl = workload(&args(&[("synthetic", "50,300,8")]), &mut StdRng::seed_from_u64(1));
-        // default: E_L = E_V, P̂ = 0
+        // default: E_L = E_V, pend_cap = 0
         let c = log_cfg(&args(&[]), &wl);
         assert_eq!((c.log_every, c.val_every(), c.pend_cap, c.coupled()), (1_000_000, 1_000_000, 0, true));
         // rebuild policy: E_V = E_L = r
         let c = log_cfg(&args(&[("policy", "rebuild"), ("r", "100000")]), &wl);
         assert_eq!((c.log_every, c.val_every(), c.pend_cap), (100_000, 100_000, 0));
-        // decoupled: auto P̂ = E_V (safe bound); explicit and measure
+        // decoupled: auto pend_cap = E_V (safe bound); explicit and measure
         let c = log_cfg(&args(&[("log-every", "1000000"), ("val-every", "4000000")]), &wl);
         assert_eq!((c.log_every, c.val_every(), c.pend_cap, c.coupled()), (1_000_000, 4_000_000, 4_000_000, false));
         let c = log_cfg(&args(&[("log-every", "1000000"), ("major-every", "0"), ("pend-cap", "5000")]), &wl);
